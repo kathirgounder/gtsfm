@@ -13,7 +13,7 @@ from gtsam import Cal3Bundler, PinholeCameraCal3Bundler, Point2, Point3, Pose3, 
 
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.products.edge_quality import EdgeQualityGraph, EdgeQualityScore
-from gtsfm.products.visibility_graph import prune_edges
+from gtsfm.products.visibility_graph import prune_edges, prune_edges_preserve_connectivity
 from gtsfm.utils.edge_quality import (
     aggregate_edge_quality,
     compute_edge_quality,
@@ -375,6 +375,113 @@ class TestPruneEdges:
 
 
 # ===========================================================================
+# Tests for prune_edges_preserve_connectivity()
+# ===========================================================================
+
+
+class TestPruneEdgesPreserveConnectivity:
+    """Tests for connectivity-preserving edge pruning."""
+
+    def test_no_bridges_removes_all_bad(self):
+        """Graph with cycle: bad edge in cycle can be safely removed."""
+        graph = [(0, 1), (0, 2), (1, 2)]
+        bad = [(0, 1)]
+        pruned, removed, kept = prune_edges_preserve_connectivity(graph, bad)
+        assert (0, 1) not in pruned
+        assert removed == {(0, 1)}
+        assert kept == set()
+
+    def test_bridge_edge_kept(self):
+        """Bad edge that is a bridge is NOT removed."""
+        graph = [(0, 1), (1, 2)]
+        bad = [(1, 2)]
+        pruned, removed, kept = prune_edges_preserve_connectivity(graph, bad)
+        assert (1, 2) in pruned
+        assert removed == set()
+        assert kept == {(1, 2)}
+
+    def test_mixed_bridge_and_non_bridge(self):
+        """Some bad edges are bridges, some are not."""
+        # 0-1-2-3-0 (cycle) plus 3-4 (bridge)
+        graph = [(0, 1), (1, 2), (2, 3), (0, 3), (3, 4)]
+        bad = [(0, 1), (3, 4)]
+        pruned, removed, kept = prune_edges_preserve_connectivity(graph, bad)
+        assert (0, 1) not in pruned  # in cycle, safe to remove
+        assert (3, 4) in pruned  # bridge, must keep
+        assert removed == {(0, 1)}
+        assert kept == {(3, 4)}
+
+    def test_no_bad_edges(self):
+        """No bad edges -> graph unchanged."""
+        graph = [(0, 1), (1, 2)]
+        pruned, removed, kept = prune_edges_preserve_connectivity(graph, [])
+        assert pruned == graph
+        assert removed == set()
+        assert kept == set()
+
+    def test_empty_graph(self):
+        """Empty graph -> empty result."""
+        pruned, removed, kept = prune_edges_preserve_connectivity([], [])
+        assert pruned == []
+        assert removed == set()
+        assert kept == set()
+
+    def test_all_bad_all_bridges(self):
+        """All edges are bad and all are bridges -> nothing removed."""
+        graph = [(0, 1), (1, 2), (2, 3)]
+        bad = [(0, 1), (1, 2), (2, 3)]
+        pruned, removed, kept = prune_edges_preserve_connectivity(graph, bad)
+        assert pruned == graph
+        assert removed == set()
+        assert kept == set(bad)
+
+    def test_preserves_connectivity(self):
+        """After pruning, the graph remains connected."""
+        import networkx as nx
+
+        # 0-1-2-0 cycle, 2-3 bridge, 3-4-5-3 cycle
+        graph = [(0, 1), (0, 2), (1, 2), (2, 3), (3, 4), (3, 5), (4, 5)]
+        bad = [(0, 1), (2, 3), (3, 4)]
+        pruned, removed, kept = prune_edges_preserve_connectivity(graph, bad)
+        assert kept == {(2, 3)}
+        G = nx.Graph()
+        G.add_edges_from(pruned)
+        assert nx.is_connected(G)
+
+    def test_collective_disconnect_prevented(self):
+        """Multiple non-bridge edges whose collective removal would disconnect the graph.
+
+        This is the exact failure mode from gerrard-hall: no single bad edge was
+        a bridge, but removing all of them collectively severed the graph. The
+        iterative approach prevents this by checking connectivity after each removal.
+        """
+        import networkx as nx
+
+        # Two clusters connected by exactly 2 edges:
+        # Cluster A: 0-1-2 fully connected
+        # Cluster B: 3-4-5 fully connected
+        # Inter-cluster: (0,5) and (2,3)
+        graph = [(0, 1), (0, 2), (0, 5), (1, 2), (2, 3), (3, 4), (3, 5), (4, 5)]
+        # Both inter-cluster edges are bad — neither is a bridge individually
+        # (each has the other as alternate path), but removing both disconnects.
+        bad = [(2, 3), (0, 5)]
+
+        pruned, removed, kept = prune_edges_preserve_connectivity(graph, bad)
+
+        # One should be removed, the other kept for connectivity
+        assert len(removed) == 1
+        assert len(kept) == 1
+        # The first in the list (2,3) should be removed; (0,5) kept
+        assert (2, 3) in removed
+        assert (0, 5) in kept
+
+        # Graph must remain connected
+        G = nx.Graph()
+        G.add_edges_from(pruned)
+        assert nx.is_connected(G)
+
+
+# ===========================================================================
 # Tests for export_edge_quality_to_json()
 # ===========================================================================
 
@@ -480,16 +587,34 @@ class TestLoadBadEdgesFromJson:
         export_edge_quality_to_json(quality, bad_edges, output_path)
 
         loaded = load_bad_edges_from_json(output_path)
-        assert loaded == bad_edges
+        assert set(loaded) == bad_edges
+
+    def test_load_bad_edges_severity_ordering(self, tmp_path: Path):
+        """Bad edges are returned ordered: zero-track first, then by descending reproj error."""
+        quality: EdgeQualityGraph = {
+            (0, 1): EdgeQualityScore(5, 1.5, 2.5),       # good edge
+            (2, 3): EdgeQualityScore(0, float("inf"), float("inf")),  # zero-track (worst)
+            (4, 5): EdgeQualityScore(3, 8.0, 12.0),       # high reproj error
+            (6, 7): EdgeQualityScore(2, 6.0, 9.0),        # moderate reproj error
+        }
+        bad_edges = {(2, 3), (4, 5), (6, 7)}
+        output_path = tmp_path / "edge_quality.json"
+        export_edge_quality_to_json(quality, bad_edges, output_path)
+
+        loaded = load_bad_edges_from_json(output_path)
+        # Zero-track edge first, then descending by mean reproj error
+        assert loaded[0] == (2, 3)   # zero-track
+        assert loaded[1] == (4, 5)   # 8.0px error
+        assert loaded[2] == (6, 7)   # 6.0px error
 
     def test_load_no_bad_edges(self, tmp_path: Path):
-        """Empty bad_edges list returns empty set."""
+        """Empty bad_edges list returns empty list."""
         quality: EdgeQualityGraph = {(0, 1): EdgeQualityScore(5, 1.5, 2.5)}
         output_path = tmp_path / "edge_quality.json"
         export_edge_quality_to_json(quality, set(), output_path)
 
         loaded = load_bad_edges_from_json(output_path)
-        assert loaded == set()
+        assert loaded == []
 
 
 # ===========================================================================
