@@ -30,29 +30,29 @@ class EdgeQualityScore:
 
     def is_bad(
         self,
-        max_reproj_error_px: float = 5.0,
+        mean_reproj_threshold_px: float = 5.0,
+        max_reproj_threshold_px: float = 50.0,
     ) -> bool:
         """Check if this edge fails quality thresholds.
 
         An edge is bad if:
         - It has zero supporting tracks (no 3D geometry between the cameras), OR
-        - Its mean reprojection error exceeds the threshold.
-
-        Quality thresholds:
-        - Good: < 1.0 px reprojection error
-        - Acceptable: 1.0-3.0 px
-        - Poor: 3.0-5.0 px
-        - Bad: > 5.0 px
+        - Its mean reprojection error exceeds the mean threshold, OR
+        - Its max reprojection error exceeds the max threshold (outlier tracks).
 
         Args:
-            max_reproj_error_px: Maximum allowed mean reprojection error.
+            mean_reproj_threshold_px: Maximum allowed mean reprojection error.
+            max_reproj_threshold_px: Maximum allowed max reprojection error
+                (catches edges with extreme outlier tracks).
 
         Returns:
-            True if the edge has no supporting tracks or exceeds the error threshold.
+            True if the edge has no supporting tracks or exceeds either threshold.
         """
         if self.num_supporting_tracks == 0:
             return True
-        return self.mean_reproj_error_px > max_reproj_error_px
+        if self.mean_reproj_error_px > mean_reproj_threshold_px:
+            return True
+        return self.max_reproj_error_px > max_reproj_threshold_px
 
 
 # Type alias: maps edge (i,j) to its quality score

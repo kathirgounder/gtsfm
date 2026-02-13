@@ -153,21 +153,18 @@ def _compute_edge_reproj_errors(
 
 def identify_bad_edges(
     edge_quality: EdgeQualityGraph,
-    max_reproj_error_px: float = 5.0,
+    mean_reproj_threshold_px: float = 5.0,
+    max_reproj_threshold_px: float = 50.0,
 ) -> set[ImageIndexPair]:
     """Identify edges that fail quality thresholds.
 
-    An edge is considered bad if its mean reprojection error exceeds the threshold.
-
-    Quality threshold guidelines:
-    - Good: < 1.0 px reprojection error
-    - Acceptable: 1.0-3.0 px
-    - Poor: 3.0-5.0 px
-    - Bad: > 5.0 px
+    An edge is considered bad if its mean or max reprojection error exceeds the
+    respective threshold, or if it has zero supporting tracks.
 
     Args:
         edge_quality: Dict mapping edges to their quality scores.
-        max_reproj_error_px: Maximum allowed mean reprojection error.
+        mean_reproj_threshold_px: Maximum allowed mean reprojection error.
+        max_reproj_threshold_px: Maximum allowed max reprojection error.
 
     Returns:
         Set of edges that fail the quality threshold.
@@ -175,7 +172,10 @@ def identify_bad_edges(
     bad_edges: set[ImageIndexPair] = set()
 
     for edge, score in edge_quality.items():
-        if score.is_bad(max_reproj_error_px):
+        if score.is_bad(
+            mean_reproj_threshold_px=mean_reproj_threshold_px,
+            max_reproj_threshold_px=max_reproj_threshold_px,
+        ):
             bad_edges.add(edge)
 
     return bad_edges
