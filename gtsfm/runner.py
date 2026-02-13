@@ -96,6 +96,13 @@ class GtsfmRunner:
             help="Path to edge_quality_report.json from a previous run. "
             "Bad edges will be pruned before partitioning.",
         )
+        parser.add_argument(
+            "--add_edges",
+            type=str,
+            default=None,
+            help="Space-separated edge pairs to add to the visibility graph after pruning, "
+            "e.g. '71,75 76,77 93,98'.",
+        )
 
         # Cluster Optimizers
         # MVO flags
@@ -190,6 +197,9 @@ class GtsfmRunner:
 
             if self.parsed_args.edge_quality_json:
                 overrides.append("+edge_quality_json_path=" + str(self.parsed_args.edge_quality_json))
+
+            if self.parsed_args.add_edges:
+                overrides.append("+add_edges=" + self.parsed_args.add_edges)
 
             if getattr(self, "_hydra_cli_overrides", None):
                 overrides.extend(self._hydra_cli_overrides)

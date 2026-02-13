@@ -24,7 +24,7 @@ from gtsfm.graph_partitioner.graph_partitioner_base import GraphPartitionerBase
 from gtsfm.graph_partitioner.single_partitioner import SinglePartitioner
 from gtsfm.loader.loader_base import LoaderBase
 from gtsfm.products.edge_quality import EdgeQualityGraph
-from gtsfm.products.visibility_graph import VisibilityGraph, prune_edges_preserve_connectivity
+from gtsfm.products.visibility_graph import VisibilityGraph, prune_edges
 from gtsfm.retriever.image_pairs_generator import ImagePairsGenerator
 from gtsfm.ui.process_graph_generator import ProcessGraphGenerator
 from gtsfm.utils.edge_quality import (
@@ -120,6 +120,7 @@ class SceneOptimizer:
         plot_reprojection_histograms: bool = True,
         use_nonlinear_sim3_merging: bool = False,
         edge_quality_json_path: Optional[str] = None,
+        add_edges: Optional[str] = None,
     ) -> None:
         self.loader = loader
         self.image_pairs_generator = image_pairs_generator
@@ -138,6 +139,7 @@ class SceneOptimizer:
         self._drop_child_if_merging_fail = getattr(self.cluster_optimizer, "drop_child_if_merging_fail", True)
         self._use_nonlinear_sim3_merging = use_nonlinear_sim3_merging
         self._edge_quality_json_path = edge_quality_json_path
+        self._add_edges = add_edges
         self.output_root = Path(output_root)
         if output_worker is not None:
             self.cluster_optimizer._output_worker = output_worker
@@ -213,20 +215,31 @@ class SceneOptimizer:
         base_metrics_groups.append(retriever_metrics)
         image_future_map = self.loader.get_image_futures(client)
 
-        # Edge pruning: remove bad edges identified in a previous run.
+        # Step 1: Naive prune — remove ALL bad edges.
         if self._edge_quality_json_path:
-            bad_edges = load_bad_edges_from_json(Path(self._edge_quality_json_path))
+            bad_edges = set(load_bad_edges_from_json(Path(self._edge_quality_json_path)))
             original_count = len(visibility_graph)
-            visibility_graph, removed, kept = prune_edges_preserve_connectivity(
-                visibility_graph, bad_edges
-            )
+            visibility_graph = prune_edges(visibility_graph, bad_edges)
             logger.info(
-                "Pruned %d bad edges (%d kept for connectivity): %d -> %d edges remaining.",
-                len(removed),
-                len(kept),
+                "Pruned %d bad edges: %d -> %d edges remaining.",
+                original_count - len(visibility_graph),
                 original_count,
                 len(visibility_graph),
             )
+
+        # Step 2: Add bridge edges (after pruning).
+        if self._add_edges:
+            existing = set(map(tuple, visibility_graph))
+            added = []
+            for pair_str in self._add_edges.split():
+                i, j = map(int, pair_str.split(","))
+                edge = (min(i, j), max(i, j))
+                if edge not in existing:
+                    visibility_graph.append(edge)
+                    existing.add(edge)
+                    added.append(edge)
+            if added:
+                logger.info("Added %d bridge edges: %s -> %d edges total.", len(added), added, len(visibility_graph))
 
         # Graph partitioning: Divide the visibility graph into clusters (runs eagerly, no delayed/futures).
         logger.info("🔥 GTSFM: Partitioning the view graph...")
