@@ -5,22 +5,22 @@ import math
 from gtsfm.products.edge_quality import EdgeQualityScore
 
 
-def test_is_bad_high_reproj_error():
+def test_is_bad_high_mean_reproj_error():
     """Edge with mean reprojection error exceeding threshold is bad."""
     score = EdgeQualityScore(num_supporting_tracks=5, mean_reproj_error_px=6.0, max_reproj_error_px=8.0)
-    assert score.is_bad(max_reproj_error_px=5.0)
+    assert score.is_bad(mean_reproj_threshold_px=5.0)
 
 
 def test_is_good_passes_threshold():
     """Edge passing threshold is not bad."""
     score = EdgeQualityScore(num_supporting_tracks=10, mean_reproj_error_px=2.0, max_reproj_error_px=4.0)
-    assert not score.is_bad(max_reproj_error_px=5.0)
+    assert not score.is_bad(mean_reproj_threshold_px=5.0)
 
 
 def test_is_bad_boundary_error_not_exceeded():
     """Edge with error exactly at threshold is NOT bad (strictly >)."""
     score = EdgeQualityScore(num_supporting_tracks=5, mean_reproj_error_px=5.0, max_reproj_error_px=5.0)
-    assert not score.is_bad(max_reproj_error_px=5.0)
+    assert not score.is_bad(mean_reproj_threshold_px=5.0)
 
 
 def test_is_bad_inf_error():
@@ -29,13 +29,27 @@ def test_is_bad_inf_error():
     assert score.is_bad()
 
 
-def test_is_bad_custom_thresholds():
-    """Stricter custom thresholds can flag edges that pass defaults."""
+def test_is_bad_custom_mean_threshold():
+    """Stricter custom mean thresholds can flag edges that pass defaults."""
     score = EdgeQualityScore(num_supporting_tracks=5, mean_reproj_error_px=2.0, max_reproj_error_px=3.0)
     # Passes default thresholds
-    assert not score.is_bad(max_reproj_error_px=5.0)
+    assert not score.is_bad(mean_reproj_threshold_px=5.0)
     # Fails stricter thresholds
-    assert score.is_bad(max_reproj_error_px=1.0)
+    assert score.is_bad(mean_reproj_threshold_px=1.0)
+
+
+def test_is_bad_high_max_reproj_error():
+    """Edge with low mean but extreme max reproj error (outlier tracks) is bad."""
+    score = EdgeQualityScore(num_supporting_tracks=1000, mean_reproj_error_px=3.0, max_reproj_error_px=60.0)
+    # Mean is fine, but max exceeds 50px default threshold
+    assert score.is_bad()
+
+
+def test_is_bad_max_reproj_below_threshold():
+    """Edge with moderate max reproj error is not flagged."""
+    score = EdgeQualityScore(num_supporting_tracks=500, mean_reproj_error_px=3.0, max_reproj_error_px=30.0)
+    # Both mean and max are within default thresholds
+    assert not score.is_bad()
 
 
 def test_is_bad_default_thresholds():

@@ -207,7 +207,7 @@ class TestIdentifyBadEdges:
             (0, 1): EdgeQualityScore(5, 1.0, 2.0),
             (1, 2): EdgeQualityScore(3, 2.0, 3.0),
         }
-        bad = identify_bad_edges(quality, max_reproj_error_px=5.0)
+        bad = identify_bad_edges(quality, mean_reproj_threshold_px=5.0)
         assert bad == set()
 
     def test_all_bad_edges(self):
@@ -226,7 +226,7 @@ class TestIdentifyBadEdges:
             (1, 2): EdgeQualityScore(1, 8.0, 12.0),  # bad: high error
             (0, 2): EdgeQualityScore(1, 2.0, 3.0),   # good
         }
-        bad = identify_bad_edges(quality, max_reproj_error_px=5.0)
+        bad = identify_bad_edges(quality, mean_reproj_threshold_px=5.0)
         assert bad == {(1, 2)}
 
     def test_empty_input(self):
@@ -242,7 +242,7 @@ class TestIdentifyBadEdges:
         # Default thresholds: both pass
         assert identify_bad_edges(quality) == set()
         # Strict error threshold: (1,2) fails
-        assert identify_bad_edges(quality, max_reproj_error_px=3.0) == {(1, 2)}
+        assert identify_bad_edges(quality, mean_reproj_threshold_px=3.0) == {(1, 2)}
 
 
 # ===========================================================================
@@ -657,7 +657,7 @@ class TestEdgeQualityIntegration:
         vis_graph = [(0, 1), (1, 2)]
 
         quality = compute_edge_quality(scene, vis_graph)
-        bad = identify_bad_edges(quality, max_reproj_error_px=5.0)
+        bad = identify_bad_edges(quality, mean_reproj_threshold_px=5.0)
 
         # Edge (0,1) should be good, (1,2) should be bad
         assert (0, 1) not in bad
@@ -681,7 +681,7 @@ class TestEdgeQualityIntegration:
         vis_graph = [(0, 1), (1, 2)]
 
         quality = compute_edge_quality(scene, vis_graph)
-        bad = identify_bad_edges(quality, max_reproj_error_px=5.0)
+        bad = identify_bad_edges(quality, mean_reproj_threshold_px=5.0)
         pruned = prune_edges(vis_graph, bad)
 
         assert pruned == [(0, 1)]
