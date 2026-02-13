@@ -126,9 +126,7 @@ class SceneOptimizer:
         self.image_pairs_generator = image_pairs_generator
         self.graph_partitioner = graph_partitioner
         self.cluster_optimizer = cluster_optimizer
-        self._run_bundle_adjustment_on_parent = getattr(
-            self.cluster_optimizer, "run_bundle_adjustment_on_parent", True
-        )
+        self._run_bundle_adjustment_on_parent = getattr(self.cluster_optimizer, "run_bundle_adjustment_on_parent", True)
         self._plot_reprojection_histograms = getattr(
             self.cluster_optimizer, "plot_reprojection_histograms", plot_reprojection_histograms
         )
@@ -283,7 +281,7 @@ class SceneOptimizer:
                     handles_tree, base_output_paths, visibility_graph
                 )
 
-                # Get the reconstruction handle and run merging to get a tree of merged result handles. 
+                # Get the reconstruction handle and run merging to get a tree of merged result handles.
                 reconstruction_tree = handles_tree.map(lambda handle: handle.reconstruction)
                 cameras_gt = self.loader.get_gt_cameras()
 
@@ -300,6 +298,7 @@ class SceneOptimizer:
                         drop_camera_with_no_track=self._drop_camera_with_no_track,
                         drop_child_if_merging_fail=self._drop_child_if_merging_fail,
                         store_full_data=False,
+                        use_nonlinear_sim3_alignment=self._use_nonlinear_sim3_merging,
                     )
 
                 merged_future_tree = submit_tree_map_with_children(client, reconstruction_tree, merge_fn)
@@ -322,7 +321,7 @@ class SceneOptimizer:
                         base_metrics_groups.extend(metrics_groups)
                         base_metrics_groups.append(merged_result.metrics)
                         root_merge_future = merge_future
-                    elif metrics_groups:
+                    else:
                         merged_result = merge_future.result()
                         metrics_groups.append(merged_result.metrics)
                         save_metrics_reports(metrics_groups, str(handle.output_paths.metrics))
