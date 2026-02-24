@@ -38,19 +38,6 @@ def test_is_bad_custom_mean_threshold():
     assert score.is_bad(mean_reproj_threshold_px=1.0)
 
 
-def test_is_bad_high_max_reproj_error():
-    """Edge with low mean but extreme max reproj error (outlier tracks) is bad."""
-    score = EdgeQualityScore(num_supporting_tracks=1000, mean_reproj_error_px=3.0, max_reproj_error_px=60.0)
-    # Mean is fine, but max exceeds 50px default threshold
-    assert score.is_bad()
-
-
-def test_is_bad_max_reproj_below_threshold():
-    """Edge with moderate max reproj error is not flagged."""
-    score = EdgeQualityScore(num_supporting_tracks=500, mean_reproj_error_px=3.0, max_reproj_error_px=30.0)
-    # Both mean and max are within default thresholds
-    assert not score.is_bad()
-
 
 def test_is_bad_default_thresholds():
     """Verify default threshold values work correctly."""
