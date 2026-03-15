@@ -450,6 +450,12 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         aspect-ratio: 1 / 1;
         border: 1px solid var(--border);
       }}
+      .hist-canvas {{
+        width: 100%;
+        height: 80px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+      }}
     </style>
   </head>
   <body>
@@ -512,6 +518,10 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
           </div>
         </div>
         <div class="panel">
+          <div class="muted">Squared reprojection error per track (px²)</div>
+          <canvas id="histCanvas" class="hist-canvas"></canvas>
+        </div>
+        <div class="panel">
           <canvas id="mainCanvas"></canvas>
         </div>
         <div class="panel zoom-pane">
@@ -554,6 +564,7 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
       const baseMainCanvas = document.createElement("canvas");
       const baseMainCtx = baseMainCanvas.getContext("2d");
       const imageCache = new Map();
+      const histCanvas = document.getElementById("histCanvas");
 
       const state = {
         clusterId: null,
@@ -606,6 +617,19 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
           const name = img.name ? img.name.toLowerCase() : "";
           return name.includes(term) || String(img.image_id).includes(term);
         });
+      }
+
+      function imageMeanReprojErr(imageData) {
+        if (!imageData || !imageData.tracks || !imageData.tracks.length) return 0.0;
+        let sum = 0.0;
+        let count = 0;
+        imageData.tracks.forEach((t) => {
+          if (Number.isFinite(t.reproj_err)) {
+            sum += t.reproj_err;
+            count += 1;
+          }
+        });
+        return count > 0 ? sum / count : 0.0;
       }
 
       function getClusterImages() {
@@ -781,6 +805,17 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         return promise;
       }
 
+      function renderToColmapCanvas(img, targetWidth, targetHeight) {
+        const tmpCanvas = document.createElement("canvas");
+        tmpCanvas.width = targetWidth;
+        tmpCanvas.height = targetHeight;
+        const tmpCtx = tmpCanvas.getContext("2d");
+        tmpCtx.clearRect(0, 0, targetWidth, targetHeight);
+        // Normalize image into COLMAP frame so track (x,y) aligns with cropping coordinates.
+        tmpCtx.drawImage(img, 0, 0, targetWidth, targetHeight);
+        return tmpCanvas;
+      }
+
       function drawSelectedTrackMarkers(ctx, measX, measY, reprojX, reprojY) {
         // Measured point: green cross.
         ctx.strokeStyle = "rgba(0, 255, 128, 1.0)";
@@ -886,6 +921,8 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
           const ctx = mainCanvas.getContext("2d");
           ctx.clearRect(0, 0, 10, 10);
           baseMainCtx.clearRect(0, 0, 10, 10);
+          const hctx = histCanvas.getContext("2d");
+          hctx.clearRect(0, 0, histCanvas.width, histCanvas.height);
           return;
         }
         mainCanvas.width = imageData.width;
@@ -910,6 +947,52 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         };
         img.src = imageSrc(imageData);
         imageBadge.textContent = `${imageData.name} (${imageData.width}x${imageData.height})`;
+      }
+
+      function renderHistogram(imageData) {
+        const ctx = histCanvas.getContext("2d");
+        const width = (histCanvas.width = histCanvas.clientWidth || 260);
+        const height = (histCanvas.height = histCanvas.clientHeight || 80);
+        ctx.clearRect(0, 0, width, height);
+        if (!imageData || !imageData.tracks || !imageData.tracks.length) {
+          ctx.fillStyle = "rgba(150,150,160,0.8)";
+          ctx.font = "11px system-ui";
+          ctx.fillText("No tracks for this image.", 8, height / 2);
+          return;
+        }
+        const errors2 = imageData.tracks.map((t) => t.reproj_err * t.reproj_err);
+        const nBins = 30;
+        let minVal = 0.0;
+        const sorted = errors2.slice().sort((a, b) => a - b);
+        const maxRaw = sorted[sorted.length - 1];
+        const p95 = sorted[Math.floor(0.95 * (sorted.length - 1))];
+        const maxVal = Math.max(p95, maxRaw * 0.5, 1e-3);
+        const binWidth = (maxVal - minVal) / nBins;
+        const bins = new Array(nBins).fill(0);
+        errors2.forEach((v) => {
+          if (!Number.isFinite(v)) return;
+          const clamped = Math.min(Math.max(v, minVal), maxVal - 1e-9);
+          const idx = Math.floor((clamped - minVal) / binWidth);
+          bins[idx] += 1;
+        });
+        const maxCount = Math.max(...bins, 1);
+        ctx.fillStyle = "rgba(20,24,36,1)";
+        ctx.fillRect(0, 0, width, height);
+        ctx.strokeStyle = "rgba(60,70,90,1)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, height - 0.5);
+        ctx.lineTo(width, height - 0.5);
+        ctx.stroke();
+        const barW = width / nBins;
+        bins.forEach((count, i) => {
+          const frac = count / maxCount;
+          const barH = frac * (height - 10);
+          const x = i * barW;
+          const y = height - barH;
+          ctx.fillStyle = "rgba(122,162,255,0.8)";
+          ctx.fillRect(x, y, Math.max(1, barW - 1), barH);
+        });
       }
 
       async function renderSelectedTrackPatches(images) {
@@ -947,6 +1030,7 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
           try {
             const img = await loadImageCached(imageSrc(item.image));
             const ctx = canvas.getContext("2d");
+            const normalizedCanvas = renderToColmapCanvas(img, item.image.width, item.image.height);
             const cx = Math.round(item.track.meas[0]);
             const cy = Math.round(item.track.meas[1]);
             const half = Math.floor(patchSize / 2);
@@ -956,7 +1040,7 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
             const sh = Math.min(patchSize, item.image.height - sy);
             ctx.clearRect(0, 0, outSize, outSize);
             ctx.imageSmoothingEnabled = false;
-            ctx.drawImage(img, sx, sy, sw, sh, 0, 0, outSize, outSize);
+            ctx.drawImage(normalizedCanvas, sx, sy, sw, sh, 0, 0, outSize, outSize);
             const measX = ((item.track.meas[0] - sx) / sw) * outSize;
             const measY = ((item.track.meas[1] - sy) / sh) * outSize;
             const reprojX = ((item.track.reproj[0] - sx) / sw) * outSize;
@@ -975,7 +1059,7 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
           await fetchImagesIfNeeded();
         }
         const images = getClusterImages();
-        const filtered = applyFilter(images);
+        let filtered = applyFilter(images);
         thumbList.innerHTML = "";
         if (!state.clusterId) {
           setStatus("No clusters available.");
@@ -990,7 +1074,10 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
           renderMainImage(null);
           return;
         }
-        setStatus(`${filtered.length} / ${images.length} images`);
+        // Sort by mean reprojection error descending so \"worst\" views float to top.
+        filtered = filtered.slice().sort((a, b) => imageMeanReprojErr(b) - imageMeanReprojErr(a));
+
+        setStatus(`${filtered.length} / ${images.length} images (sorted by mean reprojection error)`);
         const trackTotal = filtered.reduce((acc, img) => acc + img.tracks.length, 0);
         imageCount.textContent = `${filtered.length} images`;
         trackCount.textContent = `${trackTotal} tracks`;
@@ -1012,6 +1099,7 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
           });
         });
         renderMainImage(selected);
+        renderHistogram(selected);
         await renderSelectedTrackPatches(images);
       }
 
