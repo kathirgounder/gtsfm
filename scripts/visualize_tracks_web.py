@@ -306,10 +306,11 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         background: var(--bg-soft);
       }}
       .right {{
-        display: grid;
-        grid-template-rows: auto 1fr auto;
+        display: flex;
+        flex-direction: column;
         gap: 12px;
         padding: 16px;
+        overflow-y: auto;
       }}
       .panel {{
         background: var(--panel);
@@ -452,12 +453,35 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
       }}
       .hist-canvas {{
         width: 100%;
-        height: 80px;
+        height: 60px;
         border-radius: 6px;
         border: 1px solid var(--border);
+        margin-top: 4px;
+      }}
+      .main-hist-panel {{
+        display: none;
+      }}
+      .main-hist-controls {{
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: wrap;
+        margin-bottom: 8px;
+      }}
+      .main-hist-controls label {{
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 12px;
+        color: var(--muted);
+      }}
+      #mainHistDiv {{
+        height: 220px;
+        width: 100%;
       }}
     </style>
   </head>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
   <body>
     <header>
       <h1>Tracks Viewer</h1>
@@ -518,10 +542,6 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
           </div>
         </div>
         <div class="panel">
-          <div class="muted">Squared reprojection error per track (px²)</div>
-          <canvas id="histCanvas" class="hist-canvas"></canvas>
-        </div>
-        <div class="panel">
           <canvas id="mainCanvas"></canvas>
         </div>
         <div class="panel zoom-pane">
@@ -531,6 +551,15 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         <div class="panel">
           <div class="muted" id="patchesInfo">Select a track to view patches across images.</div>
           <div id="trackPatchesGrid" class="track-patches-grid"></div>
+        </div>
+        <div class="panel main-hist-panel" id="mainHistPanel">
+          <div class="main-hist-controls">
+            <span style="font-size:12px;color:var(--muted);font-weight:500;">Reprojection error distribution</span>
+            <label>Bins <input type="number" id="histBinsInput" min="5" max="500" step="5" value="30" style="width:60px;" /></label>
+            <label><input type="checkbox" id="histLogYToggle" /> Log Y</label>
+            <label><input type="checkbox" id="histShowCdfToggle" /> Show CDF</label>
+          </div>
+          <div id="mainHistDiv"></div>
         </div>
       </div>
     </div>
@@ -564,7 +593,6 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
       const baseMainCanvas = document.createElement("canvas");
       const baseMainCtx = baseMainCanvas.getContext("2d");
       const imageCache = new Map();
-      const histCanvas = document.getElementById("histCanvas");
 
       const state = {
         clusterId: null,
@@ -887,10 +915,16 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         meta.className = "meta";
         meta.innerHTML = `<div><strong>${imageData.name}</strong></div>
           <div class="muted">ID: ${imageData.image_id}</div>
-          <div class="muted">Tracks: ${imageData.tracks.length}</div>`;
+          <div class="muted">Tracks: ${imageData.tracks.length}</div>
+          <div class="muted" style="font-size:10px;margin-top:2px;">Reproj error (px)</div>`;
+        const histCanvas = document.createElement("canvas");
+        histCanvas.className = "hist-canvas";
+        meta.appendChild(histCanvas);
         card.appendChild(canvas);
         card.appendChild(meta);
         container.appendChild(card);
+        // Render histogram after card is in DOM so clientWidth is available.
+        requestAnimationFrame(() => renderHistogram(imageData, histCanvas));
       }
 
       function pickTrack(imageData, x, y, shownTrackIds) {
@@ -921,8 +955,6 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
           const ctx = mainCanvas.getContext("2d");
           ctx.clearRect(0, 0, 10, 10);
           baseMainCtx.clearRect(0, 0, 10, 10);
-          const hctx = histCanvas.getContext("2d");
-          hctx.clearRect(0, 0, histCanvas.width, histCanvas.height);
           return;
         }
         mainCanvas.width = imageData.width;
@@ -949,10 +981,10 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         imageBadge.textContent = `${imageData.name} (${imageData.width}x${imageData.height})`;
       }
 
-      function renderHistogram(imageData) {
-        const ctx = histCanvas.getContext("2d");
-        const width = (histCanvas.width = histCanvas.clientWidth || 260);
-        const height = (histCanvas.height = histCanvas.clientHeight || 80);
+      function renderHistogram(imageData, targetCanvas) {
+        const ctx = targetCanvas.getContext("2d");
+        const width = (targetCanvas.width = targetCanvas.clientWidth || 260);
+        const height = (targetCanvas.height = targetCanvas.clientHeight || 60);
         ctx.clearRect(0, 0, width, height);
         if (!imageData || !imageData.tracks || !imageData.tracks.length) {
           ctx.fillStyle = "rgba(150,150,160,0.8)";
@@ -960,9 +992,9 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
           ctx.fillText("No tracks for this image.", 8, height / 2);
           return;
         }
-        const errors2 = imageData.tracks.map((t) => t.reproj_err * t.reproj_err);
+        const errors2 = imageData.tracks.map((t) => t.reproj_err);
         const nBins = 30;
-        let minVal = 0.0;
+        const minVal = 0.0;
         const sorted = errors2.slice().sort((a, b) => a - b);
         const maxRaw = sorted[sorted.length - 1];
         const p95 = sorted[Math.floor(0.95 * (sorted.length - 1))];
@@ -976,22 +1008,73 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
           bins[idx] += 1;
         });
         const maxCount = Math.max(...bins, 1);
+
+        // Background
         ctx.fillStyle = "rgba(20,24,36,1)";
         ctx.fillRect(0, 0, width, height);
+
+        // Axes
+        const padLeft = 32;
+        const padBottom = 14;
+        const plotW = width - padLeft - 4;
+        const plotH = height - padBottom - 4;
+        const originX = padLeft;
+        const originY = height - padBottom;
+
         ctx.strokeStyle = "rgba(60,70,90,1)";
         ctx.lineWidth = 1;
         ctx.beginPath();
-        ctx.moveTo(0, height - 0.5);
-        ctx.lineTo(width, height - 0.5);
+        // X axis
+        ctx.moveTo(originX, originY + 0.5);
+        ctx.lineTo(originX + plotW, originY + 0.5);
+        // Y axis
+        ctx.moveTo(originX + 0.5, originY);
+        ctx.lineTo(originX + 0.5, originY - plotH);
         ctx.stroke();
+
+        ctx.fillStyle = "rgba(120,130,150,0.8)";
+        ctx.font = "9px system-ui";
+
+        // X ticks and labels (0 to maxVal)
+        const xTicks = 4;
+        for (let i = 0; i <= xTicks; i++) {
+          const t = i / xTicks;
+          const val = minVal + t * (maxVal - minVal);
+          const x = originX + t * plotW;
+          ctx.strokeStyle = "rgba(70,80,95,1)";
+          ctx.beginPath();
+          ctx.moveTo(x, originY);
+          ctx.lineTo(x, originY + 4);
+          ctx.stroke();
+          const label = val.toFixed(1);
+          const textW = ctx.measureText(label).width;
+          ctx.fillText(label, x - textW / 2, originY + 12);
+        }
+
+        // Y ticks and labels (0 to maxCount)
+        const yTicks = 3;
+        for (let i = 0; i <= yTicks; i++) {
+          const t = i / yTicks;
+          const countVal = t * maxCount;
+          const y = originY - t * plotH;
+          ctx.strokeStyle = "rgba(50,60,80,0.6)";
+          ctx.beginPath();
+          ctx.moveTo(originX - 3, y);
+          ctx.lineTo(originX, y);
+          ctx.stroke();
+          const label = Math.round(countVal).toString();
+          const textW = ctx.measureText(label).width;
+          ctx.fillText(label, originX - 6 - textW, y + 3);
+        }
+
         const barW = width / nBins;
         bins.forEach((count, i) => {
           const frac = count / maxCount;
-          const barH = frac * (height - 10);
-          const x = i * barW;
-          const y = height - barH;
+          const barH = frac * plotH;
+          const x = originX + i * (plotW / nBins);
+          const y = originY - barH;
           ctx.fillStyle = "rgba(122,162,255,0.8)";
-          ctx.fillRect(x, y, Math.max(1, barW - 1), barH);
+          ctx.fillRect(x, y, Math.max(1, (plotW / nBins) - 1), barH);
         });
       }
 
@@ -1052,6 +1135,70 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         }
       }
 
+      function renderMainHistogram(imageData) {
+        const panel = document.getElementById("mainHistPanel");
+        if (!imageData || !imageData.tracks || !imageData.tracks.length) {
+          panel.style.display = "none";
+          return;
+        }
+        panel.style.display = "block";
+        const nbins = Math.max(5, Number(document.getElementById("histBinsInput").value) || 30);
+        const logY = document.getElementById("histLogYToggle").checked;
+        const showCdf = document.getElementById("histShowCdfToggle").checked;
+
+        const errors = imageData.tracks.map((t) => t.reproj_err).filter((v) => Number.isFinite(v));
+        errors.sort((a, b) => a - b);
+
+        const traces = [{
+          x: errors,
+          type: "histogram",
+          nbinsx: nbins,
+          name: "count",
+          marker: { color: "rgba(122,162,255,0.75)", line: { color: "rgba(90,120,210,1)", width: 1 } },
+          hovertemplate: "err: %{x:.3f} px<br>count: %{y}<extra></extra>",
+          yaxis: "y",
+        }];
+
+        if (showCdf) {
+          const n = errors.length;
+          const cdfY = errors.map((_, i) => ((i + 1) / n) * 100);
+          traces.push({
+            x: errors,
+            y: cdfY,
+            type: "scatter",
+            mode: "lines",
+            name: "CDF %",
+            line: { color: "rgba(255,209,102,0.85)", width: 2 },
+            hovertemplate: "err: %{x:.3f} px<br>CDF: %{y:.1f}%<extra></extra>",
+            yaxis: "y2",
+          });
+        }
+
+        const layout = {
+          paper_bgcolor: "rgba(0,0,0,0)",
+          plot_bgcolor: "rgba(14,18,28,0.55)",
+          font: { color: "#9aa4b2", size: 11 },
+          margin: { l: 52, r: showCdf ? 52 : 16, t: 10, b: 48 },
+          xaxis: { title: { text: "Reprojection error (px)", standoff: 8 }, color: "#9aa4b2", gridcolor: "#263041", zerolinecolor: "#3a4560" },
+          yaxis: { title: { text: logY ? "Count (log)" : "Count", standoff: 6 }, type: logY ? "log" : "linear", color: "#9aa4b2", gridcolor: "#263041", zerolinecolor: "#3a4560" },
+          bargap: 0.04,
+          showlegend: showCdf,
+          legend: { x: 0.65, y: 0.97, bgcolor: "rgba(14,18,28,0.7)", bordercolor: "#263041", borderwidth: 1, font: { size: 11 } },
+        };
+
+        if (showCdf) {
+          layout.yaxis2 = { title: { text: "CDF (%)", standoff: 6 }, overlaying: "y", side: "right", range: [0, 100], color: "#ffd166", gridcolor: "rgba(0,0,0,0)", showgrid: false };
+        }
+
+        Plotly.react("mainHistDiv", traces, layout, {
+          responsive: true,
+          displayModeBar: true,
+          modeBarButtonsToRemove: ["toImage", "sendDataToCloud"],
+          displaylogo: false,
+          scrollZoom: true,
+        });
+      }
+
       async function renderAll() {
         if (serverMode) {
           await fetchClustersIfNeeded();
@@ -1099,7 +1246,7 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
           });
         });
         renderMainImage(selected);
-        renderHistogram(selected);
+        renderMainHistogram(selected);
         await renderSelectedTrackPatches(images);
       }
 
@@ -1234,6 +1381,13 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
           trackBadge.textContent = "Track: none";
           renderAll();
         });
+        function replotHist() {
+          const images = applyFilter(getClusterImages());
+          renderMainHistogram(getSelectedImageData(images));
+        }
+        document.getElementById("histBinsInput").addEventListener("change", replotHist);
+        document.getElementById("histLogYToggle").addEventListener("change", replotHist);
+        document.getElementById("histShowCdfToggle").addEventListener("change", replotHist);
         setupZoom();
         setupMainCanvasSelection();
         renderAll();
