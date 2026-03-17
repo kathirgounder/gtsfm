@@ -1,14 +1,15 @@
 """Compare MegaLoc visibility graph vs GT COLMAP/GLOMAP covisibility graph.
 
-Computes precision, recall, F1, graph stats, and fragmentation metrics.
+Computes precision, recall, F1, graph stats, fragmentation metrics, and PR curves.
 
 Usage:
-    # With MegaLoc results:
+    # With MegaLoc results + PR curves:
     python scripts/compare_visibility_graphs.py \
         --dataset_name Gendarmenmarkt \
         --colmap_dir benchmarks/Gendarmenmarkt/sparse_glomap/0 \
         --images_dir benchmarks/Gendarmenmarkt/images \
         --megaloc_pairs_file results/gendermarket_results_2/plots/similarity_named_pairs.txt \
+        --similarity_matrix results/gendermarket_results_2/plots/similarity_matrix.txt \
         --min_shared_points 30 \
         --output_json results/analysis/Gendarmenmarkt.json
 
@@ -28,6 +29,9 @@ from collections import defaultdict
 from itertools import combinations
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 
 import thirdparty.colmap.scripts.python.read_write_model as colmap_io
@@ -124,6 +128,150 @@ def load_megaloc_pairs(
     return pairs, scores
 
 
+def load_similarity_matrix(matrix_path: str, num_images: int) -> dict[tuple[int, int], float]:
+    """Load full N×N similarity matrix and return upper-triangle scores.
+
+    Returns:
+        Dict mapping (i, j) with i < j to similarity score (only entries > 0).
+    """
+    mat = np.loadtxt(matrix_path, delimiter=",")
+    assert mat.shape[0] == mat.shape[1], f"Expected square matrix, got {mat.shape}"
+    if mat.shape[0] != num_images:
+        print(f"  WARNING: similarity matrix has {mat.shape[0]} images, expected {num_images}")
+    scores: dict[tuple[int, int], float] = {}
+    n = mat.shape[0]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if mat[i, j] > 0 and np.isfinite(mat[i, j]):
+                scores[(i, j)] = float(mat[i, j])
+    return scores
+
+
+def compute_pr_curve_sweep_score(
+    all_scores: dict[tuple[int, int], float],
+    gt_set: set[tuple[int, int]],
+    num_thresholds: int = 50,
+) -> list[dict]:
+    """Sweep MegaLoc score threshold and compute precision/recall at each point."""
+    # Sort edges by score descending for efficient sweep.
+    sorted_edges = sorted(all_scores.items(), key=lambda x: -x[1])
+    thresholds = np.linspace(0.0, 1.0, num_thresholds + 1).tolist()
+
+    curve = []
+    for t in thresholds:
+        predicted = {edge for edge, score in sorted_edges if score >= t}
+        tp = len(predicted & gt_set)
+        precision = tp / len(predicted) if predicted else 1.0
+        recall = tp / len(gt_set) if gt_set else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        curve.append({
+            "threshold": round(t, 4),
+            "precision": round(precision, 4),
+            "recall": round(recall, 4),
+            "f1": round(f1, 4),
+            "num_predicted": len(predicted),
+        })
+    return curve
+
+
+def compute_pr_curve_sweep_gt(
+    megaloc_set: set[tuple[int, int]],
+    pair_counts: dict[tuple[int, int], int],
+    max_threshold: int = 100,
+) -> list[dict]:
+    """Sweep GT covisibility threshold and compute precision/recall at each point."""
+    curve = []
+    for min_pts in range(1, max_threshold + 1):
+        gt_set = {edge for edge, count in pair_counts.items() if count >= min_pts}
+        tp = len(megaloc_set & gt_set)
+        precision = tp / len(megaloc_set) if megaloc_set else 0.0
+        recall = tp / len(gt_set) if gt_set else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        curve.append({
+            "min_shared_points": min_pts,
+            "precision": round(precision, 4),
+            "recall": round(recall, 4),
+            "f1": round(f1, 4),
+            "num_gt_edges": len(gt_set),
+        })
+    return curve
+
+
+def plot_pr_curves(
+    curve_score: list[dict] | None,
+    curve_gt: list[dict] | None,
+    dataset_name: str,
+    output_path: str,
+) -> None:
+    """Plot PR curves and save to PNG."""
+    num_plots = (1 if curve_score else 0) + (1 if curve_gt else 0)
+    if num_plots == 0:
+        return
+
+    fig, axes = plt.subplots(1, num_plots, figsize=(7 * num_plots, 5))
+    if num_plots == 1:
+        axes = [axes]
+
+    plot_idx = 0
+
+    if curve_score:
+        ax = axes[plot_idx]
+        recalls = [p["recall"] for p in curve_score]
+        precisions = [p["precision"] for p in curve_score]
+        thresholds = [p["threshold"] for p in curve_score]
+
+        # AUC via trapezoidal rule (sort by recall ascending).
+        sorted_pairs = sorted(zip(recalls, precisions))
+        r_sorted = [x[0] for x in sorted_pairs]
+        p_sorted = [x[1] for x in sorted_pairs]
+        auc = float(np.trapezoid(p_sorted, r_sorted))
+
+        ax.plot(recalls, precisions, "b.-", markersize=3)
+
+        # Mark operating points at score=0.5 and best F1.
+        best_f1_entry = max(curve_score, key=lambda x: x["f1"])
+        ax.plot(best_f1_entry["recall"], best_f1_entry["precision"], "r*", markersize=12,
+                label=f"Best F1={best_f1_entry['f1']:.3f} @ score={best_f1_entry['threshold']:.2f}")
+
+        # Find score=0.5 point.
+        for entry in curve_score:
+            if abs(entry["threshold"] - 0.5) < 0.02:
+                ax.plot(entry["recall"], entry["precision"], "go", markersize=8,
+                        label=f"score=0.5 (P={entry['precision']:.2f}, R={entry['recall']:.2f})")
+                break
+
+        ax.set_xlabel("Recall")
+        ax.set_ylabel("Precision")
+        ax.set_title(f"{dataset_name}: MegaLoc Score Sweep (AUC={auc:.3f})")
+        ax.set_xlim(-0.02, 1.02)
+        ax.set_ylim(-0.02, 1.02)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        plot_idx += 1
+
+    if curve_gt:
+        ax = axes[plot_idx]
+        gt_thresholds = [p["min_shared_points"] for p in curve_gt]
+        precisions = [p["precision"] for p in curve_gt]
+        recalls = [p["recall"] for p in curve_gt]
+        f1s = [p["f1"] for p in curve_gt]
+
+        ax.plot(gt_thresholds, precisions, "b-", label="Precision")
+        ax.plot(gt_thresholds, recalls, "r-", label="Recall")
+        ax.plot(gt_thresholds, f1s, "g--", label="F1")
+        ax.set_xlabel("GT min_shared_points")
+        ax.set_ylabel("Score")
+        ax.set_title(f"{dataset_name}: GT Threshold Sweep")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close("all")
+    print(f"\nPR curve plot saved to {output_path}")
+
+
 def build_gt_pair_counts(
     colmap_dir: str, image_fnames: list[str]
 ) -> tuple[dict[tuple[int, int], int], int, int, int]:
@@ -177,8 +325,12 @@ def main():
     parser.add_argument("--colmap_dir", required=True, help="Path to COLMAP/GLOMAP sparse model directory")
     parser.add_argument("--images_dir", required=True, help="Path to images directory")
     parser.add_argument("--megaloc_pairs_file", default=None, help="Path to similarity_named_pairs.txt")
+    parser.add_argument("--similarity_matrix", default=None, help="Path to similarity_matrix.txt (full N×N CSV) for PR curve sweep")
     parser.add_argument("--min_shared_points", type=int, default=30, help="GT covisibility threshold")
     parser.add_argument("--output_json", default=None, help="Path to write results JSON")
+    parser.add_argument("--output_plot", default=None, help="Path to save PR curve PNG")
+    parser.add_argument("--num_score_thresholds", type=int, default=50, help="Number of MegaLoc score thresholds to sweep")
+    parser.add_argument("--max_gt_threshold", type=int, default=100, help="Max GT min_shared_points for sweep")
     args = parser.parse_args()
 
     # Get image filenames (sorted, basename only).
@@ -227,6 +379,7 @@ def main():
     }
 
     # --- MegaLoc comparison ---
+    megaloc_set = None
     if args.megaloc_pairs_file:
         print("\n" + "=" * 60)
         print("MEGALOC COMPARISON")
@@ -309,6 +462,57 @@ def main():
             print(f"  False positives: mean={np.mean(fp_scores):.3f}, median={np.median(fp_scores):.3f}")
             results["tp_score_mean"] = round(float(np.mean(tp_scores)), 4)
             results["fp_score_mean"] = round(float(np.mean(fp_scores)), 4)
+
+    # --- PR Curves ---
+    curve_score = None
+    curve_gt = None
+    megaloc_set_for_gt_sweep = None
+
+    if args.similarity_matrix:
+        print("\n" + "=" * 60)
+        print("PR CURVE: SWEEP MEGALOC SCORE THRESHOLD")
+        print("=" * 60)
+        all_scores = load_similarity_matrix(args.similarity_matrix, len(image_fnames))
+        print(f"  Loaded {len(all_scores)} pairwise scores from similarity matrix")
+
+        curve_score = compute_pr_curve_sweep_score(all_scores, gt_set, args.num_score_thresholds)
+        results["pr_curve_sweep_score"] = curve_score
+
+        # AUC
+        sorted_pairs = sorted([(p["recall"], p["precision"]) for p in curve_score])
+        auc = float(np.trapezoid([x[1] for x in sorted_pairs], [x[0] for x in sorted_pairs]))
+        results["pr_curve_sweep_score_auc"] = round(auc, 4)
+
+        # Best F1
+        best = max(curve_score, key=lambda x: x["f1"])
+        results["best_f1_score_threshold"] = best["threshold"]
+        results["best_f1"] = best["f1"]
+        print(f"  AUC: {auc:.4f}")
+        print(f"  Best F1: {best['f1']:.4f} at score threshold {best['threshold']:.2f}")
+
+        # Derive megaloc_set at 0.5 for GT sweep if no pairs file was provided.
+        if not args.megaloc_pairs_file:
+            megaloc_set_for_gt_sweep = {edge for edge, score in all_scores.items() if score >= 0.5}
+
+    # Use megaloc_set from pairs file, or derive from similarity matrix at score=0.5.
+    gt_sweep_set = megaloc_set if megaloc_set is not None else megaloc_set_for_gt_sweep
+    if gt_sweep_set is not None:
+        print("\n" + "=" * 60)
+        print("PR CURVE: SWEEP GT THRESHOLD")
+        print("=" * 60)
+        sweep_set = gt_sweep_set
+        curve_gt = compute_pr_curve_sweep_gt(sweep_set, pair_counts, args.max_gt_threshold)
+        results["pr_curve_sweep_gt"] = curve_gt
+        best_gt = max(curve_gt, key=lambda x: x["f1"])
+        print(f"  Best F1: {best_gt['f1']:.4f} at min_shared_points={best_gt['min_shared_points']}")
+
+    # Plot
+    if curve_score or curve_gt:
+        output_plot = args.output_plot
+        if not output_plot and args.output_json:
+            output_plot = args.output_json.replace(".json", "_pr.png")
+        if output_plot:
+            plot_pr_curves(curve_score, curve_gt, args.dataset_name, output_plot)
 
     # --- Write JSON ---
     if args.output_json:
