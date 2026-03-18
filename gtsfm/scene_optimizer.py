@@ -15,6 +15,7 @@ from omegaconf import OmegaConf
 
 import gtsfm.utils.logger as logger_utils
 from gtsfm import cluster_merging
+from gtsfm.cluster_merging import MergingOptions
 from gtsfm.cluster_optimizer import Base, save_metrics_reports
 from gtsfm.cluster_optimizer.cluster_optimizer_base import ClusterContext
 from gtsfm.common.gtsfm_data import GtsfmData
@@ -108,61 +109,27 @@ class SceneOptimizer:
         graph_partitioner: GraphPartitionerBase = SinglePartitioner(),
         output_root: str = DEFAULT_OUTPUT_ROOT,
         output_worker: Optional[str] = None,
-        plot_reprojection_histograms: bool = True,
-        use_nonlinear_sim3_merging: bool = False,
+        merging_options: MergingOptions | None = None,
+        # --- Bridge params ---
         bridge_min_similarity: float = 0.0,
         bridge_top_k: int = 10,
         bridge_min_component_size: int = 3,
-        merging_pre_ba_max_reproj_error: float = 14.0,
-        merging_pre_ba_min_track_length: int = 2,
-        merging_allow_post_ba_reproj_filtering: bool = True,
-        merging_ba_use_calibration_prior: bool = False,
-        merging_ba_use_pose_prior: bool = False,
-        merging_use_gnc: bool = False,
-        merging_factor_weight_outlier_threshold: float = 0.0,
-        metric_constructed_only: bool = False,
-        max_track_correspondences_for_sim3: int = 150,
-        scale_and_average_focal_length_in_merging: bool = False,
     ) -> None:
         self.loader = loader
         self.image_pairs_generator = image_pairs_generator
         self.graph_partitioner = graph_partitioner
         self.cluster_optimizer = cluster_optimizer
-        self._run_bundle_adjustment_on_parent = getattr(self.cluster_optimizer, "run_bundle_adjustment_on_parent", True)
-        self._plot_reprojection_histograms = getattr(
-            self.cluster_optimizer, "plot_reprojection_histograms", plot_reprojection_histograms
-        )
-        self._merge_duplicate_tracks = getattr(self.cluster_optimizer, "merge_duplicate_tracks", True)
-        self._drop_outlier_after_camera_merging = getattr(
-            self.cluster_optimizer, "drop_outlier_after_camera_merging", True
-        )
-        self._post_ba_max_reproj_error = getattr(self.cluster_optimizer, "post_ba_max_reproj_error", 3.0)
-        self._drop_camera_with_no_track = getattr(self.cluster_optimizer, "drop_camera_with_no_track", True)
-        self._drop_child_if_merging_fail = getattr(self.cluster_optimizer, "drop_child_if_merging_fail", True)
-        self._use_shared_calibration = getattr(self.cluster_optimizer, "use_shared_calibration", True)
-        self._gnc_loss = getattr(self.cluster_optimizer, "gnc_loss", "GMC")
-        self._use_nonlinear_sim3_merging = use_nonlinear_sim3_merging
-        self._min_track_length = getattr(self.cluster_optimizer, "min_track_length", 2)
-        self._keep_all_cameras_in_merging = getattr(self.cluster_optimizer, "keep_all_cameras_in_merging", False)
+        self._merging_options = merging_options or MergingOptions()
         self._bridge_min_similarity = bridge_min_similarity
         self._bridge_top_k = bridge_top_k
         self._bridge_min_component_size = bridge_min_component_size
-        self._merging_pre_ba_max_reproj_error = merging_pre_ba_max_reproj_error
-        self._merging_pre_ba_min_track_length = merging_pre_ba_min_track_length
-        self._merging_allow_post_ba_reproj_filtering = merging_allow_post_ba_reproj_filtering
-        self._merging_factor_weight_outlier_threshold = merging_factor_weight_outlier_threshold
-        self._merging_ba_use_calibration_prior = merging_ba_use_calibration_prior
-        self._merging_ba_use_pose_prior = merging_ba_use_pose_prior
-        self._merging_use_gnc = merging_use_gnc
-        self._metric_constructed_only = metric_constructed_only
+        # Propagate metric_constructed_only to the cluster optimizer if it supports it.
         if hasattr(self.cluster_optimizer, "_metric_constructed_only"):
-            setattr(self.cluster_optimizer, "_metric_constructed_only", metric_constructed_only)
+            setattr(self.cluster_optimizer, "_metric_constructed_only", self._merging_options.metric_constructed_only)
         elif hasattr(self.cluster_optimizer, "_optimizer") and hasattr(
             getattr(self.cluster_optimizer, "_optimizer"), "_metric_constructed_only"
         ):
-            setattr(self.cluster_optimizer._optimizer, "_metric_constructed_only", metric_constructed_only)
-        self._max_track_correspondences_for_sim3 = max_track_correspondences_for_sim3
-        self._scale_and_average_focal_length_in_merging = scale_and_average_focal_length_in_merging
+            setattr(self.cluster_optimizer._optimizer, "_metric_constructed_only", self._merging_options.metric_constructed_only)
         self._config_snapshot = None
         self.output_root = Path(output_root)
         if output_worker is not None:
@@ -310,29 +277,7 @@ class SceneOptimizer:
                         cast(Optional[GtsfmData], reconstruction),
                         child_results,
                         cameras_gt=cameras_gt,
-                        post_ba_max_reproj_error=self._post_ba_max_reproj_error,
-                        run_bundle_adjustment_on_parent=self._run_bundle_adjustment_on_parent,
-                        plot_reprojection_histograms=self._plot_reprojection_histograms,
-                        merge_duplicate_tracks=self._merge_duplicate_tracks,
-                        drop_outlier_after_camera_merging=self._drop_outlier_after_camera_merging,
-                        drop_camera_with_no_track=self._drop_camera_with_no_track,
-                        drop_child_if_merging_fail=self._drop_child_if_merging_fail,
-                        store_full_data=False,
-                        use_nonlinear_sim3_alignment=self._use_nonlinear_sim3_merging,
-                        use_shared_calibration=self._use_shared_calibration,
-                        use_gnc=self._merging_use_gnc,
-                        gnc_loss=self._gnc_loss,
-                        min_track_length=self._min_track_length,
-                        keep_all_cameras_in_merging=self._keep_all_cameras_in_merging,
-                        pre_ba_max_reproj_error=self._merging_pre_ba_max_reproj_error,
-                        pre_ba_min_track_length=self._merging_pre_ba_min_track_length,
-                        merging_allow_post_ba_reproj_filtering=self._merging_allow_post_ba_reproj_filtering,
-                        merging_factor_weight_outlier_threshold=self._merging_factor_weight_outlier_threshold,
-                        ba_use_calibration_prior=self._merging_ba_use_calibration_prior,
-                        merging_ba_use_pose_prior=self._merging_ba_use_pose_prior,
-                        metric_constructed_only=self._metric_constructed_only,
-                        max_track_correspondences_for_sim3=self._max_track_correspondences_for_sim3,
-                        scale_and_average_focal_length_in_merging=self._scale_and_average_focal_length_in_merging,
+                        options=self._merging_options,
                     )
 
                 merged_future_tree = submit_tree_map_with_children(client, reconstruction_tree, merge_fn)

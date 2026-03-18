@@ -42,26 +42,7 @@ class ClusterOptimizerCacher(ClusterOptimizerBase):
             optimizer: cluster optimizer to use in case of cache miss.
             cache_subdir: Optional subdirectory (relative to cache root) for storing cache entries.
         """
-        run_bundle_adjustment_on_leaf = getattr(optimizer, "run_bundle_adjustment_on_leaf", None)
-        if run_bundle_adjustment_on_leaf is None:
-            run_bundle_adjustment_on_leaf = getattr(optimizer, "_run_bundle_adjustment_on_leaf", False)
-        super().__init__(
-            pose_angular_error_thresh=optimizer.pose_angular_error_thresh,
-            run_bundle_adjustment_on_leaf=run_bundle_adjustment_on_leaf,
-            run_bundle_adjustment_on_parent=getattr(optimizer, "run_bundle_adjustment_on_parent", True),
-            drop_outlier_after_camera_merging=getattr(optimizer, "drop_outlier_after_camera_merging", True),
-            drop_child_if_merging_fail=getattr(optimizer, "drop_child_if_merging_fail", True),
-            drop_camera_with_no_track=getattr(optimizer, "drop_camera_with_no_track", True),
-            plot_reprojection_histograms=getattr(optimizer, "plot_reprojection_histograms", True),
-            use_shared_calibration=getattr(optimizer, "use_shared_calibration", True),
-            use_gnc=getattr(optimizer, "use_gnc", False),
-            gnc_loss=getattr(optimizer, "gnc_loss", "GMC"),
-            post_ba_max_reproj_error=getattr(optimizer, "post_ba_max_reproj_error", 3.0),
-            min_track_length=getattr(optimizer, "min_track_length", 2),
-            keep_all_cameras_in_merging=getattr(optimizer, "keep_all_cameras_in_merging", False),
-            merge_duplicate_tracks=getattr(optimizer, "merge_duplicate_tracks", True),
-            output_worker=optimizer._output_worker,
-        )
+        super().__init__(output_worker=optimizer._output_worker)
         self._optimizer = optimizer
         self._optimizer_hash = hashlib.sha1(repr(optimizer).encode()).hexdigest()
         self._cache_subdir = cache_subdir if cache_subdir is not None else os.getenv("GTSFM_CACHE_SUBDIR")
@@ -94,18 +75,7 @@ class ClusterOptimizerCacher(ClusterOptimizerBase):
         self._cache_subdir = typing.cast(Optional[str], state.get("_cache_subdir"))
         self._cache_root_path = self._resolve_cache_root(self._cache_subdir)
         # Re-initialize the base class to mimic the constructor.
-        run_bundle_adjustment_on_leaf = getattr(self._optimizer, "run_bundle_adjustment_on_leaf", None)
-        if run_bundle_adjustment_on_leaf is None:
-            run_bundle_adjustment_on_leaf = getattr(self._optimizer, "_run_bundle_adjustment_on_leaf", False)
-        super().__init__(
-            pose_angular_error_thresh=self._optimizer.pose_angular_error_thresh,
-            run_bundle_adjustment_on_leaf=run_bundle_adjustment_on_leaf,
-            run_bundle_adjustment_on_parent=getattr(self._optimizer, "run_bundle_adjustment_on_parent", True),
-            use_gnc=getattr(self._optimizer, "use_gnc", False),
-            gnc_loss=getattr(self._optimizer, "gnc_loss", "GMC"),
-            keep_all_cameras_in_merging=getattr(self._optimizer, "keep_all_cameras_in_merging", False),
-            output_worker=self._optimizer._output_worker,
-        )
+        super().__init__(output_worker=self._optimizer._output_worker)
 
     @staticmethod
     def _resolve_cache_root(cache_subdir: Optional[str]) -> Path:

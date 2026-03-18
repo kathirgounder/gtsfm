@@ -31,41 +31,66 @@ cluster_optimizer:
   _target_: gtsfm.cluster_optimizer.Cacher
   optimizer:
     _target_: gtsfm.cluster_optimizer.cluster_vggt.ClusterVGGT
-    input_mode: crop
-    save_processed_image: true #for debug, save processed images in each subfolder
-    weights_path: null
-    conf_threshold: 0.1
-    max_num_points: 100000
-    tracking: true
-    tracking_max_query_pts: 512
-    tracking_query_frame_num: 3
-    keypoint_extractor: aliked+sp+sift
-    track_vis_thresh: 0.05
-    track_conf_thresh: 0.2
-    post_ba_max_reproj_error: 3.0
-    vggt_max_reproj_error: 14.0
-    min_triangulation_angle: 10.0
-    min_track_length: 3
-    camera_type: PINHOLE
-    drop_outlier_after_camera_merging: true
-    drop_child_if_merging_fail: true
-    drop_camera_with_no_track: false
-    keep_all_cameras_in_merging: true #wether to keep all cameras in merging, otherwise cameras without track can be dropped
-    seed: 42
-    plot_reprojection_histograms: true
-    run_bundle_adjustment_on_leaf: true
-    run_bundle_adjustment_on_parent: true
-    model_cache_key: null
-    store_pre_ba_result: true
-    ba_use_calibration_prior: false
-    ba_use_undistorted_camera_model: false
-    use_shared_calibration: true
-    use_gnc: true
-    gnc_loss: GMC
-    factor_weight_outlier_threshold: 1e-8
 
-use_nonlinear_sim3_merging: true
-merging_pre_ba_max_reproj_error: 14.0
-merging_pre_ba_min_track_length: 2
-merging_ba_use_calibration_prior: true
-merging_use_gnc: false
+    # --- Geometry transformer ---
+    geometry_transformer:
+      _target_: gtsfm.frontend.vggt_geometry_transformer.VggtGeometryTransformer
+      config:
+        _target_: gtsfm.frontend.vggt_geometry_transformer.VggtGeometryConfig
+        confidence_threshold: 0.1
+        max_num_points: 100000
+        seed: 42
+
+    # --- Multi-view tracker ---
+    tracker:
+      _target_: gtsfm.frontend.multi_view_tracker.MultiViewTracker
+      config:
+        _target_: gtsfm.frontend.multi_view_tracker.TrackingConfig
+        tracking: true
+        max_query_pts: 512
+        query_frame_num: 3
+        keypoint_extractor: aliked+sp+sift
+        track_vis_thresh: 0.05
+        track_conf_thresh: 0.2
+        vggt_max_reproj_error: 14.0
+        min_triangulation_angle: 10.0
+        min_track_length: 3
+
+    # --- Leaf-level bundle adjustment ---
+    pre_ba_max_reproj_error: 14.0
+    post_ba_max_reproj_error: 3.0
+    drop_camera_with_no_track: false
+    ba_options:
+      _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptions
+      shared_calib: true
+      use_calibration_prior: false
+      use_gnc: true
+      gnc_loss: GMC
+      factor_weight_outlier_threshold: 1e-8
+
+    # --- VGGT operational params ---
+    input_mode: crop
+    save_processed_image: true
+    weights_path: null
+    seed: 42
+    model_cache_key: null
+
+# --- Merging options ---
+merging_options:
+  _target_: gtsfm.cluster_merging.MergingOptions
+  run_bundle_adjustment: true
+  merge_duplicate_tracks: true
+  drop_child_if_merging_fail: true
+  drop_outlier_after_camera_merging: true
+  drop_camera_with_no_track: false
+  keep_all_cameras: true
+  plot_reprojection_histograms: true
+  use_nonlinear_sim3_alignment: true
+  pre_ba_max_reproj_error: 14.0
+  pre_ba_min_track_length: 2
+  post_ba_max_reproj_error: 3.0
+  min_track_length: 3
+  ba_options:
+    _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptions
+    use_calibration_prior: true
+    use_gnc: false
