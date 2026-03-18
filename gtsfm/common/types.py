@@ -3,7 +3,7 @@
 Authors: Ayush Baid, Travis Driver
 """
 
-from typing import Type, Union
+from typing import Type, Union, Sequence
 
 import gtsam  # type: ignore
 import numpy as np
@@ -110,7 +110,11 @@ def get_prior_factor_for_calibration(calibration: CALIBRATION_TYPE) -> Type[PRIO
 
 
 def get_noise_model_for_calibration(
-    calibration, focal_sigma: float, pp_sigma: float, skew_sigma: float = 1e-6, dist_sigma: float = 1e-6
+    calibration,
+    focal_sigma: float,
+    pp_sigma: float,
+    skew_sigma: float = 1e-6,
+    dist_sigma: float | Sequence[float] = 1e-6,
 ) -> gtsam.noiseModel.Diagonal:
     """Get the noise model for the calibration, based on the calibration type.
 
@@ -127,23 +131,21 @@ def get_noise_model_for_calibration(
         A Diagonal noise model with the given sigma for the focal length and principal point.
     """
     if isinstance(calibration, gtsam.Cal3Bundler):
-        sigmas = np.array([focal_sigma, dist_sigma, dist_sigma])  # f, k1, k2
+        if isinstance(dist_sigma, float):
+            sigma_k1, sigma_k2 = dist_sigma, dist_sigma
+        else:
+            sigma_k1, sigma_k2 = dist_sigma[:2]
+        sigmas = np.array([focal_sigma, sigma_k1, sigma_k2])  # f, k1, k2
     elif isinstance(calibration, gtsam.Cal3_S2):
         sigmas = np.array([focal_sigma, focal_sigma, skew_sigma, pp_sigma, pp_sigma])  # fx, fy, s, cx, cy
     elif isinstance(calibration, gtsam.Cal3DS2) or isinstance(calibration, gtsam.Cal3Fisheye):
+        if isinstance(dist_sigma, float):
+            sigma_k1, sigma_k2, sigma_p1, sigma_p2 = dist_sigma, dist_sigma, dist_sigma, dist_sigma
+        else:
+            sigma_k1, sigma_k2, sigma_p1, sigma_p2 = dist_sigma[:4]
         sigmas = np.array(
-            [
-                focal_sigma,
-                focal_sigma,
-                skew_sigma,  # skew
-                pp_sigma,
-                pp_sigma,
-                dist_sigma,  # k1
-                dist_sigma,  # k2
-                dist_sigma,  # p1
-                dist_sigma,  # p2
-            ]
-        )
+            [focal_sigma, focal_sigma, skew_sigma, pp_sigma, pp_sigma, sigma_k1, sigma_k2, sigma_p1, sigma_p2]
+        )  # fx, fy, s, cx, cy, k1, k2, p1, p2
     else:  # If the calibration type is not recognized, raise an error.
         raise ValueError(f"Unsupported calibration type: {type(calibration)}. Supported types are {CALIBRATION_TYPE}.")
     return gtsam.noiseModel.Diagonal.Sigmas(sigmas)

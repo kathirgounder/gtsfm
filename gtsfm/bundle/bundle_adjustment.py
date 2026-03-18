@@ -69,7 +69,8 @@ class BundleAdjustmentOptimizer:
         max_iterations: Optional[int] = None,
         cam_pose3_prior_noise_sigma: float = 0.1,
         calibration_prior_focal_sigma: float = 20.0,
-        calibration_prior_dist_sigma: float = 0.1,
+        calibration_prior_dist_sigma: float | Sequence[float] = 0.1,
+        calibration_prior_pp_sigma: float = 1e-5,
         measurement_noise_sigma: float = 2.0,
         allow_indeterminate_linear_system: bool = True,
         print_summary: bool = False,
@@ -77,7 +78,8 @@ class BundleAdjustmentOptimizer:
         save_iteration_visualization: bool = False,
         robust_noise_basin: float = 1.345,
         use_karcher_mean_factor: bool = True,
-        use_pose_prior: bool = False,
+        use_pose_prior_all_cameras: bool = False,
+        use_pose_prior_first_camera: bool = False,
         use_calibration_prior: bool = True,
         use_first_point_prior: bool = False,
         use_gnc: bool = False,
@@ -125,6 +127,7 @@ class BundleAdjustmentOptimizer:
         self._use_calibration_prior = use_calibration_prior
         self._calibration_prior_focal_sigma = calibration_prior_focal_sigma
         self._calibration_prior_dist_sigma = calibration_prior_dist_sigma
+        self._calibration_prior_pp_sigma = calibration_prior_pp_sigma
         self._measurement_noise_sigma = measurement_noise_sigma
         self._allow_indeterminate_linear_system = allow_indeterminate_linear_system
         self._ordering_type = ordering_type
@@ -132,7 +135,8 @@ class BundleAdjustmentOptimizer:
         self._save_iteration_visualization = save_iteration_visualization
         self._robust_noise_basin = robust_noise_basin
         self._use_karcher_mean_factor = use_karcher_mean_factor
-        self._use_pose_prior = use_pose_prior
+        self._use_pose_prior_all_cameras = use_pose_prior_all_cameras
+        self._use_pose_prior_first_camera = use_pose_prior_first_camera
         self._use_first_point_prior = use_first_point_prior
         self._use_gnc = use_gnc
         if isinstance(gnc_loss, str):
@@ -229,18 +233,19 @@ class BundleAdjustmentOptimizer:
         if self._use_karcher_mean_factor:
             camera_keys = [X(i) for i in cameras_to_model]
             graph.push_back(gtsam.KarcherMeanFactorPose3(camera_keys, 6, 1000))
-            if self._use_pose_prior:
-                for camera_idx in cameras_to_model:
-                    camera_i = initial_data.get_camera(camera_idx)
-                    assert camera_i is not None, f"Camera {camera_idx} in initial data is None"
-                    graph.push_back(
-                        PriorFactorPose3(
-                            X(camera_idx),
-                            camera_i.pose(),
-                            Isotropic.Sigma(CAM_POSE3_DOF, self._cam_pose3_prior_noise_sigma),
-                        )
+
+        if self._use_pose_prior_all_cameras:
+            for camera_idx in cameras_to_model:
+                camera_i = initial_data.get_camera(camera_idx)
+                assert camera_i is not None, f"Camera {camera_idx} in initial data is None"
+                graph.push_back(
+                    PriorFactorPose3(
+                        X(camera_idx),
+                        camera_i.pose(),
+                        Isotropic.Sigma(CAM_POSE3_DOF, self._cam_pose3_prior_noise_sigma),
                     )
-        else:
+                )
+        elif self._use_pose_prior_first_camera:
             first_camera = initial_data.get_camera(cameras_to_model[0])
             assert first_camera is not None, "First camera in initial data is None"
             graph.push_back(
@@ -267,7 +272,7 @@ class BundleAdjustmentOptimizer:
             first_camera.calibration(),
             focal_sigma=self._calibration_prior_focal_sigma,
             dist_sigma=self._calibration_prior_dist_sigma,
-            pp_sigma=1e-5,
+            pp_sigma=self._calibration_prior_pp_sigma,
             skew_sigma=1e-6,
         )
         if self._shared_calib:
