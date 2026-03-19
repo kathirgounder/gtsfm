@@ -489,7 +489,7 @@ class ClusterVGGT(ClusterOptimizerBase):
         cameras_gt = [context.one_view_data_dict[idx].camera_gt for idx in range(context.num_images)]
         metrics_tasks = [
             delayed(_aggregate_vggt_metrics)(
-                result_graph,
+                ba_result_graph,
                 cameras_gt=cameras_gt,
                 pre_ba_result=pre_ba_result_graph,
                 save_dir=str(context.output_paths.metrics),
@@ -502,7 +502,7 @@ class ClusterVGGT(ClusterOptimizerBase):
         with self._output_annotation():
             io_tasks.append(
                 delayed(_save_reconstruction_as_text)(
-                    result_graph,
+                    ba_result_graph,
                     context.output_paths.results,
                 )
             )
@@ -516,5 +516,5 @@ class ClusterVGGT(ClusterOptimizerBase):
         return ClusterComputationGraph(
             io_tasks=tuple(io_tasks),
             metric_tasks=tuple(metrics_tasks),
-            sfm_result=result_graph,
+            sfm_result=ba_result_graph
         )
