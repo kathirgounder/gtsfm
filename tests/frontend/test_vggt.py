@@ -6,7 +6,6 @@ Authors: Xinan Zhang and Frank Dellaert
 import unittest
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torchvision.transforms import v2 as transforms  # type: ignore
@@ -19,7 +18,6 @@ from gtsfm.frontend.multi_view_tracker import (
     _select_track_ids_for_ba_coverage,
 )
 from gtsfm.frontend.vggt_geometry_transformer import (
-    DEFAULT_FIXED_RESOLUTION,
     VggtGeometryConfig,
     VggtGeometryTransformer,
     default_dtype,

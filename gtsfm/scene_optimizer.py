@@ -129,7 +129,11 @@ class SceneOptimizer:
         elif hasattr(self.cluster_optimizer, "_optimizer") and hasattr(
             getattr(self.cluster_optimizer, "_optimizer"), "_metric_constructed_only"
         ):
-            setattr(self.cluster_optimizer._optimizer, "_metric_constructed_only", self._merging_options.metric_constructed_only)
+            setattr(
+                self.cluster_optimizer._optimizer,
+                "_metric_constructed_only",
+                self._merging_options.metric_constructed_only,
+            )
         self._config_snapshot = None
         self.output_root = Path(output_root)
         if output_worker is not None:

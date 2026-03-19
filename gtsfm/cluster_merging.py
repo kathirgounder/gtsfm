@@ -16,7 +16,7 @@ from gtsam import Pose3, Similarity3, TrajectoryAlignerSim3, UnaryMeasurementPos
 import gtsfm.common.types as gtsfm_types
 import gtsfm.utils.logger as logger_utils
 import gtsfm.utils.metrics as metrics_utils
-from gtsfm.bundle.bundle_adjustment import BundleAdjustmentOptions, BundleAdjustmentOptimizer, RobustBAMode
+from gtsfm.bundle.bundle_adjustment import BundleAdjustmentOptions
 from gtsfm.cluster_optimizer.cluster_anysplat import save_splats
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.evaluation.metrics import GtsfmMetric, GtsfmMetricsGroup

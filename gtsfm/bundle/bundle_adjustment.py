@@ -5,7 +5,7 @@ Authors: Xiaolong Wu, John Lambert, Ayush Baid
 
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union

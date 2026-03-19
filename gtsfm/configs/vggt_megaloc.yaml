@@ -84,10 +84,11 @@ merging_options:
   plot_reprojection_histograms: true
   use_nonlinear_sim3_alignment: true
   pre_ba_max_reproj_error: 14.0
-  pre_ba_min_track_length: 3
+  pre_ba_min_track_length: 2
   post_ba_max_reproj_error: 3.0
   min_track_length: 3
   ba_options:
     _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptions
+    shared_calib: true
     use_calibration_prior: true
     use_gnc: false
