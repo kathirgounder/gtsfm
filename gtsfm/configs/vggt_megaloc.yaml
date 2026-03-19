@@ -32,7 +32,6 @@ cluster_optimizer:
   optimizer:
     _target_: gtsfm.cluster_optimizer.cluster_vggt.ClusterVGGT
 
-    # --- Geometry transformer ---
     geometry_transformer:
       _target_: gtsfm.frontend.vggt_geometry_transformer.VggtGeometryTransformer
       config:
@@ -41,7 +40,6 @@ cluster_optimizer:
         max_num_points: 100000
         seed: 42
 
-    # --- Multi-view tracker ---
     tracker:
       _target_: gtsfm.frontend.multi_view_tracker.MultiViewTracker
       config:
@@ -56,7 +54,6 @@ cluster_optimizer:
         min_triangulation_angle: 10.0
         min_track_length: 3
 
-    # --- Leaf-level bundle adjustment ---
     pre_ba_max_reproj_error: 14.0
     post_ba_max_reproj_error: 3.0
     drop_camera_with_no_track: false
@@ -87,7 +84,7 @@ merging_options:
   plot_reprojection_histograms: true
   use_nonlinear_sim3_alignment: true
   pre_ba_max_reproj_error: 14.0
-  pre_ba_min_track_length: 2
+  pre_ba_min_track_length: 3
   post_ba_max_reproj_error: 3.0
   min_track_length: 3
   ba_options:
