@@ -487,8 +487,18 @@ def main():
         best = max(curve_score, key=lambda x: x["f1"])
         results["best_f1_score_threshold"] = best["threshold"]
         results["best_f1"] = best["f1"]
+        results["best_f1_precision"] = best["precision"]
+        results["best_f1_recall"] = best["recall"]
+        results["best_f1_num_predicted"] = best["num_predicted"]
         print(f"  AUC: {auc:.4f}")
         print(f"  Best F1: {best['f1']:.4f} at score threshold {best['threshold']:.2f}")
+        print(f"    Precision: {best['precision']:.4f}, Recall: {best['recall']:.4f}")
+        print(f"    Predicted edges: {best['num_predicted']}, GT edges: {len(gt_set)}")
+
+        # Stats at score=0.5 (our current operating point).
+        pt05 = min(curve_score, key=lambda x: abs(x["threshold"] - 0.5))
+        print(f"  At score=0.5: P={pt05['precision']:.4f}, R={pt05['recall']:.4f}, "
+              f"F1={pt05['f1']:.4f}, edges={pt05['num_predicted']}")
 
         # Derive megaloc_set at 0.5 for GT sweep if no pairs file was provided.
         if not args.megaloc_pairs_file:
@@ -505,6 +515,8 @@ def main():
         results["pr_curve_sweep_gt"] = curve_gt
         best_gt = max(curve_gt, key=lambda x: x["f1"])
         print(f"  Best F1: {best_gt['f1']:.4f} at min_shared_points={best_gt['min_shared_points']}")
+        print(f"    Precision: {best_gt['precision']:.4f}, Recall: {best_gt['recall']:.4f}")
+        print(f"    GT edges at that threshold: {best_gt['num_gt_edges']}")
 
     # Plot
     if curve_score or curve_gt:
@@ -513,6 +525,26 @@ def main():
             output_plot = args.output_json.replace(".json", "_pr.png")
         if output_plot:
             plot_pr_curves(curve_score, curve_gt, args.dataset_name, output_plot)
+
+    # --- Summary ---
+    print("\n" + "=" * 60)
+    print(f"SUMMARY: {args.dataset_name}")
+    print("=" * 60)
+    print(f"  Images on disk: {len(image_fnames)}")
+    print(f"  GT registered: {num_registered} (with 3D obs: {num_with_obs})")
+    print(f"  GT graph (min_shared={args.min_shared_points}): {gt_stats['num_nodes']} nodes, "
+          f"{gt_stats['num_edges']} edges, {gt_stats['num_components']} components")
+    gt_density = gt_stats['num_edges'] / (gt_stats['num_nodes'] * (gt_stats['num_nodes'] - 1) / 2) * 100 if gt_stats['num_nodes'] > 1 else 0
+    print(f"  GT graph density: {gt_density:.1f}%")
+    if curve_score:
+        print(f"  Score sweep AUC: {results['pr_curve_sweep_score_auc']}")
+        print(f"  Best F1: {best['f1']:.4f} @ score={best['threshold']:.2f} "
+              f"(P={best['precision']:.4f}, R={best['recall']:.4f}, {best['num_predicted']} edges)")
+        print(f"  At score=0.5: P={pt05['precision']:.4f}, R={pt05['recall']:.4f}, "
+              f"F1={pt05['f1']:.4f}, {pt05['num_predicted']} edges")
+    if curve_gt:
+        print(f"  GT sweep best F1: {best_gt['f1']:.4f} @ min_shared={best_gt['min_shared_points']} "
+              f"(P={best_gt['precision']:.4f}, R={best_gt['recall']:.4f})")
 
     # --- Write JSON ---
     if args.output_json:
