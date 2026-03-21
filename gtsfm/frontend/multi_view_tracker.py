@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import os
+import sqlite3
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple, Union
 
+from PIL import Image as PILImage
 import numpy as np
 import torch
 import torch.nn.functional as F
 from gtsam import Point2, Point3
 from torch.amp import autocast as amp_autocast  # type: ignore
+import yaml
 
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.frontend.geometry_transformer import GeometryTransformerOutput
@@ -27,6 +31,22 @@ _IMAGENET_STD = [0.229, 0.224, 0.225]
 
 # Per-worker cache for DINOv2 model to avoid reloading per cluster/task.
 _DINO_V2_MODEL_CACHE: dict[tuple[str, str], Any] = {}
+_DEFAULT_VGGT_COLMAPTRACKER_CONFIG_PATH = (
+    Path(__file__).resolve().parent.parent / "configs" / "vggt_colmaptracker.yaml"
+)
+_COLMAP_TRACKER_TARGET_SIZE = 518
+_COLMAP_MAX_IMAGE_ID = 2147483647
+
+
+@dataclass(frozen=True)
+class _CachedColmapDatabase:
+    """Cached metadata read once from a COLMAP database."""
+
+    db_path: Path
+    image_id_by_name: dict[int, str]
+    name_to_image_id: dict[str, int]
+    keypoints_by_image_id: dict[int, np.ndarray]
+    matches: list[tuple[int, int, np.ndarray]]
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +71,9 @@ class TrackingConfig:
     ba_track_patch_grid_size: int = 8
     enable_ba_track_patching: bool = True
     ba_use_undistorted_camera_model: bool = False
+    colmaptracker_config_path: str = str(_DEFAULT_VGGT_COLMAPTRACKER_CONFIG_PATH)
+    colmap_database_path: Optional[str] = None
+    colmap_input_mode: str = "crop"
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +447,7 @@ class MultiViewTracker:
         *,
         model: Any = None,
         config: TrackingConfig | None = None,
+        image_names: Sequence[str] | None = None,
     ) -> VGGTTrackingResult:
         """Generate dense feature tracks using the VGGT tracking backend.
 
@@ -431,6 +455,7 @@ class MultiViewTracker:
             geo_output: Output from a geometry transformer.
             model: Loaded VGGT model (required for track head).
             config: Optional override config.
+            image_names: Optional image names to keep the interface aligned with other trackers.
 
         Returns:
             :class:`VGGTTrackingResult` with tracks, visibilities, and 3D points.
@@ -629,10 +654,519 @@ class MultiViewTracker:
 
 
 # ---------------------------------------------------------------------------
+# ColmapTracker
+# ---------------------------------------------------------------------------
+
+
+class ColmapTracker(MultiViewTracker):
+    """Tracker implementation that reads matches from a cached COLMAP database."""
+
+    _config_cache: dict[Path, dict[str, Any]] = {}
+    _database_cache: dict[Path, _CachedColmapDatabase] = {}
+    _image_size_cache: dict[Path, tuple[int, int]] = {}
+
+    def __init__(self, config: TrackingConfig | None = None) -> None:
+        super().__init__(config=config)
+
+    def run_tracking(
+        self,
+        geo_output: GeometryTransformerOutput,
+        *,
+        model: Any = None,
+        config: TrackingConfig | None = None,
+        image_names: Sequence[str] | None = None,
+    ) -> VGGTTrackingResult:
+        """Load tracks from a COLMAP database and package as tracking output.
+
+        Args:
+            geo_output: Geometry transformer output containing dense tracks and images.
+            model: Unused for this tracker.
+            config: Optional override config.
+            image_names: Image names used to resolve COLMAP image IDs.
+        """
+        cfg = config or self.config
+        if model is not None:
+            logger.debug("Ignoring provided model argument for ColmapTracker.")
+
+        if not image_names:
+            logger.warning(
+                "ColmapTracker requires image names to resolve COLMAP keypoints; returning empty tracks."
+            )
+            frame_num = int(geo_output.images.shape[0])
+            return VGGTTrackingResult(
+                tracks=np.zeros((frame_num, 0, 2), dtype=np.float32),
+                visibilities=np.zeros((frame_num, 0), dtype=np.float32),
+                confidences=None,
+                points_3d=np.zeros((0, 3), dtype=np.float32),
+                colors=np.zeros((0, 3), dtype=np.uint8),
+            )
+
+        db_path = self._resolve_database_path(cfg)
+        if not Path(db_path).exists():
+            raise FileNotFoundError(f"COLMAP database not found: {db_path}")
+
+        db_data = self._load_database(db_path)
+
+        selected_image_ids = self._resolve_image_ids(db_data, image_names or [])
+        if not selected_image_ids:
+            logger.warning("ColmapTracker received no matching image names for database %s.", db_path)
+            frame_num = int(geo_output.images.shape[0])
+            return VGGTTrackingResult(
+                tracks=np.zeros((frame_num, 0, 2), dtype=np.float32),
+                visibilities=np.zeros((frame_num, 0), dtype=np.float32),
+                confidences=None,
+                points_3d=np.zeros((0, 3), dtype=np.float32),
+                colors=np.zeros((0, 3), dtype=np.uint8),
+            )
+
+        if len(selected_image_ids) != len(image_names or []):
+            logger.warning(
+                "ColmapTracker mapped %d of %d provided image names to database images.",
+                len(selected_image_ids),
+                len(image_names or []),
+            )
+
+        preprocessed_tracks, visibilities = self._load_tracks_for_images(
+            db_data=db_data,
+            selected_image_ids=selected_image_ids,
+            mode=cfg.colmap_input_mode,
+        )
+
+        num_tracks = preprocessed_tracks.shape[1]
+        if num_tracks == 0:
+            empty_points = np.zeros((0, 3), dtype=np.float32)
+            return VGGTTrackingResult(
+                tracks=preprocessed_tracks,
+                visibilities=visibilities,
+                confidences=None,
+                points_3d=empty_points,
+                colors=np.zeros((0, 3), dtype=np.uint8),
+            )
+
+        dense_points = geo_output.dense_points
+        images = geo_output.images
+        points_3d = self._sample_points_from_tracks(preprocessed_tracks, visibilities, dense_points)
+        colors = self._sample_colors_from_tracks(preprocessed_tracks, visibilities, images)
+        return VGGTTrackingResult(
+            tracks=preprocessed_tracks,
+            visibilities=visibilities,
+            confidences=None,
+            points_3d=points_3d,
+            colors=colors,
+        )
+
+    @classmethod
+    def _load_reference_config(cls, config_path: Path) -> dict[str, Any]:
+        if config_path in cls._config_cache:
+            return cls._config_cache[config_path]
+
+        if not config_path.exists():
+            logger.debug("COLMAP tracker config path not found: %s", config_path)
+            cls._config_cache[config_path] = {}
+            return {}
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            loaded = yaml.safe_load(f) or {}
+        if not isinstance(loaded, dict):
+            logger.warning("Invalid YAML content in %s; expected a mapping.", config_path)
+            loaded = {}
+        cls._config_cache[config_path] = loaded
+        return loaded
+
+    @classmethod
+    def _resolve_database_path(cls, config: TrackingConfig) -> Path:
+        if config.colmap_database_path:
+            explicit = Path(config.colmap_database_path).expanduser()
+            if explicit.is_absolute():
+                return explicit
+            candidate = (Path(__file__).resolve().parent.parent / explicit).resolve()
+            if candidate.exists():
+                return candidate
+            return explicit
+
+        reference_cfg = cls._load_reference_config(Path(config.colmaptracker_config_path).expanduser())
+        loader_cfg = reference_cfg.get("loader", {})
+        dataset_dir = loader_cfg.get("dataset_dir")
+        if isinstance(dataset_dir, str) and dataset_dir not in {"???", ""}:
+            candidate = Path(dataset_dir).expanduser()
+            if not candidate.is_absolute():
+                candidate = (Path(__file__).resolve().parent.parent / candidate).resolve()
+            candidate = candidate / "database.db"
+            if candidate.exists():
+                return candidate
+
+        default_candidate = Path("/nethome/xzhang979/nvme/gtsfm/benchmarks/eth3dmvs/test/botanical_garden/database.db")
+        if default_candidate.exists():
+            return default_candidate
+        fallback = Path(config.colmaptracker_config_path).expanduser()
+        if not fallback.is_absolute():
+            fallback = (Path(__file__).resolve().parent.parent / fallback).resolve()
+        return fallback.parent / "database.db"
+
+    @classmethod
+    def _load_database(cls, db_path: Path) -> _CachedColmapDatabase:
+        db_path = db_path.resolve()
+        if db_path in cls._database_cache:
+            return cls._database_cache[db_path]
+
+        connection = sqlite3.connect(str(db_path))
+        cursor = connection.cursor()
+
+        image_rows = cursor.execute("SELECT image_id, name FROM images").fetchall()
+        image_id_by_name: dict[int, str] = {}
+        name_to_image_id: dict[str, int] = {}
+        for image_id, raw_name in image_rows:
+            image_id_int = int(image_id)
+            normalized = cls._normalize_image_name(str(raw_name))
+            image_id_by_name[image_id_int] = str(raw_name)
+            name_to_image_id[normalized] = image_id_int
+            name_to_image_id[os.path.basename(normalized)] = image_id_int
+
+        keypoints_by_image_id: dict[int, np.ndarray] = {}
+        for image_id, rows, cols, data in cursor.execute("SELECT image_id, rows, cols, data FROM keypoints"):
+            image_id_int = int(image_id)
+            if rows == 0 or cols == 0 or data is None:
+                keypoints_by_image_id[image_id_int] = np.zeros((0, 2), dtype=np.float32)
+                continue
+            blob = np.frombuffer(data, dtype=np.float32).reshape(int(rows), int(cols))
+            keypoints_by_image_id[image_id_int] = blob[:, :2].copy()
+
+        matches: list[tuple[int, int, np.ndarray]] = []
+        for pair_id, rows, cols, data in cursor.execute("SELECT pair_id, rows, cols, data FROM matches"):
+            if rows == 0 or cols == 0 or data is None:
+                continue
+            image_id1, image_id2 = cls._pair_id_to_image_ids(int(pair_id))
+            blob = np.frombuffer(data, dtype=np.uint32).reshape(int(rows), int(cols))
+            matches.append((image_id1, image_id2, blob[:, :2].copy()))
+
+        connection.close()
+
+        cached = _CachedColmapDatabase(
+            db_path=db_path,
+            image_id_by_name=image_id_by_name,
+            name_to_image_id=name_to_image_id,
+            keypoints_by_image_id=keypoints_by_image_id,
+            matches=matches,
+        )
+        cls._database_cache[db_path] = cached
+        return cached
+
+    @classmethod
+    def _pair_id_to_image_ids(cls, pair_id: int) -> tuple[int, int]:
+        image_id2 = pair_id % _COLMAP_MAX_IMAGE_ID
+        image_id1 = (pair_id - image_id2) // _COLMAP_MAX_IMAGE_ID
+        return int(image_id1), int(image_id2)
+
+    @classmethod
+    def _normalize_image_name(cls, name: str) -> str:
+        return os.path.normpath(name.replace("\\", "/"))
+
+    @classmethod
+    def _resolve_image_ids(cls, db_data: _CachedColmapDatabase, image_names: Sequence[str]) -> list[int]:
+        image_ids: list[int] = []
+        for raw_name in image_names:
+            if raw_name is None:
+                continue
+            normalized = cls._normalize_image_name(str(raw_name))
+            image_id = db_data.name_to_image_id.get(normalized)
+            if image_id is None:
+                image_id = db_data.name_to_image_id.get(os.path.basename(normalized))
+            if image_id is None:
+                logger.warning("Image %s not found in COLMAP database %s.", raw_name, db_data.db_path)
+                continue
+            image_ids.append(image_id)
+        seen: set[int] = set()
+        deduped = [image_id for image_id in image_ids if not (image_id in seen or seen.add(image_id))]
+        return deduped
+
+    def _resolve_image_size(self, db_dir: Path, image_name: str) -> tuple[int, int]:
+        normalized = self._normalize_image_name(image_name)
+        candidates = [
+            db_dir / normalized,
+            db_dir / os.path.basename(normalized),
+            Path(normalized),
+            Path(os.path.expanduser(normalized)),
+        ]
+        for candidate in candidates:
+            candidate = candidate.expanduser()
+            if not candidate.is_absolute():
+                candidate = (db_dir / candidate).resolve()
+            cached_size = self._image_size_cache.get(candidate)
+            if cached_size is not None:
+                return cached_size
+            if candidate.exists():
+                with PILImage.open(candidate) as img:
+                    size = img.size
+                self._image_size_cache[candidate] = size
+                return size
+        return 0, 0
+
+    def _load_tracks_for_images(
+        self,
+        db_data: _CachedColmapDatabase,
+        selected_image_ids: list[int],
+        mode: str = "crop",
+    ) -> tuple[np.ndarray, np.ndarray]:
+        selected_set = set(selected_image_ids)
+        num_frames = len(selected_image_ids)
+
+        image_id_to_local_frame = {image_id: frame_idx for frame_idx, image_id in enumerate(selected_image_ids)}
+        image_name_by_id = {image_id: db_data.image_id_by_name.get(image_id, "") for image_id in selected_image_ids}
+
+        # Read image sizes and map DB keypoints to the preprocessing coordinate frame.
+        db_dir = db_data.db_path.parent
+        frame_points: list[np.ndarray] = []
+        frame_sizes: list[tuple[int, int]] = []
+        for image_id in selected_image_ids:
+            keypoints = db_data.keypoints_by_image_id.get(image_id, np.zeros((0, 2), dtype=np.float32))
+            if keypoints.size == 0:
+                frame_points.append(np.zeros((0, 2), dtype=np.float32))
+                frame_sizes.append((0, 0))
+                continue
+            width, height = self._resolve_image_size(db_dir, image_name_by_id[image_id])
+            if width == 0 or height == 0:
+                width = float(np.max(keypoints[:, 0]) + 1.0) if keypoints.size else 1.0
+                height = float(np.max(keypoints[:, 1]) + 1.0) if keypoints.size else 1.0
+                width = max(1.0, width)
+                height = max(1.0, height)
+            transformed = self._transform_keypoints_to_preprocessed_frame(
+                keypoints.astype(np.float32),
+                int(width),
+                int(height),
+                mode=mode,
+            )
+            frame_points.append(transformed.points)
+            frame_sizes.append((transformed.height, transformed.width))
+
+        # Additional global padding to emulate batched preprocessing in the loader.
+        max_h = max(h for h, _ in frame_sizes)
+        max_w = max(w for _, w in frame_sizes)
+        if max_h == 0:
+            max_h = 1
+        if max_w == 0:
+            max_w = 1
+        for idx, (frame_h, frame_w) in enumerate(frame_sizes):
+            h_pad = max_h - frame_h
+            w_pad = max_w - frame_w
+            if h_pad <= 0 and w_pad <= 0:
+                continue
+            x_offset = w_pad // 2
+            y_offset = h_pad // 2
+            if frame_points[idx].size:
+                frame_points[idx][:, 0] = frame_points[idx][:, 0] + x_offset
+                frame_points[idx][:, 1] = frame_points[idx][:, 1] + y_offset
+            frame_points[idx] = np.clip(frame_points[idx], [0.0, 0.0], [max_w - 1.0, max_h - 1.0])
+
+        # Union-Find over keypoint observations for selected image pair matches.
+        num_local_points = []
+        for points in frame_points:
+            num_local_points.append(points.shape[0])
+        total_keypoints = int(sum(num_local_points))
+        if total_keypoints == 0:
+            return (
+                np.zeros((num_frames, 0, 2), dtype=np.float32),
+                np.zeros((num_frames, 0), dtype=np.float32),
+            )
+
+        local_offset: dict[int, int] = {}
+        running = 0
+        for image_id, num_points in zip(selected_image_ids, num_local_points):
+            local_offset[image_id] = running
+            running += num_points
+
+        parent = np.arange(total_keypoints, dtype=np.int64)
+        rank = np.zeros(total_keypoints, dtype=np.int8)
+
+        def find(idx: int) -> int:
+            while parent[idx] != idx:
+                parent[idx] = parent[parent[idx]]
+                idx = parent[idx]
+            return int(idx)
+
+        def union(i_idx: int, j_idx: int) -> None:
+            i_root = find(i_idx)
+            j_root = find(j_idx)
+            if i_root == j_root:
+                return
+            if rank[i_root] < rank[j_root]:
+                parent[i_root] = j_root
+            elif rank[i_root] > rank[j_root]:
+                parent[j_root] = i_root
+            else:
+                parent[j_root] = i_root
+                rank[i_root] += 1
+
+        for image_id1, image_id2, pair_matches in db_data.matches:
+            if image_id1 not in selected_set or image_id2 not in selected_set:
+                continue
+            if pair_matches.size == 0:
+                continue
+            offset1 = local_offset[image_id1]
+            offset2 = local_offset[image_id2]
+            num_p1 = num_local_points[image_id_to_local_frame[image_id1]]
+            num_p2 = num_local_points[image_id_to_local_frame[image_id2]]
+            match_kp1 = pair_matches[:, 0].astype(np.int64)
+            match_kp2 = pair_matches[:, 1].astype(np.int64)
+            valid = (match_kp1 >= 0) & (match_kp1 < num_p1) & (match_kp2 >= 0) & (match_kp2 < num_p2)
+            if not np.any(valid):
+                continue
+            match_kp1 = match_kp1[valid]
+            match_kp2 = match_kp2[valid]
+            for i1, i2 in zip(offset1 + match_kp1, offset2 + match_kp2):
+                union(int(i1), int(i2))
+
+        roots = np.fromiter((find(idx) for idx in range(total_keypoints)), dtype=np.int64, count=total_keypoints)
+        track_obs: dict[int, list[int]] = {}
+        for idx, root in enumerate(roots):
+            track_obs.setdefault(int(root), []).append(idx)
+        valid_track_obs = [obs for obs in track_obs.values() if len(obs) >= 2]
+        num_tracks = len(valid_track_obs)
+        if num_tracks == 0:
+            return (
+                np.zeros((num_frames, 0, 2), dtype=np.float32),
+                np.zeros((num_frames, 0), dtype=np.float32),
+            )
+
+        tracks = np.zeros((num_frames, num_tracks, 2), dtype=np.float32)
+        visibility = np.zeros((num_frames, num_tracks), dtype=np.float32)
+        frame_index_by_global = np.empty(total_keypoints, dtype=np.int32)
+        keypoint_index_by_global = np.empty(total_keypoints, dtype=np.int32)
+        for image_id, frame_idx in image_id_to_local_frame.items():
+            start = local_offset[image_id]
+            end = start + num_local_points[frame_idx]
+            frame_index_by_global[start:end] = frame_idx
+            keypoint_index_by_global[start:end] = np.arange(num_local_points[frame_idx], dtype=np.int32)
+
+        for track_idx, obs in enumerate(valid_track_obs):
+            for local_idx in obs:
+                frame_idx = int(frame_index_by_global[local_idx])
+                kp_idx = int(keypoint_index_by_global[local_idx])
+                points = frame_points[frame_idx]
+                if kp_idx < points.shape[0]:
+                    tracks[frame_idx, track_idx, :] = points[kp_idx]
+                    visibility[frame_idx, track_idx] = 1.0
+
+        return tracks, visibility
+
+    @classmethod
+    def _transform_keypoints_to_preprocessed_frame(
+        cls,
+        keypoints: np.ndarray,
+        orig_width: int,
+        orig_height: int,
+        mode: str = "crop",
+    ) -> "_TransformedKeypoints":
+        target_size = _COLMAP_TRACKER_TARGET_SIZE
+        if keypoints.size == 0 or orig_width <= 0 or orig_height <= 0:
+            return _TransformedKeypoints(np.zeros((0, 2), dtype=np.float32), 0, 0)
+        if mode not in {"crop", "pad"}:
+            raise ValueError(f"Unsupported input mode '{mode}'. Expected 'crop' or 'pad'.")
+
+        orig_w = float(orig_width)
+        orig_h = float(orig_height)
+        scaled_w = float(target_size)
+        scaled_h = round(orig_h * (scaled_w / orig_w) / 14.0) * 14.0
+        scale_x = scaled_w / orig_w
+        scale_y = scaled_h / orig_h
+        x = keypoints[:, 0] * scale_x
+        y = keypoints[:, 1] * scale_y
+
+        if mode == "pad":
+            h_padding = target_size - int(scaled_h)
+            w_padding = target_size - int(scaled_w)
+            pad_left = max(w_padding // 2, 0)
+            pad_top = max(h_padding // 2, 0)
+            x = x + float(pad_left)
+            y = y + float(pad_top)
+            out_h = target_size
+            out_w = target_size
+        else:
+            start_y = (int(scaled_h) - target_size) // 2 if int(scaled_h) > target_size else 0
+            y = y - float(start_y)
+            out_h = min(int(scaled_h), target_size)
+            out_w = min(int(scaled_w), target_size)
+
+        x = np.clip(x, 0.0, max(float(out_w - 1), 0.0))
+        y = np.clip(y, 0.0, max(float(out_h - 1), 0.0))
+        return _TransformedKeypoints(np.stack([x, y], axis=1).astype(np.float32), out_h, out_w)
+
+    @staticmethod
+    def _sample_points_from_tracks(
+        tracks: np.ndarray,
+        visibilities: np.ndarray,
+        dense_points: torch.Tensor,
+    ) -> np.ndarray:
+        if tracks.size == 0 or visibilities.size == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        dense_np = dense_points.detach().float().cpu().numpy()
+        visibility_mask = visibilities > 0.0
+        first_frame = visibility_mask.argmax(axis=0)
+        valid = visibility_mask.sum(axis=0) > 0
+        track_indices = np.flatnonzero(valid)
+        if track_indices.size == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        h = dense_np.shape[1]
+        w = dense_np.shape[2]
+        sample_frames = first_frame[track_indices]
+        sample_x = tracks[sample_frames, track_indices, 0]
+        sample_y = tracks[sample_frames, track_indices, 1]
+        sample_x_int = np.rint(sample_x).astype(np.int64)
+        sample_y_int = np.rint(sample_y).astype(np.int64)
+        sample_x_int = np.clip(sample_x_int, 0, w - 1)
+        sample_y_int = np.clip(sample_y_int, 0, h - 1)
+        sampled = dense_np[sample_frames.astype(np.int64), sample_y_int, sample_x_int]
+        sampled = np.nan_to_num(sampled, nan=0.0, posinf=0.0, neginf=0.0)
+        points = np.zeros((tracks.shape[1], 3), dtype=np.float32)
+        points[track_indices] = sampled.astype(np.float32)
+        return points
+
+    @staticmethod
+    def _sample_colors_from_tracks(
+        tracks: np.ndarray,
+        visibilities: np.ndarray,
+        images: torch.Tensor,
+    ) -> np.ndarray:
+        if tracks.size == 0 or visibilities.size == 0:
+            return np.zeros((0, 3), dtype=np.uint8)
+
+        image_np = (images.detach().float().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        visibility_mask = visibilities > 0.0
+        first_frame = visibility_mask.argmax(axis=0)
+        valid = visibility_mask.sum(axis=0) > 0
+        track_indices = np.flatnonzero(valid)
+        if track_indices.size == 0:
+            return np.zeros((0, 3), dtype=np.uint8)
+
+        h = image_np.shape[2]
+        w = image_np.shape[3]
+        sample_frames = first_frame[track_indices]
+        sample_x = tracks[sample_frames, track_indices, 0]
+        sample_y = tracks[sample_frames, track_indices, 1]
+        sample_x_int = np.rint(sample_x).astype(np.int64)
+        sample_y_int = np.rint(sample_y).astype(np.int64)
+        sample_x_int = np.clip(sample_x_int, 0, w - 1)
+        sample_y_int = np.clip(sample_y_int, 0, h - 1)
+        sampled = image_np[sample_frames.astype(np.int64), :, sample_y_int, sample_x_int].transpose(0, 1)
+        colors = sampled.astype(np.uint8)
+        out = np.zeros((tracks.shape[1], 3), dtype=np.uint8)
+        out[track_indices] = colors
+        return out
+
+
+@dataclass
+class _TransformedKeypoints:
+    points: np.ndarray
+    height: int
+    width: int
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 __all__ = [
+    "ColmapTracker",
     "MultiViewTracker",
     "TrackingConfig",
     "VGGTTrackingResult",

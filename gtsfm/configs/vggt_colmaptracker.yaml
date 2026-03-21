@@ -1,0 +1,69 @@
+# VGGT cluster-only configuration.
+
+# @package _global_
+_target_: gtsfm.scene_optimizer.SceneOptimizer
+
+loader:
+  _target_: gtsfm.loader.Olsson
+  dataset_dir: ??? # Required: set to the dataset root on the command line.
+  images_dir: null
+  max_resolution: 518 # VGGT recommended max resolution. Non editable. mode is fixed to "crop"
+
+image_pairs_generator:
+  _target_: gtsfm.retriever.image_pairs_generator.ImagePairsGenerator
+  global_descriptor:
+    _target_: gtsfm.frontend.cacher.global_descriptor_cacher.GlobalDescriptorCacher
+    global_descriptor_obj:
+      _target_: gtsfm.frontend.global_descriptor.MegaLoc
+  retriever:
+    _target_: gtsfm.retriever.Similarity
+    num_matched: 5
+    min_score: 0.25
+  batch_size: 16
+
+graph_partitioner:
+  _target_: gtsfm.graph_partitioner.Metis
+
+cluster_optimizer:
+  _target_: gtsfm.cluster_optimizer.Cacher
+  optimizer:
+    _target_: gtsfm.cluster_optimizer.cluster_vggt.ClusterVGGT
+
+    # --- Geometry transformer ---
+    geometry_transformer:
+      _target_: gtsfm.frontend.vggt_geometry_transformer.VggtGeometryTransformer
+      config:
+        _target_: gtsfm.frontend.vggt_geometry_transformer.VggtGeometryConfig
+        confidence_threshold: 5.0
+        max_num_points: 100000
+        seed: 42
+
+    # --- Use Colmap tracker ---
+    tracker:
+      _target_: gtsfm.frontend.multi_view_tracker.ColmapTracker
+      config:
+        _target_: gtsfm.frontend.multi_view_tracker.TrackingConfig
+        tracking: true
+        vggt_max_reproj_error: 0 # 0.0 means no filtering based on reproj error
+        min_triangulation_angle: 0.0
+        ba_use_undistorted_camera_model: false
+
+    # --- VGGT operational params ---
+    weights_path: null
+    seed: 42
+    model_cache_key: null
+
+# --- Merging options ---
+merging_options:
+  _target_: gtsfm.cluster_merging.MergingOptions
+  run_bundle_adjustment: false
+  merge_duplicate_tracks: false
+  drop_child_if_merging_fail: true
+  drop_outlier_after_camera_merging: false
+  drop_camera_with_no_track: true
+  keep_all_cameras: false
+  plot_reprojection_histograms: true
+  ba_options:
+    _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptions
+    shared_calib: true
+    use_calibration_prior: false

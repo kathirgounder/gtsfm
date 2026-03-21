@@ -211,7 +211,7 @@ def _run_vggt_pipeline(
     # Step 2: Optional tracking.
     tracking_result = None
     if tracker.config.tracking:
-        tracking_result = tracker.run_tracking(geo_output, model=cached_model)
+        tracking_result = tracker.run_tracking(geo_output, model=cached_model, image_names=image_names)
         if geo_output.device.type == "cuda":
             offload_vggt_model(cached_model)
 
