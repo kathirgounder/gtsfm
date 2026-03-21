@@ -12,11 +12,12 @@ import json
 import os
 import textwrap
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, NamedTuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 from gtsam import Pose3, Rot3
+from thirdparty.colmap.scripts.python import read_write_model
 
 import gtsfm.utils.logger as logger_utils
 import gtsfm.utils.metrics as metric_utils
@@ -145,6 +146,205 @@ def _find_cluster_recon_dirs(root: Path, recon_name: str) -> Iterable[Path]:
             yield Path(dirpath)
 
 
+def _image_candidates(image_name: str, root_dirs: List[str]) -> List[str]:
+    """Generate common candidate paths for an image under a list of root directories."""
+    base_name = os.path.basename(image_name)
+    candidates: List[str] = []
+    for root_dir in root_dirs:
+        if root_dir == "":
+            continue
+        candidates.extend(
+            [
+                os.path.join(root_dir, image_name),
+                os.path.join(root_dir, base_name),
+                os.path.join(root_dir, "images", image_name),
+                os.path.join(root_dir, "images", base_name),
+            ]
+        )
+    return list(dict.fromkeys([path for path in candidates if path]))
+
+
+def _find_image_path(image_name: str, root_dirs: List[str]) -> Optional[str]:
+    """Find an image file path from candidate roots."""
+    if os.path.isabs(image_name) and os.path.exists(image_name):
+        return image_name
+    for path in _image_candidates(image_name, root_dirs):
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _find_images_file_in_reconstruction(model_dir: Path | str) -> Optional[str]:
+    """Find COLMAP images.txt or images.bin under a reconstruction directory."""
+    model_root = str(model_dir)
+    candidates = [model_root, os.path.join(model_root, "0")]
+    for base in candidates:
+        for fname in ("images.txt", "images.bin"):
+            candidate = os.path.join(base, fname)
+            if os.path.isfile(candidate):
+                return candidate
+    for root, _dirs, files in os.walk(model_root):
+        if "images.txt" in files:
+            return os.path.join(root, "images.txt")
+        if "images.bin" in files:
+            return os.path.join(root, "images.bin")
+    return None
+
+
+def _get_current_image_measurement_counts(current_recon_dir: Path) -> Dict[str, int]:
+    """Read number of 2D observations per image from the current reconstruction."""
+    images_file = _find_images_file_in_reconstruction(current_recon_dir)
+    if images_file is None:
+        logger.warning("No images.txt/images.bin found in %s; cannot read measurement counts.", current_recon_dir)
+        return {}
+    try:
+        if images_file.endswith(".bin"):
+            images = read_write_model.read_images_binary(images_file)
+        else:
+            images = read_write_model.read_images_text(images_file)
+    except Exception as e:
+        logger.warning("Failed to read %s (%s): %s", images_file, type(e).__name__, str(e))
+        return {}
+    counts = {img.name: len(img.xys) for _, img in images.items()}
+    logger.info("Loaded %d images with measurement counts from %s.", len(counts), images_file)
+    return counts
+
+
+def _get_measurement_count_for_image(
+    image_name: str, image_measurement_counts: Optional[Dict[str, int]]
+) -> Optional[int]:
+    """Get per-image measurement count by matching full name or basename."""
+    if image_measurement_counts is None:
+        return None
+    base_name = os.path.basename(image_name)
+    return image_measurement_counts.get(image_name, image_measurement_counts.get(base_name))
+
+
+def _save_image_with_error_overlay(
+    src_path: str, dst_path: str, error: float, metric_name: str, num_measurements: Optional[object] = None
+) -> None:
+    """Save an image copy with error text and number of measurements overlaid."""
+    image = plt.imread(src_path)
+    fig = plt.figure(figsize=(12, 8))
+    ax = fig.add_subplot(1, 1, 1)
+    ax.imshow(image)
+    ax.axis("off")
+    measurement_text = "N/A" if num_measurements is None else str(num_measurements)
+    ax.text(
+        0.02,
+        0.02,
+        f"{metric_name}: {float(error):.4f}\nnum_measurements: {measurement_text}",
+        color="yellow",
+        fontsize=14,
+        weight="bold",
+        transform=ax.transAxes,
+        bbox=dict(facecolor="black", alpha=0.6, edgecolor="none", pad=3.0),
+    )
+    fig.savefig(dst_path, dpi=200, bbox_inches="tight", pad_inches=0)
+    plt.close(fig)
+
+
+def _plot_error_vs_measurements(
+    metric: metric_utils.GtsfmMetric,
+    image_names: List[str],
+    image_measurement_counts: Optional[Dict[str, int]],
+    output_dirpath: Path,
+) -> None:
+    """Save a scatter plot of metric error versus per-image measurement count."""
+    if metric.data is None:
+        logger.warning("Skipping error-vs-measurements plot for metric `%s`: no full data.", metric.name)
+        return
+
+    errors = np.asarray(metric.data, dtype=np.float32)
+    if errors.size != len(image_names):
+        logger.warning(
+            "Skipping error-vs-measurements plot for metric `%s`: mismatch between errors (%d) and image names (%d).",
+            metric.name,
+            int(errors.size),
+            len(image_names),
+        )
+        return
+
+    valid_mask = np.isfinite(errors)
+    if not np.any(valid_mask):
+        logger.warning("Skipping error-vs-measurements plot for metric `%s`: no finite errors.", metric.name)
+        return
+
+    valid_names = np.array(image_names, dtype=object)[valid_mask]
+    valid_errors = errors[valid_mask]
+    counts = []
+    for name in valid_names:
+        count = _get_measurement_count_for_image(str(name), image_measurement_counts)
+        counts.append(np.nan if count is None else float(count))
+
+    counts_np = np.asarray(counts, dtype=np.float32)
+    valid_count_mask = np.isfinite(counts_np)
+    if not np.any(valid_count_mask):
+        logger.warning(
+            "Skipping error-vs-measurements plot for metric `%s`: no numeric measurement counts.", metric.name
+        )
+        return
+
+    output_dirpath.mkdir(parents=True, exist_ok=True)
+    fig = plt.figure(figsize=(7, 6))
+    ax = fig.add_subplot(1, 1, 1)
+    ax.scatter(counts_np[valid_count_mask], valid_errors[valid_count_mask], s=12, alpha=0.55)
+    ax.set_title(f"{metric.name}: error vs num_measurements")
+    ax.set_xlabel("num_measurements")
+    ax.set_ylabel(metric.name)
+    ax.grid(alpha=0.3, linestyle="--")
+    fig.tight_layout()
+    fig.savefig(str(output_dirpath / f"{output_dirpath.name}_error_vs_measurements.png"), dpi=250)
+    plt.close(fig)
+
+
+def _export_ranked_images(
+    metric: metric_utils.GtsfmMetric,
+    image_names: List[str],
+    image_roots: List[str],
+    output_dirpath: Path,
+    metric_folder: str,
+    image_measurement_counts: Optional[Dict[str, int]] = None,
+) -> None:
+    """Export images sorted by metric value in descending error order."""
+    if metric.data is None:
+        logger.warning("Skipping image export for metric `%s`: no full data.", metric.name)
+        return
+
+    errors = np.asarray(metric.data, dtype=np.float32)
+    if errors.size != len(image_names):
+        logger.warning(
+            "Skipping image export for metric `%s`: mismatch between errors (%d) and image names (%d).",
+            metric.name,
+            int(errors.size),
+            len(image_names),
+        )
+        return
+
+    valid = np.isfinite(errors)
+    valid_errors = errors[valid]
+    sorted_indices = np.argsort(valid_errors)[::-1]
+    valid_names = np.array(image_names, dtype=object)[valid]
+
+    metric_output_dir = output_dirpath / metric_folder
+    metric_output_dir.mkdir(parents=True, exist_ok=True)
+
+    for rank, sorted_idx in enumerate(sorted_indices):
+        image_name = str(valid_names[sorted_idx])
+        src = _find_image_path(image_name, image_roots)
+        if src is None:
+            logger.warning("Could not find image file for %s.", image_name)
+            continue
+        dst = str(metric_output_dir / f"{rank}_{os.path.basename(image_name)}")
+        num_measurements = "N/A"
+        if image_measurement_counts is not None:
+            count_value = _get_measurement_count_for_image(image_name, image_measurement_counts)
+            if count_value is not None:
+                num_measurements = count_value
+        error = float(valid_errors[sorted_idx])
+        _save_image_with_error_overlay(src, dst, error, metric.name, num_measurements=num_measurements)
+
+
 def _build_pose_lists(
     baseline_poses: Dict[str, Pose3],
     current_poses: Dict[str, Pose3],
@@ -183,8 +383,12 @@ def _compute_pose_metrics(baseline_list: List[Pose3], current_aligned_list: List
     baseline_wRi_dict, baseline_wti_dict = metric_utils.get_rotations_translations_from_poses(baseline_dict)
 
     metrics = []
-    metrics.append(metric_utils.compute_rotation_angle_metric(wRi_aligned_dict, baseline_wRi_dict))
-    metrics.append(metric_utils.compute_translation_distance_metric(wti_aligned_dict, baseline_wti_dict))
+    metrics.append(
+        metric_utils.compute_rotation_angle_metric(wRi_aligned_dict, baseline_wRi_dict, store_full_data=True)
+    )
+    metrics.append(
+        metric_utils.compute_translation_distance_metric(wti_aligned_dict, baseline_wti_dict, store_full_data=True)
+    )
     metrics.append(metric_utils.compute_translation_angle_metric(baseline_dict, current_dict))
     relative_rotation_error_metric = metric_utils.compute_relative_rotation_angle_metric(
         i2Ri1_dict_gt, current_dict, store_full_data=True
@@ -655,7 +859,24 @@ def export_metrics_group_to_csv(
         writer.writeheader()
 
 
-def main() -> None:
+class _ClusterComparisonResult(NamedTuple):
+    """Container for all outputs generated while evaluating one cluster reconstruction."""
+
+    recon_dir: Path
+    common_names: List[str]
+    baseline_list: List[Pose3]
+    current_aligned_list: List[Pose3]
+    baseline_count: int
+    current_count: int
+    common_count: int
+    current_image_measurement_counts: Optional[Dict[str, int]]
+    metrics_group: GtsfmMetricsGroup
+    intrinsics_deltas: Dict[str, List[float]]
+    fov_deltas: Dict[str, List[float]]
+
+
+def _parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for cluster comparison run."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline", required=True, help="Path to baseline COLMAP directory.")
     parser.add_argument("--root", required=True, help="Root directory to traverse for cluster reconstructions.")
@@ -694,21 +915,377 @@ def main() -> None:
         default=0,
         help="Random seed for robust Sim(3) alignment.",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    baseline_images = Path(args.baseline) / "images.txt"
-    baseline_cameras_txt = Path(args.baseline) / "cameras.txt"
-    baseline_poses, baseline_camera_by_name = _read_images_txt_with_names_and_cameras(baseline_images)
-    baseline_cameras = _read_cameras_txt_with_ids(baseline_cameras_txt)
+
+def _get_default_fig_output_dir(args: argparse.Namespace) -> Optional[Path]:
+    """Get figure directory from args, using CSV output folder as fallback."""
     fig_output_dir = Path(args.fig_output_dir) if args.fig_output_dir else None
     if fig_output_dir is None and args.csv_output:
         fig_output_dir = Path(args.csv_output).parent / "cluster_camera_centers"
+    return fig_output_dir
+
+
+def _load_baseline_data(baseline_dir: Path) -> Tuple[
+    Dict[str, Pose3],
+    Dict[str, int],
+    Dict[int, Dict[str, float]],
+]:
+    """Load baseline pose and intrinsic dictionaries used by all comparisons."""
+    baseline_images = baseline_dir / "images.txt"
+    baseline_cameras_txt = baseline_dir / "cameras.txt"
+    baseline_poses, baseline_camera_by_name = _read_images_txt_with_names_and_cameras(baseline_images)
+    baseline_cameras = _read_cameras_txt_with_ids(baseline_cameras_txt)
+    return baseline_poses, baseline_camera_by_name, baseline_cameras
+
+
+def _compute_intrinsics_deltas(
+    common_names: List[str],
+    baseline_camera_by_name: Dict[str, int],
+    current_camera_by_name: Dict[str, int],
+    baseline_cameras: Dict[int, Dict[str, float]],
+    current_cameras: Dict[int, Dict[str, float]],
+) -> Tuple[Dict[str, List[float]], Dict[str, List[float]]]:
+    """Compute intrinsics and FOV deltas for common images in the cluster."""
+    intrinsics_deltas: Dict[str, List[float]] = {
+        "delta_fx_norm": [],
+        "delta_fy_norm": [],
+        "delta_cx_norm": [],
+        "delta_cy_norm": [],
+    }
+    fov_deltas: Dict[str, List[float]] = {
+        "delta_fovx_deg": [],
+        "delta_fovy_deg": [],
+    }
+
+    for name in common_names:
+        base_cam_id = baseline_camera_by_name.get(name)
+        curr_cam_id = current_camera_by_name.get(name)
+        if base_cam_id is None or curr_cam_id is None:
+            continue
+        base = baseline_cameras.get(base_cam_id)
+        curr = current_cameras.get(curr_cam_id)
+        if base is None or curr is None:
+            continue
+
+        base_w, base_h = base["width"], base["height"]
+        curr_w, curr_h = curr["width"], curr["height"]
+        if curr_w > 0 and curr_h > 0 and (base_w != curr_w or base_h != curr_h):
+            sx = base_w / curr_w
+            sy = base_h / curr_h
+            curr_fx = curr["fx"] * sx
+            curr_fy = curr["fy"] * sy
+            curr_cx = curr["cx"] * sx
+            curr_cy = curr["cy"] * sy
+        else:
+            curr_fx = curr["fx"]
+            curr_fy = curr["fy"]
+            curr_cx = curr["cx"]
+            curr_cy = curr["cy"]
+
+        if base_w > 0 and base_h > 0:
+            if base["fx"] != 0:
+                intrinsics_deltas["delta_fx_norm"].append(abs(base["fx"] - curr_fx) / abs(base["fx"]))
+            if base["fy"] != 0:
+                intrinsics_deltas["delta_fy_norm"].append(abs(base["fy"] - curr_fy) / abs(base["fy"]))
+            if base["cx"] != 0:
+                intrinsics_deltas["delta_cx_norm"].append(abs(base["cx"] - curr_cx) / abs(base["cx"]))
+            if base["cy"] != 0:
+                intrinsics_deltas["delta_cy_norm"].append(abs(base["cy"] - curr_cy) / abs(base["cy"]))
+        if base["fx"] != 0 and curr_fx != 0 and base["fy"] != 0 and curr_fy != 0:
+            base_fovx = 2.0 * np.degrees(np.arctan(base_w / (2.0 * base["fx"])))
+            base_fovy = 2.0 * np.degrees(np.arctan(base_h / (2.0 * base["fy"])))
+            curr_fovx = 2.0 * np.degrees(np.arctan(base_w / (2.0 * curr_fx)))
+            curr_fovy = 2.0 * np.degrees(np.arctan(base_h / (2.0 * curr_fy)))
+            fov_deltas["delta_fovx_deg"].append(abs(base_fovx - curr_fovx))
+            fov_deltas["delta_fovy_deg"].append(abs(base_fovy - curr_fovy))
+
+    return intrinsics_deltas, fov_deltas
+
+
+def _process_recon_dir(
+    recon_dir: Path,
+    baseline_poses: Dict[str, Pose3],
+    baseline_camera_by_name: Dict[str, int],
+    baseline_cameras: Dict[int, Dict[str, float]],
+    use_ransac: bool,
+    robust_max_hypotheses: int,
+    robust_inlier_thresh: float,
+    rng: np.random.Generator,
+) -> Optional[_ClusterComparisonResult]:
+    """Process one cluster reconstruction folder and return comparison metrics."""
+    current_images = recon_dir / "images.txt"
+    current_cameras_txt = recon_dir / "cameras.txt"
+
+    current_poses, current_camera_by_name = _read_images_txt_with_names_and_cameras(current_images)
+    try:
+        current_cameras = _read_cameras_txt_with_ids(current_cameras_txt)
+    except FileNotFoundError:
+        logger.warning("Missing cameras.txt for %s; skipping intrinsics comparison.", recon_dir)
+        current_cameras = {}
+
+    common_names, baseline_list, current_list = _build_pose_lists(
+        baseline_poses, current_poses, cluster_label=str(recon_dir)
+    )
+    baseline_count = len(baseline_poses)
+    current_count = len(current_poses)
+    common_count = len(common_names)
+    if len(common_names) < 2:
+        logger.warning(
+            "Skipping %s (baseline=%d, current=%d, common=%d)",
+            recon_dir,
+            baseline_count,
+            current_count,
+            common_count,
+        )
+        return None
+
+    current_aligned_list, _aSb = _align_poses(
+        baseline_list,
+        current_list,
+        use_ransac=use_ransac,
+        max_hypotheses=robust_max_hypotheses,
+        inlier_thresh=robust_inlier_thresh,
+        rng=rng,
+        cluster_label=str(recon_dir),
+    )
+    try:
+        metrics_group = _compute_pose_metrics(baseline_list, current_aligned_list)
+    except Exception as exc:
+        logger.warning("Skipping %s due to metric failure: %s", recon_dir, exc)
+        return None
+
+    _summarize_pose_errors(baseline_list, current_aligned_list, str(recon_dir))
+
+    current_image_measurement_counts = _get_current_image_measurement_counts(recon_dir)
+    if current_image_measurement_counts:
+        valid_count_values = [
+            _get_measurement_count_for_image(name, current_image_measurement_counts)
+            for name in common_names
+            if _get_measurement_count_for_image(name, current_image_measurement_counts) is not None
+        ]
+        if valid_count_values:
+            logger.info(
+                "Current reconstruction measurement stats for %s: n=%d, min=%d, max=%d, mean=%.2f",
+                recon_dir,
+                len(valid_count_values),
+                int(min(valid_count_values)),
+                int(max(valid_count_values)),
+                float(np.mean(valid_count_values)),
+            )
+
+    intrinsics_deltas, fov_deltas = _compute_intrinsics_deltas(
+        common_names,
+        baseline_camera_by_name,
+        current_camera_by_name,
+        baseline_cameras,
+        current_cameras,
+    )
+
+    return _ClusterComparisonResult(
+        recon_dir=recon_dir,
+        common_names=common_names,
+        baseline_list=baseline_list,
+        current_aligned_list=current_aligned_list,
+        baseline_count=baseline_count,
+        current_count=current_count,
+        common_count=common_count,
+        current_image_measurement_counts=current_image_measurement_counts,
+        metrics_group=metrics_group,
+        intrinsics_deltas=intrinsics_deltas,
+        fov_deltas=fov_deltas,
+    )
+
+
+def _update_cluster_aggregates(
+    metrics_group: GtsfmMetricsGroup,
+    current_count: int,
+    all_pose_auc_values: Dict[str, List[float]],
+    all_pose_auc_by_label_and_count: Dict[str, List[Tuple[int, float]]],
+    all_rotation_auc_values: Dict[str, List[float]],
+    all_translation_auc_values: Dict[str, List[float]],
+) -> None:
+    """Append AUC metrics into global aggregate dictionaries."""
+    for metric in metrics_group.metrics:
+        if metric.name.startswith("pose_auc_@") and metric.data is not None:
+            try:
+                value = float(metric.data)
+            except (TypeError, ValueError):
+                continue
+            label = metric.name.replace("pose_auc_", "")
+            all_pose_auc_values.setdefault(label, []).append(value)
+            all_pose_auc_by_label_and_count.setdefault(label, []).append((current_count, value))
+        elif metric.name.startswith("rotation_auc_@") and metric.data is not None:
+            try:
+                value = float(metric.data)
+            except (TypeError, ValueError):
+                continue
+            label = metric.name.replace("rotation_auc_", "")
+            all_rotation_auc_values.setdefault(label, []).append(value)
+        elif metric.name.startswith("translation_auc_@") and metric.data is not None:
+            try:
+                value = float(metric.data)
+            except (TypeError, ValueError):
+                continue
+            label = metric.name.replace("translation_auc_", "")
+            all_translation_auc_values.setdefault(label, []).append(value)
+
+
+def _emit_cluster_outputs(
+    result: _ClusterComparisonResult,
+    baseline_dir: str,
+    fig_output_dir: Optional[Path],
+    csv_output: Optional[Path],
+    csv_rows: List[Dict[str, str]],
+) -> None:
+    """Write CSV row data and render per-cluster visualization for one reconstruction."""
+    if csv_output:
+        export_metrics_group_to_csv(
+            result.metrics_group,
+            cluster_label=str(result.recon_dir),
+            baseline_count=result.baseline_count,
+            current_count=result.current_count,
+            common_count=result.common_count,
+            output_path=csv_output,
+            rows=csv_rows,
+        )
+    else:
+        _print_metrics(str(result.recon_dir), result.metrics_group)
+
+    if fig_output_dir is None:
+        return
+
+    safe_name = str(result.recon_dir).replace(os.sep, "__")
+    cluster_fig_dir = fig_output_dir / safe_name
+    plot_path = fig_output_dir / f"{safe_name}_camera_centers.png"
+    pose_auc_text = _format_auc(result.metrics_group, "pose_auc")
+    rotation_auc_text = _format_auc(result.metrics_group, "rotation_auc")
+    translation_auc_text = _format_auc(result.metrics_group, "translation_auc")
+    title_lines = [f"{result.recon_dir}"]
+    if pose_auc_text:
+        title_lines.append(f"Pose AUC: {pose_auc_text}")
+    if rotation_auc_text:
+        title_lines.append(f"Rotation AUC: {rotation_auc_text}")
+    if translation_auc_text:
+        title_lines.append(f"Translation AUC: {translation_auc_text}")
+    _plot_camera_centers(result.baseline_list, result.current_aligned_list, plot_path, "\n".join(title_lines))
+
+    image_roots = [
+        baseline_dir,
+        str(result.recon_dir),
+        str(Path(baseline_dir).parent / "images"),
+        str(result.recon_dir / "images"),
+    ]
+    rotation_angle_metric = result.metrics_group.metrics[0]
+    translation_distance_metric = result.metrics_group.metrics[1]
+    _export_ranked_images(
+        rotation_angle_metric,
+        result.common_names,
+        image_roots,
+        cluster_fig_dir,
+        "rotation_angle_metric",
+        image_measurement_counts=result.current_image_measurement_counts,
+    )
+    _plot_error_vs_measurements(
+        rotation_angle_metric,
+        result.common_names,
+        result.current_image_measurement_counts,
+        cluster_fig_dir / "rotation_angle_metric",
+    )
+    _export_ranked_images(
+        translation_distance_metric,
+        result.common_names,
+        image_roots,
+        cluster_fig_dir,
+        "translation_distance_metric",
+        image_measurement_counts=result.current_image_measurement_counts,
+    )
+    _plot_error_vs_measurements(
+        translation_distance_metric,
+        result.common_names,
+        result.current_image_measurement_counts,
+        cluster_fig_dir / "translation_distance_metric",
+    )
+
+
+def _write_csv_output_if_requested(csv_output: Optional[Path], csv_rows: List[Dict[str, str]]) -> None:
+    """Append in-memory rows to CSV when enabled."""
+    if not csv_output or not csv_rows:
+        return
+
+    csv_output.parent.mkdir(parents=True, exist_ok=True)
+    with csv_output.open("a", newline="") as csvfile:
+        writer = csv.DictWriter(
+            csvfile,
+            fieldnames=["cluster", "baseline_count", "current_count", "common_count", "metric_name", "value"],
+        )
+        writer.writerows(csv_rows)
+
+
+def _render_aggregate_plots(
+    fig_output_dir: Optional[Path],
+    all_pose_auc_values: Dict[str, List[float]],
+    all_pose_auc_by_label_and_count: Dict[str, List[Tuple[int, float]]],
+    all_rotation_auc_values: Dict[str, List[float]],
+    all_translation_auc_values: Dict[str, List[float]],
+    all_intrinsics_deltas: Dict[str, List[float]],
+    all_fov_deltas: Dict[str, List[float]],
+) -> None:
+    """Render cross-cluster summary figures."""
+    if fig_output_dir is None:
+        return
+
+    if all_pose_auc_values:
+        auc_plot_path = fig_output_dir / "pose_auc_boxplot_all_clusters.png"
+        _plot_pose_auc_boxplot(all_pose_auc_values, auc_plot_path, "Pose AUC by threshold (all clusters)")
+
+    if all_pose_auc_by_label_and_count:
+        auc_vs_images_plot_path = fig_output_dir / "pose_auc_vs_input_images.png"
+        _plot_pose_auc_vs_input_images(all_pose_auc_by_label_and_count, auc_vs_images_plot_path)
+
+    if all_rotation_auc_values:
+        rotation_auc_plot_path = fig_output_dir / "rotation_auc_boxplot_all_clusters.png"
+        _plot_pose_auc_boxplot(
+            all_rotation_auc_values, rotation_auc_plot_path, "Rotation AUC by threshold (all clusters)"
+        )
+
+    if all_translation_auc_values:
+        translation_auc_plot_path = fig_output_dir / "translation_auc_boxplot_all_clusters.png"
+        _plot_pose_auc_boxplot(
+            all_translation_auc_values,
+            translation_auc_plot_path,
+            "Translation AUC by threshold (all clusters)",
+        )
+
+    if any(all_intrinsics_deltas.values()):
+        intrinsics_plot_path = fig_output_dir / "intrinsics_deltas_all_clusters.png"
+        _plot_intrinsics_deltas_boxplot(
+            all_intrinsics_deltas,
+            intrinsics_plot_path,
+            "Intrinsics Δ (normalized, all clusters)",
+        )
+
+    if any(all_fov_deltas.values()):
+        fov_plot_path = fig_output_dir / "fov_deltas_all_clusters.png"
+        _plot_fov_deltas_boxplot(
+            all_fov_deltas,
+            fov_plot_path,
+            "FOV Δ (degrees, all clusters)",
+        )
+
+
+def main() -> None:
+    """Run COLMAP-by-cluster comparison and generate outputs."""
+    args = _parse_args()
+    baseline_dir = Path(args.baseline)
+    baseline_poses, baseline_camera_by_name, baseline_cameras = _load_baseline_data(baseline_dir)
+    fig_output_dir = _get_default_fig_output_dir(args)
+    csv_output = Path(args.csv_output) if args.csv_output else None
 
     root = Path(args.root)
     recon_dirs = sorted(_find_cluster_recon_dirs(root, args.recon_name))
     if not recon_dirs:
         raise FileNotFoundError(f"No reconstructions named '{args.recon_name}' with images.txt under {root}")
-
     logger.info("Found %d reconstructions under %s", len(recon_dirs), root)
 
     csv_rows: List[Dict[str, str]] = []
@@ -726,192 +1303,53 @@ def main() -> None:
         "delta_fovx_deg": [],
         "delta_fovy_deg": [],
     }
+
     rng = np.random.default_rng(args.robust_sim3_seed)
     for recon_dir in recon_dirs:
-        current_images = recon_dir / "images.txt"
-        current_cameras_txt = recon_dir / "cameras.txt"
-        current_poses, current_camera_by_name = _read_images_txt_with_names_and_cameras(current_images)
-        try:
-            current_cameras = _read_cameras_txt_with_ids(current_cameras_txt)
-        except FileNotFoundError:
-            logger.warning("Missing cameras.txt for %s; skipping intrinsics comparison.", recon_dir)
-            current_cameras = {}
-        common_names, baseline_list, current_list = _build_pose_lists(
-            baseline_poses, current_poses, cluster_label=str(recon_dir)
-        )
-        baseline_count = len(baseline_poses)
-        current_count = len(current_poses)
-        common_count = len(common_names)
-        if len(common_names) < 2:
-            logger.warning(
-                "Skipping %s (baseline=%d, current=%d, common=%d)",
-                recon_dir,
-                baseline_count,
-                current_count,
-                common_count,
-            )
-            continue
-        current_aligned_list, _aSb = _align_poses(
-            baseline_list,
-            current_list,
+        result = _process_recon_dir(
+            recon_dir=recon_dir,
+            baseline_poses=baseline_poses,
+            baseline_camera_by_name=baseline_camera_by_name,
+            baseline_cameras=baseline_cameras,
             use_ransac=args.robust_sim3,
-            max_hypotheses=args.robust_sim3_max_hypotheses,
-            inlier_thresh=args.robust_sim3_inlier_thresh,
+            robust_max_hypotheses=args.robust_sim3_max_hypotheses,
+            robust_inlier_thresh=args.robust_sim3_inlier_thresh,
             rng=rng,
-            cluster_label=str(recon_dir),
         )
-        try:
-            metrics_group = _compute_pose_metrics(baseline_list, current_aligned_list)
-        except Exception as exc:
-            logger.warning("Skipping %s due to metric failure: %s", recon_dir, exc)
+        if result is None:
             continue
-        _summarize_pose_errors(baseline_list, current_aligned_list, str(recon_dir))
-        intrinsics_deltas: Dict[str, List[float]] = {
-            "delta_fx_norm": [],
-            "delta_fy_norm": [],
-            "delta_cx_norm": [],
-            "delta_cy_norm": [],
-        }
-        fov_deltas: Dict[str, List[float]] = {
-            "delta_fovx_deg": [],
-            "delta_fovy_deg": [],
-        }
-        for name in common_names:
-            base_cam_id = baseline_camera_by_name.get(name)
-            curr_cam_id = current_camera_by_name.get(name)
-            if base_cam_id is None or curr_cam_id is None:
-                continue
-            base = baseline_cameras.get(base_cam_id)
-            curr = current_cameras.get(curr_cam_id)
-            if base is None or curr is None:
-                continue
-            base_w, base_h = base["width"], base["height"]
-            curr_w, curr_h = curr["width"], curr["height"]
-            if curr_w > 0 and curr_h > 0 and (base_w != curr_w or base_h != curr_h):
-                sx = base_w / curr_w
-                sy = base_h / curr_h
-                curr_fx = curr["fx"] * sx
-                curr_fy = curr["fy"] * sy
-                curr_cx = curr["cx"] * sx
-                curr_cy = curr["cy"] * sy
-            else:
-                curr_fx = curr["fx"]
-                curr_fy = curr["fy"]
-                curr_cx = curr["cx"]
-                curr_cy = curr["cy"]
-            if base_w > 0 and base_h > 0:
-                if base["fx"] != 0:
-                    intrinsics_deltas["delta_fx_norm"].append(abs(base["fx"] - curr_fx) / abs(base["fx"]))
-                if base["fy"] != 0:
-                    intrinsics_deltas["delta_fy_norm"].append(abs(base["fy"] - curr_fy) / abs(base["fy"]))
-                if base["cx"] != 0:
-                    intrinsics_deltas["delta_cx_norm"].append(abs(base["cx"] - curr_cx) / abs(base["cx"]))
-                if base["cy"] != 0:
-                    intrinsics_deltas["delta_cy_norm"].append(abs(base["cy"] - curr_cy) / abs(base["cy"]))
-            if base["fx"] != 0 and curr_fx != 0 and base["fy"] != 0 and curr_fy != 0:
-                base_fovx = 2.0 * np.degrees(np.arctan(base_w / (2.0 * base["fx"])))
-                base_fovy = 2.0 * np.degrees(np.arctan(base_h / (2.0 * base["fy"])))
-                curr_fovx = 2.0 * np.degrees(np.arctan(base_w / (2.0 * curr_fx)))
-                curr_fovy = 2.0 * np.degrees(np.arctan(base_h / (2.0 * curr_fy)))
-                fov_deltas["delta_fovx_deg"].append(abs(base_fovx - curr_fovx))
-                fov_deltas["delta_fovy_deg"].append(abs(base_fovy - curr_fovy))
-        for key, values in intrinsics_deltas.items():
-            all_intrinsics_deltas[key].extend(values)
-        for key, values in fov_deltas.items():
-            all_fov_deltas[key].extend(values)
-        if args.csv_output:
-            export_metrics_group_to_csv(
-                metrics_group,
-                cluster_label=str(recon_dir),
-                baseline_count=baseline_count,
-                current_count=current_count,
-                common_count=common_count,
-                output_path=Path(args.csv_output),
-                rows=csv_rows,
-            )
-        else:
-            _print_metrics(str(recon_dir), metrics_group)
-        if fig_output_dir is not None:
-            safe_name = str(recon_dir).replace(os.sep, "__")
-            plot_path = fig_output_dir / f"{safe_name}_camera_centers.png"
-            pose_auc_text = _format_auc(metrics_group, "pose_auc")
-            rotation_auc_text = _format_auc(metrics_group, "rotation_auc")
-            translation_auc_text = _format_auc(metrics_group, "translation_auc")
-            title_lines = [f"{recon_dir}"]
-            if pose_auc_text:
-                title_lines.append(f"Pose AUC: {pose_auc_text}")
-            if rotation_auc_text:
-                title_lines.append(f"Rotation AUC: {rotation_auc_text}")
-            if translation_auc_text:
-                title_lines.append(f"Translation AUC: {translation_auc_text}")
-            title = "\n".join(title_lines)
-            _plot_camera_centers(baseline_list, current_aligned_list, plot_path, title)
-        # Intrinsics stats are annotated in the plot; no terminal logging.
-        for metric in metrics_group.metrics:
-            if metric.name.startswith("pose_auc_@") and metric.data is not None:
-                try:
-                    value = float(metric.data)
-                except (TypeError, ValueError):
-                    continue
-                label = metric.name.replace("pose_auc_", "")
-                all_pose_auc_values.setdefault(label, []).append(value)
-                all_pose_auc_by_label_and_count.setdefault(label, []).append((current_count, value))
-            elif metric.name.startswith("rotation_auc_@") and metric.data is not None:
-                try:
-                    value = float(metric.data)
-                except (TypeError, ValueError):
-                    continue
-                label = metric.name.replace("rotation_auc_", "")
-                all_rotation_auc_values.setdefault(label, []).append(value)
-            elif metric.name.startswith("translation_auc_@") and metric.data is not None:
-                try:
-                    value = float(metric.data)
-                except (TypeError, ValueError):
-                    continue
-                label = metric.name.replace("translation_auc_", "")
-                all_translation_auc_values.setdefault(label, []).append(value)
 
-    if args.csv_output and csv_rows:
-        output_path = Path(args.csv_output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with output_path.open("a", newline="") as csvfile:
-            writer = csv.DictWriter(
-                csvfile,
-                fieldnames=["cluster", "baseline_count", "current_count", "common_count", "metric_name", "value"],
-            )
-            writer.writerows(csv_rows)
-    if fig_output_dir is not None and all_pose_auc_values:
-        auc_plot_path = fig_output_dir / "pose_auc_boxplot_all_clusters.png"
-        _plot_pose_auc_boxplot(all_pose_auc_values, auc_plot_path, "Pose AUC by threshold (all clusters)")
-    if fig_output_dir is not None and all_pose_auc_by_label_and_count:
-        auc_vs_images_plot_path = fig_output_dir / "pose_auc_vs_input_images.png"
-        _plot_pose_auc_vs_input_images(all_pose_auc_by_label_and_count, auc_vs_images_plot_path)
-    if fig_output_dir is not None and all_rotation_auc_values:
-        rotation_auc_plot_path = fig_output_dir / "rotation_auc_boxplot_all_clusters.png"
-        _plot_pose_auc_boxplot(
-            all_rotation_auc_values, rotation_auc_plot_path, "Rotation AUC by threshold (all clusters)"
+        for key, values in result.intrinsics_deltas.items():
+            all_intrinsics_deltas[key].extend(values)
+        for key, values in result.fov_deltas.items():
+            all_fov_deltas[key].extend(values)
+
+        _emit_cluster_outputs(
+            result=result,
+            baseline_dir=args.baseline,
+            fig_output_dir=fig_output_dir,
+            csv_output=csv_output,
+            csv_rows=csv_rows,
         )
-    if fig_output_dir is not None and all_translation_auc_values:
-        translation_auc_plot_path = fig_output_dir / "translation_auc_boxplot_all_clusters.png"
-        _plot_pose_auc_boxplot(
+        _update_cluster_aggregates(
+            result.metrics_group,
+            result.current_count,
+            all_pose_auc_values,
+            all_pose_auc_by_label_and_count,
+            all_rotation_auc_values,
             all_translation_auc_values,
-            translation_auc_plot_path,
-            "Translation AUC by threshold (all clusters)",
         )
-    if fig_output_dir is not None and any(all_intrinsics_deltas.values()):
-        intrinsics_plot_path = fig_output_dir / "intrinsics_deltas_all_clusters.png"
-        _plot_intrinsics_deltas_boxplot(
-            all_intrinsics_deltas,
-            intrinsics_plot_path,
-            "Intrinsics Δ (normalized, all clusters)",
-        )
-    if fig_output_dir is not None and any(all_fov_deltas.values()):
-        fov_plot_path = fig_output_dir / "fov_deltas_all_clusters.png"
-        _plot_fov_deltas_boxplot(
-            all_fov_deltas,
-            fov_plot_path,
-            "FOV Δ (degrees, all clusters)",
-        )
+
+    _write_csv_output_if_requested(csv_output, csv_rows)
+    _render_aggregate_plots(
+        fig_output_dir,
+        all_pose_auc_values,
+        all_pose_auc_by_label_and_count,
+        all_rotation_auc_values,
+        all_translation_auc_values,
+        all_intrinsics_deltas,
+        all_fov_deltas,
+    )
 
 
 if __name__ == "__main__":
