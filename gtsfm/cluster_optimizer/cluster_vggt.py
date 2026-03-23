@@ -37,11 +37,11 @@ _VGGT_MODEL_CACHE: dict[Hashable, Any] = {}
 
 
 # ---------------------------------------------------------------------------
-# Leaf-level BA runner
+# Cluster-level BA runner
 # ---------------------------------------------------------------------------
 
 
-def _run_leaf_ba(
+def _run_cluster_ba(
     gtsfm_data: GtsfmData,
     *,
     ba_options: BundleAdjustmentOptions,
@@ -51,7 +51,7 @@ def _run_leaf_ba(
     min_track_length: int = 2,
     cluster_label: Optional[str] = None,
 ) -> tuple[GtsfmData, GtsfmData]:
-    """Run leaf-level BA on a GtsfmData result.
+    """Run cluster-level BA on a GtsfmData result.
 
     This is a module-level function so it can be used with ``dask.delayed``.
 
@@ -78,7 +78,7 @@ def _run_leaf_ba(
         )
 
     if drop_camera_with_no_track:
-        gtsfm_data, should_run_ba = data_utils.remove_cameras_with_no_tracks(gtsfm_data, "node-level BA")
+        gtsfm_data, should_run_ba = data_utils.remove_cameras_with_no_tracks(gtsfm_data, "cluster-level BA")
         if not should_run_ba:
             return gtsfm_data, pre_ba_data
 
@@ -320,6 +320,7 @@ def _aggregate_vggt_metrics(
     save_dir: Optional[str] = None,
     metric_constructed_only: bool = False,
 ) -> list[GtsfmMetricsGroup]:
+    """Aggregate VGGT metrics into groups for both pre- and post-BA results."""
     def _build_metrics_group(scene: GtsfmData, name: str) -> GtsfmMetricsGroup:
         metrics_group = GtsfmMetricsGroup(
             name,
@@ -351,7 +352,7 @@ class ClusterVGGT(ClusterOptimizerBase):
 
     Composes a :class:`VggtGeometryTransformer` for model inference and a
     :class:`MultiViewTracker` for feature tracking and GtsfmData assembly.
-    Leaf-level bundle adjustment is handled by :func:`_run_leaf_ba`.
+    Cluster-level bundle adjustment is handled by :func:`_run_cluster_ba`.
     """
 
     def __init__(
@@ -360,7 +361,7 @@ class ClusterVGGT(ClusterOptimizerBase):
         geometry_transformer: VggtGeometryTransformer | None = None,
         # --- Tracker ---
         tracker: MultiViewTracker | None = None,
-        # --- Leaf BA params ---
+        # --- Cluster BA params ---
         ba_options: BundleAdjustmentOptions | None = None,
         pre_ba_max_reproj_error: float = 14.0,
         post_ba_max_reproj_error: float = 3.0,
@@ -389,7 +390,7 @@ class ClusterVGGT(ClusterOptimizerBase):
         # --- Tracker ---
         self.tracker = tracker or MultiViewTracker()
 
-        # --- Leaf BA params ---
+        # --- Cluster BA params ---
         self.ba_options = ba_options or BundleAdjustmentOptions()
         self._pre_ba_max_reproj_error = pre_ba_max_reproj_error
         self._post_ba_max_reproj_error = post_ba_max_reproj_error
@@ -474,8 +475,8 @@ class ClusterVGGT(ClusterOptimizerBase):
             cluster_label=context.label,
         )
 
-        # 3. Run leaf-level BA.
-        ba_result_graph, pre_ba_result_graph = delayed(_run_leaf_ba, nout=2)(
+        # 3. Run cluster-level BA.
+        ba_result_graph, pre_ba_result_graph = delayed(_run_cluster_ba, nout=2)(
             pre_ba_data_graph,
             ba_options=self.ba_options,
             pre_ba_max_reproj_error=self._pre_ba_max_reproj_error,
