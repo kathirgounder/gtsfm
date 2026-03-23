@@ -5,9 +5,9 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Sequence, Tuple, Union
+from typing import Any, Optional, Sequence, Union
 
 from PIL import Image as PILImage
 import numpy as np
@@ -1160,6 +1160,7 @@ class _TransformedKeypoints:
     points: np.ndarray
     height: int
     width: int
+
 
 # ---------------------------------------------------------------------------
 # Public API

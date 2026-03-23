@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import abc
-from dataclasses import dataclass, field
-from typing import Any, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Optional, Union
 
-import numpy as np
 import torch
 
 

@@ -19,7 +19,7 @@ import gtsfm.frontend.anysplat as anysplat_utils
 import gtsfm.utils.torch as torch_utils
 from gtsfm.cluster_optimizer.cluster_optimizer_base import ClusterComputationGraph, ClusterContext, ClusterOptimizerBase
 from gtsfm.bundle.bundle_adjustment import BundleAdjustmentOptions
-from gtsfm.cluster_optimizer.cluster_vggt import _run_leaf_ba
+from gtsfm.cluster_optimizer.cluster_vggt import _run_cluster_ba
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.common.image import Image
 from gtsfm.evaluation.metrics import GtsfmMetric, GtsfmMetricsGroup
@@ -379,7 +379,7 @@ class ClusterAnySplat(ClusterOptimizerBase):
             gtsfm_data.log_scene_reprojection_error_stats()
 
         if self.run_bundle_adjustment_on_leaf:
-            post_ba_gtsfm_data, _ = _run_leaf_ba(gtsfm_data, ba_options=BundleAdjustmentOptions())
+            post_ba_gtsfm_data, _ = _run_cluster_ba(gtsfm_data, ba_options=BundleAdjustmentOptions())
             if post_ba_gtsfm_data is not gtsfm_data:
                 for idx in post_ba_gtsfm_data.get_valid_camera_indices():
                     info = gtsfm_data.get_image_info(idx)
