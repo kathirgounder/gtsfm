@@ -443,7 +443,11 @@ class VggtGeometryTransformer(GeometryTransformer):
             with autocast_ctx:
                 batched = images.unsqueeze(0)
                 tokens, ps_idx = model.aggregator(batched)
-            with torch.amp.autocast("cuda", dtype=torch.float32):
+            if resolved_device.type == "cuda":
+                pose_depth_autocast_ctx: Any = torch.amp.autocast("cuda", dtype=torch.float32)
+            else:
+                pose_depth_autocast_ctx = nullcontext()
+            with pose_depth_autocast_ctx:
                 pose_enc = model.camera_head(tokens)[-1]
                 extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, batched.shape[-2:])
                 depth_map, depth_conf = model.depth_head(tokens, batched, ps_idx)

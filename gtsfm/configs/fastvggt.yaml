@@ -26,29 +26,45 @@ graph_partitioner:
 
 cluster_optimizer:
   _target_: gtsfm.cluster_optimizer.cluster_fast_vggt.ClusterFastVGGT
-  weights_path: null
-  conf_threshold: 5.0
-  max_num_points: 100000
-  tracking: true
-  tracking_max_query_pts: 2048
-  tracking_query_frame_num: 3
-  keypoint_extractor: aliked+sp+sift
-  track_vis_thresh: 0.05
-  track_conf_thresh: 0.2
-  max_reproj_error: 0 # 0.0 means no filtering based on reproj error
-  min_triangulation_angle: 0.0
-  camera_type: PINHOLE
-  drop_outlier_after_camera_merging: false
-  drop_child_if_merging_fail: true
-  drop_camera_with_no_track: true
-  seed: 42
-  plot_reprojection_histograms: true
-  run_bundle_adjustment_on_leaf: false
-  run_bundle_adjustment_on_parent: false
-  model_cache_key: null
-  store_pre_ba_result: true
+
+  # --- Geometry transformer (built from FastVGGT params below) ---
+  fast_dtype: bfloat16
   merging: 0  # Set >0 to enable FastVGGT token merging.
   vis_attn_map: false
   enable_protection: false
-  fast_dtype: bfloat16
   extra_model_kwargs: {}
+
+  # --- Multi-view tracker ---
+  tracker:
+    _target_: gtsfm.frontend.multi_view_tracker.MultiViewTracker
+    config:
+      _target_: gtsfm.frontend.multi_view_tracker.TrackingConfig
+      tracking: true
+      max_query_pts: 2048
+      query_frame_num: 3
+      keypoint_extractor: aliked+sp+sift
+      track_vis_thresh: 0.05
+      track_conf_thresh: 0.2
+      vggt_max_reproj_error: 0 # 0.0 means no filtering based on reproj error
+      min_triangulation_angle: 0.0
+      ba_use_undistorted_camera_model: false
+
+  # --- VGGT operational params ---
+  weights_path: null
+  seed: 42
+  model_cache_key: null
+
+# --- Merging options ---
+merging_options:
+  _target_: gtsfm.cluster_merging.MergingOptions
+  run_bundle_adjustment: false
+  merge_duplicate_tracks: false
+  drop_child_if_merging_fail: true
+  drop_outlier_after_camera_merging: false
+  drop_camera_with_no_track: true
+  keep_all_cameras: false
+  plot_reprojection_histograms: true
+  ba_options:
+    _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptions
+    shared_calib: true
+    use_calibration_prior: false

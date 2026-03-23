@@ -795,13 +795,12 @@ class ColmapTracker(MultiViewTracker):
             if candidate.exists():
                 return candidate
 
-        default_candidate = Path("/nethome/xzhang979/nvme/gtsfm/benchmarks/eth3dmvs/test/botanical_garden/database.db")
-        if default_candidate.exists():
-            return default_candidate
-        fallback = Path(config.colmaptracker_config_path).expanduser()
-        if not fallback.is_absolute():
-            fallback = (Path(__file__).resolve().parent.parent / fallback).resolve()
-        return fallback.parent / "database.db"
+        raise FileNotFoundError(
+            "Could not resolve a COLMAP database path. "
+            "Set 'colmap_database_path' explicitly in the tracker config or ensure "
+            "'loader.dataset_dir' in the colmaptracker config points to a directory "
+            "containing 'database.db'."
+        )
 
     @classmethod
     def _load_database(cls, db_path: Path) -> _CachedColmapDatabase:

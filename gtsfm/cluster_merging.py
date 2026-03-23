@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -58,11 +58,7 @@ class MergingOptions:
     min_track_length: int = 2
     allow_post_ba_reproj_filtering: bool = True
     metric_constructed_only: bool = False
-    ba_options: BundleAdjustmentOptions = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.ba_options is None:
-            self.ba_options = BundleAdjustmentOptions()
+    ba_options: BundleAdjustmentOptions = field(default_factory=BundleAdjustmentOptions)
 
 
 def _create_unary_measurements(scene: GtsfmData) -> list[UnaryMeasurementPose3]:
