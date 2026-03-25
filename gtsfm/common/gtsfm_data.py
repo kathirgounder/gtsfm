@@ -824,6 +824,9 @@ class GtsfmData:
         """Logs reprojection error stats for all 3d points in the entire scene."""
         scene_reproj_errors = self.get_scene_reprojection_errors()
         logger.info(
+            "# cameras: %d, # tracks: %d, # images: %d", len(self.cameras()), self.number_tracks(), self.number_images()
+        )
+        logger.info(
             "Min scene reproj error: %.3f", np.nanmin(scene_reproj_errors) if len(scene_reproj_errors) else np.nan
         )
         logger.info(
