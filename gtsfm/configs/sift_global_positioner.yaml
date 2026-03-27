@@ -111,7 +111,7 @@ cluster_optimizer:
       max_iterations: 50
       min_track_measurements: 3
       max_reproj_error: 5.0
-      max_tracks: 500
+      max_tracks: 50
 
     bundle_adjustment_module:
       _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptimizer

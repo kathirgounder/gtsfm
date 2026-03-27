@@ -274,21 +274,14 @@ def build_and_solve(
     if num_scales > 0:
         graph.push_back(make_scale_prior_factor(S(0), 1.0, gauge_1d))
 
-    # Schur ordering: scales → points → cameras.
-    ordering = Ordering()
-    for i in range(num_scales):
-        ordering.push_back(S(i))
-    for t in sorted(track_indices):
-        ordering.push_back(L(t))
-    for c in sorted(camera_indices):
-        ordering.push_back(C(c))
-
-    # Solve with per-iteration logging using optimizer.iterate().
+    # Use COLAMD automatic ordering — lets GTSAM choose the best
+    # elimination order based on sparsity. Manual Schur ordering caused
+    # the solver to hang on larger problems.
     params = gtsam.LevenbergMarquardtParams()
     params.setMaxIterations(max_iterations)
     params.setRelativeErrorTol(1e-5)
     params.setVerbosityLM("SILENT")
-    params.setOrdering(ordering)
+    params.setOrderingType("COLAMD")
 
     initial_error = graph.error(initial_values)
     num_factors = graph.size()
@@ -324,8 +317,6 @@ def build_and_solve(
         if iteration > 1 and rel_change < 1e-5:
             logger.info("  Converged at iteration %d (relative change %.2e < 1e-5)", iteration, rel_change)
             break
-
-        prev_error = current_error
 
         prev_error = current_error
 
