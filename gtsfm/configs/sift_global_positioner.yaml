@@ -1,0 +1,128 @@
+# SIFT front-end with Global Positioner (replaces translation averaging + data association).
+#
+# Uses the GLOMAP-inspired BATA bearing factor graph to jointly estimate
+# camera positions and 3D points, feeding directly into global BA.
+#
+# Pipeline:  rot_avg → GlobalPositioner → BA
+# (instead of: rot_avg → trans_avg → data_assoc → BA)
+
+# @package _global_
+_target_: gtsfm.scene_optimizer.SceneOptimizer
+loader:
+  _target_: gtsfm.loader.Colmap
+
+image_pairs_generator:
+  _target_: gtsfm.retriever.image_pairs_generator.ImagePairsGenerator
+  global_descriptor:
+    _target_: gtsfm.frontend.cacher.global_descriptor_cacher.GlobalDescriptorCacher
+    global_descriptor_obj:
+      _target_: gtsfm.frontend.global_descriptor.NetVLAD
+  retriever:
+    _target_: gtsfm.retriever.Similarity
+    num_matched: 20
+    min_score: 0.3
+
+graph_partitioner:
+  _target_: gtsfm.graph_partitioner.Single
+
+cluster_optimizer:
+  _target_: gtsfm.cluster_optimizer.Multiview
+  correspondence_generator:
+    _target_: gtsfm.frontend.correspondence_generator.det_desc_correspondence_generator.DetDescCorrespondenceGenerator
+
+    detector_descriptor:
+      _target_: gtsfm.frontend.cacher.detector_descriptor_cacher.DetectorDescriptorCacher
+      detector_descriptor_obj:
+        _target_: gtsfm.frontend.detector_descriptor.sift.SIFTDetectorDescriptor
+        max_keypoints: 5000
+
+    matcher:
+      _target_: gtsfm.frontend.cacher.matcher_cacher.MatcherCacher
+      matcher_obj:
+        _target_: gtsfm.frontend.matcher.twoway_matcher.TwoWayMatcher
+        ratio_test_threshold: 0.8
+
+  two_view_estimator:
+    _target_: gtsfm.two_view_estimator_cacher.TwoViewEstimatorCacher
+    two_view_estimator_obj:
+      _target_: gtsfm.two_view_estimator.TwoViewEstimator
+      bundle_adjust_2view: True
+      eval_threshold_px: 4 # in px
+      ba_reproj_error_thresholds: [0.5]
+      bundle_adjust_2view_maxiters: 100
+
+      verifier:
+        _target_: gtsfm.frontend.verifier.ransac.Ransac
+        use_intrinsics_in_verification: True
+        estimation_threshold_px: 4 # for H/E/F estimators
+
+      triangulation_options:
+        _target_: gtsfm.data_association.point3d_initializer.TriangulationOptions
+        reproj_error_threshold: 100.0
+        mode:
+          _target_: gtsfm.data_association.point3d_initializer.TriangulationSamplingMode
+          value: NO_RANSAC
+
+      inlier_support_processor:
+        _target_: gtsfm.two_view_estimator.InlierSupportProcessor
+        min_num_inliers_est_model: 15
+        min_inlier_ratio_est_model: 0.1
+  save_gtsfm_data: True
+  save_3d_viz: False
+  save_two_view_viz: False
+  pose_angular_error_thresh: 5 # degrees
+  multiview_optimizer:
+    _target_: gtsfm.multi_view_optimizer.MultiViewOptimizer
+
+    # comment out to not run
+    view_graph_estimator:
+      _target_: gtsfm.view_graph_estimator.cycle_consistent_rotation_estimator.CycleConsistentRotationViewGraphEstimator
+      edge_error_aggregation_criterion: MEDIAN_EDGE_ERROR
+
+    rot_avg_module:
+      _target_: gtsfm.averaging.rotation.shonan.ShonanRotationAveraging
+
+    # trans_avg_module and data_association_module are still required for
+    # backwards compatibility but are unused when global_positioner is set.
+    trans_avg_module:
+      _target_: gtsfm.averaging.translation.averaging_1dsfm.TranslationAveraging1DSFM
+      robust_measurement_noise: True
+      projection_sampling_method: SAMPLE_INPUT_MEASUREMENTS
+      reject_outliers: False
+      use_all_tracks_for_averaging: True
+      use_relative_camera_poses: True
+
+    data_association_module:
+      _target_: gtsfm.data_association.data_assoc.DataAssociation
+      min_track_len: 2
+      triangulation_options:
+        _target_: gtsfm.data_association.point3d_initializer.TriangulationOptions
+        mode:
+          _target_: gtsfm.data_association.point3d_initializer.TriangulationSamplingMode
+          value: RANSAC_SAMPLE_UNIFORM
+        max_num_hypotheses: 100
+      save_track_patches_viz: False
+
+    # Global Positioner: replaces trans_avg + data_assoc with joint optimization.
+    global_positioner:
+      _target_: gtsfm.global_positioner.global_positioner.GlobalPositioner
+      noise_sigma: 0.01
+      huber_loss_scale: 0.1
+      max_iterations: 100
+      min_track_measurements: 3
+      max_reproj_error: 5.0
+
+    bundle_adjustment_module:
+      _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptimizer
+      reproj_error_thresholds: [10, 5, 3] # for (multistage) post-optimization filtering
+      robust_ba_mode: "HUBER"
+      shared_calib: False
+
+  # comment out to not run
+  dense_multiview_optimizer:
+    _target_: gtsfm.densify.mvs_patchmatchnet.MVSPatchmatchNet
+
+  gaussian_splatting_optimizer:
+    _target_: gtsfm.splat.gaussian_splatting.GaussianSplatting
+    cfg:
+      _target_: gtsfm.splat.gaussian_splatting.Config
