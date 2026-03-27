@@ -2,6 +2,21 @@
 
 The UI loads COLMAP text outputs (vggt / vggt_pre_ba) and lets you browse clusters,
 see per-image tracks, and inspect details with zoomed pixel crops.
+
+Example commands:
+  python scripts/visualize_tracks_web.py \
+      --results_root outputs/trevi_debug/results \
+      --dataset_dir data/trevi \
+      --serve --port 8000 \
+      --gt_colmap_dir colmap/sparse/0
+
+  python scripts/visualize_tracks_web.py \
+      --results_root outputs/trevi_debug/results \
+      --dataset_dir data/trevi \
+      --gt_colmap_dir colmap/sparse/0 \
+      --baseline data/trevi/sparse/0 \
+      --baseline_label "glomap" \
+      --serve --port 8000
 """
 
 from __future__ import annotations
@@ -29,7 +44,7 @@ from gtsfm.visualization.track_viz_utils import collect_reprojection_pairs
 
 logger = logging.getLogger(__name__)
 
-RECON_OPTIONS = ("vggt", "vggt_pre_ba")
+RECON_OPTIONS = ("vggt", "vggt_pre_ba", "merged")
 COLMAP_REQUIRED_TXT = ("cameras.txt", "images.txt", "points3D.txt")
 COLMAP_REQUIRED_BIN = ("cameras.bin", "images.bin", "points3D.bin")
 
@@ -500,7 +515,7 @@ def _build_pose_data_for_cluster(
 
     # Compute arrow scale from core sets only (exclude baselines).
     all_pts = []
-    for core_key in ["gt", "vggt", "vggt_pre_ba"]:
+    for core_key in ["gt", "vggt", "vggt_pre_ba", "merged"]:
         if core_key in result and isinstance(result[core_key], list):
             for e in result[core_key]:
                 all_pts.append([e["x"], e["y"]])
@@ -511,16 +526,11 @@ def _build_pose_data_for_cluster(
     else:
         result["arrow_scale"] = 1.0
 
-    # Covisibility edges from the best available reconstruction.
-    ref_data = recon_data.get("vggt") or next(iter(recon_data.values()), None)
-    if ref_data:
-        result["edges"] = _compute_covisibility_edges(ref_data)
-    else:
-        result["edges"] = []
-
-    # Compute per-edge relative pose errors (estimated vs GT) for each reconstruction.
-    if gt_names and result["edges"]:
-        for edge in result["edges"]:
+    # Helper: add relative pose errors (estimated vs GT) to a list of edges.
+    def _add_errors_to_edges(edges: List[Dict[str, Any]]) -> None:
+        if not gt_names:
+            return
+        for edge in edges:
             ni, nj = edge["i"], edge["j"]
             if ni not in gt_names or nj not in gt_names:
                 continue
@@ -536,6 +546,38 @@ def _build_pose_data_for_cluster(
                 rot_err = _rotation_angle_deg(gt_R_rel, est_rel.rotation().matrix())
                 trans_err = _translation_angle_deg(gt_t_rel, est_rel.translation())
                 edge[rn] = {"rot_err": round(rot_err, 2), "trans_err": round(trans_err, 2)}
+
+    def _build_all_pairs(covis_edges: List[Dict[str, Any]], cam_names: set) -> List[Dict[str, Any]]:
+        """Extend covisibility edges with all remaining camera pairs."""
+        covis_set = {(e["i"], e["j"]) for e in covis_edges}
+        extra: List[Dict[str, Any]] = []
+        for n1, n2 in itertools.combinations(sorted(cam_names), 2):
+            if (n1, n2) not in covis_set:
+                extra.append({"i": n1, "j": n2, "n": 0})
+        _add_errors_to_edges(extra)
+        return covis_edges + extra
+
+    # Compute separate edge sets for vggt and merged.
+    # vggt edges.
+    vggt_ref = recon_data.get("vggt")
+    vggt_covis = _compute_covisibility_edges(vggt_ref) if vggt_ref else []
+    _add_errors_to_edges(vggt_covis)
+    vggt_cam_names = set(aligned_names.get("vggt", {}).keys())
+    if gt_names:
+        vggt_cam_names &= set(gt_names.keys()) | vggt_cam_names
+    result["edges"] = vggt_covis
+    result["all_edges"] = _build_all_pairs(vggt_covis, vggt_cam_names)
+
+    # merged edges (if merged reconstruction exists).
+    merged_ref = recon_data.get("merged")
+    if merged_ref:
+        merged_covis = _compute_covisibility_edges(merged_ref)
+        _add_errors_to_edges(merged_covis)
+        merged_cam_names = set(aligned_names.get("merged", {}).keys())
+        if gt_names:
+            merged_cam_names &= set(gt_names.keys()) | merged_cam_names
+        result["merged_edges"] = merged_covis
+        result["merged_all_edges"] = _build_all_pairs(merged_covis, merged_cam_names)
 
     return result
 
@@ -864,6 +906,7 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         <select id="reconSelect">
           <option value="vggt">vggt</option>
           <option value="vggt_pre_ba">vggt_pre_ba</option>
+          <option value="merged">merged</option>
         </select>
       </label>
       <label>
@@ -937,8 +980,15 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
             <label><input type="checkbox" id="poseShowGt" checked /> GT</label>
             <label><input type="checkbox" id="poseShowPreBa" checked /> Pre-BA</label>
             <label><input type="checkbox" id="poseShowVggt" checked /> Post-BA</label>
+            <label><input type="checkbox" id="poseShowMerged" checked /> Merged</label>
             <span id="poseBaselineControls"></span>
             <label><input type="checkbox" id="poseShowEdges" checked /> Edges</label>
+            <label>Edge set
+              <select id="poseEdgeSet" style="font-size:12px;">
+                <option value="covis" selected>Covisibility</option>
+                <option value="all">All pairs</option>
+              </select>
+            </label>
             <label><input type="checkbox" id="poseShowLabels" /> IDs</label>
             <label><input type="checkbox" id="poseFlip" /> Flip</label>
             <label>Edge color
@@ -955,6 +1005,7 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
             <div class="pose-legend-item"><div class="pose-legend-swatch" style="background:#4ade80;"></div> GT</div>
             <div class="pose-legend-item"><div class="pose-legend-swatch" style="background:#f59e0b;"></div> Pre-BA</div>
             <div class="pose-legend-item"><div class="pose-legend-swatch" style="background:#60a5fa;"></div> Post-BA</div>
+            <div class="pose-legend-item"><div class="pose-legend-swatch" style="background:#c084fc;"></div> Merged</div>
             <div class="pose-legend-item"><div class="pose-legend-swatch" style="background:#ef4444;"></div> X axis</div>
             <div class="pose-legend-item"><div class="pose-legend-swatch" style="background:#3b82f6;"></div> Z axis (view dir)</div>
             <span id="poseBaselineLegend"></span>
@@ -1100,9 +1151,15 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         return count > 0 ? sum / count : 0.0;
       }
 
+      function getEffectiveRecon() {
+        const cluster = data.imagesByCluster[state.clusterId] || {};
+        if (state.recon === "merged" && !cluster["merged"]) return "vggt";
+        return state.recon;
+      }
+
       function getClusterImages() {
         const cluster = data.imagesByCluster[state.clusterId] || {};
-        return cluster[state.recon] || [];
+        return cluster[getEffectiveRecon()] || [];
       }
 
       function getSelectedImageData(images) {
@@ -1179,7 +1236,8 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
       async function fetchImagesIfNeeded() {
         if (!serverMode || !state.clusterId) return;
         const cluster = data.imagesByCluster[state.clusterId] || {};
-        if (cluster[state.recon]) return;
+        const effectiveRecon = getEffectiveRecon();
+        if (cluster[effectiveRecon]) return;
         state.loadingImages = true;
         setStatus(`Loading images for ${state.clusterId} (${state.recon})...`);
         const resp = await fetch(
@@ -1187,7 +1245,16 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         );
         const payload = await resp.json();
         data.imagesByCluster[state.clusterId] = data.imagesByCluster[state.clusterId] || {};
-        data.imagesByCluster[state.clusterId][state.recon] = payload.images || [];
+        const images = payload.images || [];
+        data.imagesByCluster[state.clusterId][state.recon] = images;
+        // If merged returned empty, fallback: fetch vggt instead.
+        if (state.recon === "merged" && !images.length && !cluster["vggt"]) {
+          const resp2 = await fetch(
+            `/api/images?cluster=${encodeURIComponent(state.clusterId)}&recon=vggt`
+          );
+          const payload2 = await resp2.json();
+          data.imagesByCluster[state.clusterId]["vggt"] = payload2.images || [];
+        }
         state.loadingImages = false;
       }
 
@@ -1606,9 +1673,16 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         const showGt = document.getElementById("poseShowGt").checked;
         const showPreBa = document.getElementById("poseShowPreBa").checked;
         const showVggt = document.getElementById("poseShowVggt").checked;
+        const showMerged = document.getElementById("poseShowMerged").checked;
         const showEdges = document.getElementById("poseShowEdges").checked;
         const showLabels = document.getElementById("poseShowLabels").checked;
         const flip = document.getElementById("poseFlip").checked ? -1 : 1;
+        const edgeSetKey = document.getElementById("poseEdgeSet").value;
+        // Pick edges from merged or vggt depending on the merged toggle.
+        const useMergedEdges = showMerged && poseData.merged_edges;
+        const covisEdges = useMergedEdges ? poseData.merged_edges : (poseData.edges || []);
+        const allPairEdges = useMergedEdges ? (poseData.merged_all_edges || covisEdges) : (poseData.all_edges || covisEdges);
+        const activeEdges = edgeSetKey === "all" ? allPairEdges : covisEdges;
 
         const svg = d3.select("#poseSvg");
         const rect = svg.node().getBoundingClientRect();
@@ -1624,7 +1698,7 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         if (showPreBa && poseData.vggt_pre_ba) sets.push(poseData.vggt_pre_ba);
         // Always use core sets (gt, vggt, vggt_pre_ba) for stable extents.
         // Baselines are excluded so they don't blow up the scale.
-        ["gt", "vggt", "vggt_pre_ba"].forEach((k) => {
+        ["gt", "vggt", "vggt_pre_ba", "merged"].forEach((k) => {
           if (poseData[k]) poseData[k].forEach((c) => allPts.push(c));
         });
         if (!allPts.length) { panel.style.display = "none"; return; }
@@ -1671,6 +1745,7 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         buildLookup(poseData.gt, "gt");
         buildLookup(poseData.vggt, "vggt");
         buildLookup(poseData.vggt_pre_ba, "vggt_pre_ba");
+        buildLookup(poseData.merged, "merged");
         (data.baselines || []).forEach((bl) => buildLookup(poseData[bl.key], bl.key));
 
         // Edge error coloring.
@@ -1678,7 +1753,7 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         const edgeLegend = document.getElementById("edgeColorLegend");
         const edgeColorMax = document.getElementById("edgeColorMax");
         // Use the currently selected reconstruction for error lookups.
-        const errRecon = state.recon;
+        const errRecon = getEffectiveRecon();
         // Determine the error value for an edge given the metric.
         function edgeError(e) {
           const errs = e[errRecon];
@@ -1691,8 +1766,8 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         // Build a color scale: green (0) -> yellow (mid) -> red (high).
         let errColorScale = null;
         let maxErrVal = 10;
-        if (edgeMetric !== "none" && poseData.edges) {
-          const errVals = poseData.edges.map(edgeError).filter((v) => v !== null && Number.isFinite(v));
+        if (edgeMetric !== "none" && activeEdges.length) {
+          const errVals = activeEdges.map(edgeError).filter((v) => v !== null && Number.isFinite(v));
           if (errVals.length) {
             maxErrVal = Math.max(d3.quantile(errVals.sort(d3.ascending), 0.95), 1);
             errColorScale = d3.scaleSequential(d3.interpolateRdYlGn).domain([maxErrVal, 0]);
@@ -1707,9 +1782,9 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         }
 
         // Draw edges.
-        if (showEdges && poseData.edges) {
+        if (showEdges && activeEdges.length) {
           const edgeG = g.append("g");
-          poseData.edges.forEach((e) => {
+          activeEdges.forEach((e) => {
             const p1 = posLookup[e.i];
             const p2 = posLookup[e.j];
             if (!p1 || !p2) return;
@@ -1741,7 +1816,17 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
 
         // Draw camera sets in order: GT (back), baselines, pre-BA, then post-BA (front).
         const camSets = [];
-        if (showGt && poseData.gt) camSets.push({ key: "gt", cams: poseData.gt, color: "#4ade80" });
+        if (showGt && poseData.gt) {
+          // Filter GT cameras: if merged is visible use merged camera set, otherwise use vggt.
+          const refSet = (showMerged && poseData.merged) ? poseData.merged : poseData.vggt;
+          if (refSet) {
+            const refNames = new Set(refSet.map((c) => c.name));
+            const filteredGt = poseData.gt.filter((c) => refNames.has(c.name));
+            camSets.push({ key: "gt", cams: filteredGt, color: "#4ade80" });
+          } else {
+            camSets.push({ key: "gt", cams: poseData.gt, color: "#4ade80" });
+          }
+        }
         (data.baselines || []).forEach((bl, i) => {
           const cb = document.getElementById("poseShowBaseline_" + bl.key);
           if (cb && cb.checked && poseData[bl.key]) {
@@ -1750,6 +1835,7 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         });
         if (showPreBa && poseData.vggt_pre_ba) camSets.push({ key: "vggt_pre_ba", cams: poseData.vggt_pre_ba, color: "#f59e0b" });
         if (showVggt && poseData.vggt) camSets.push({ key: "vggt", cams: poseData.vggt, color: "#60a5fa" });
+        if (showMerged && poseData.merged) camSets.push({ key: "merged", cams: poseData.merged, color: "#c084fc" });
 
         camSets.forEach((cs) => {
           const camG = g.append("g").attr("class", "cam-set-" + cs.key);
@@ -1866,7 +1952,17 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         const panel = document.getElementById("aucPanel");
         const content = document.getElementById("aucContent");
         const poseData = data.posesByCluster ? data.posesByCluster[state.clusterId] : null;
-        if (!poseData || !poseData.edges || !poseData.edges.length) {
+        if (!poseData) {
+          panel.style.display = "none";
+          return;
+        }
+        const edgeSetKey = document.getElementById("poseEdgeSet").value;
+        const showMergedAuc = document.getElementById("poseShowMerged").checked;
+        const useMergedEdgesAuc = showMergedAuc && poseData.merged_edges;
+        const covisEdgesAuc = useMergedEdgesAuc ? poseData.merged_edges : (poseData.edges || []);
+        const allPairEdgesAuc = useMergedEdgesAuc ? (poseData.merged_all_edges || covisEdgesAuc) : (poseData.all_edges || covisEdgesAuc);
+        const activeEdges = edgeSetKey === "all" ? allPairEdgesAuc : covisEdgesAuc;
+        if (!activeEdges.length) {
           panel.style.display = "none";
           return;
         }
@@ -1897,15 +1993,25 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         const metricLabel = edgeMetric === "rot" ? "Rotation" : edgeMetric === "trans" ? "Translation" : "Max(R,T)";
 
         // Collect errors and build rows for each reconstruction.
-        const reconKeys = [{ key: state.recon, label: state.recon === "vggt" ? "Post-BA" : "Pre-BA" }];
-        (data.baselines || []).forEach((bl) => reconKeys.push({ key: bl.key, label: bl.label }));
+        const effRecon = getEffectiveRecon();
+        const reconLabel = effRecon === "vggt" ? "Post-BA" : effRecon === "vggt_pre_ba" ? "Pre-BA" : "Merged";
+        // Each entry: { key, label, edges } — edges to use for that recon's AUC.
+        const reconEntries = [{ key: effRecon, label: reconLabel, edges: activeEdges }];
+        // Always include merged separately using its own edge set.
+        if (effRecon !== "merged" && poseData.merged) {
+          const mergedCovis = poseData.merged_edges || [];
+          const mergedAll = poseData.merged_all_edges || mergedCovis;
+          const mergedEdges = edgeSetKey === "all" ? mergedAll : mergedCovis;
+          reconEntries.push({ key: "merged", label: "Merged", edges: mergedEdges });
+        }
+        (data.baselines || []).forEach((bl) => reconEntries.push({ key: bl.key, label: bl.label, edges: activeEdges }));
 
         let rows = [];
-        reconKeys.forEach((rk) => {
+        reconEntries.forEach((rk) => {
           const allErrs = [];
           const selErrs = [];
           const exclErrs = [];
-          poseData.edges.forEach((e) => {
+          rk.edges.forEach((e) => {
             const v = getErr(e, rk.key);
             if (v === null || !Number.isFinite(v)) return;
             allErrs.push(v);
@@ -2141,7 +2247,7 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         if (urlCluster && data.clusters.some((c) => c.id === urlCluster)) {
           state.clusterId = urlCluster;
         }
-        if (urlRecon && ["vggt", "vggt_pre_ba"].includes(urlRecon)) {
+        if (urlRecon && ["vggt", "vggt_pre_ba", "merged"].includes(urlRecon)) {
           state.recon = urlRecon;
         }
         populateClusters();
@@ -2221,10 +2327,11 @@ def _write_html(output_dir: Path, title: str, *, serve_mode: bool) -> None:
         document.getElementById("histLogYToggle").addEventListener("change", replotHist);
         document.getElementById("histShowCdfToggle").addEventListener("change", replotHist);
         // Pose visualization toggles.
-        ["poseShowGt", "poseShowPreBa", "poseShowVggt", "poseShowEdges", "poseShowLabels", "poseFlip"].forEach((id) => {
+        ["poseShowGt", "poseShowPreBa", "poseShowVggt", "poseShowMerged", "poseShowEdges", "poseShowLabels", "poseFlip"].forEach((id) => {
           document.getElementById(id).addEventListener("change", renderPoseVisualization);
         });
         document.getElementById("poseEdgeMetric").addEventListener("change", renderPoseVisualization);
+        document.getElementById("poseEdgeSet").addEventListener("change", renderPoseVisualization);
         (data.baselines || []).forEach((bl) => {
           const cb = document.getElementById("poseShowBaseline_" + bl.key);
           if (cb) cb.addEventListener("change", renderPoseVisualization);
