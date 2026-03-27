@@ -69,7 +69,7 @@ class TrackingConfig:
     min_triangulation_angle: float = 10.0
     min_track_length: int = 2
     ba_track_patch_grid_size: int = 8
-    enable_ba_track_patching: bool = True
+    enable_ba_track_patching: bool = False
     ba_use_undistorted_camera_model: bool = False
     colmaptracker_config_path: str = str(_DEFAULT_VGGT_COLMAPTRACKER_CONFIG_PATH)
     colmap_database_path: Optional[str] = None
@@ -448,6 +448,7 @@ class MultiViewTracker:
         model: Any = None,
         config: TrackingConfig | None = None,
         image_names: Sequence[str] | None = None,
+        dataset_dir: PathLike | None = None,
     ) -> VGGTTrackingResult:
         """Generate dense feature tracks using the VGGT tracking backend.
 
@@ -456,6 +457,7 @@ class MultiViewTracker:
             model: Loaded VGGT model (required for track head).
             config: Optional override config.
             image_names: Optional image names to keep the interface aligned with other trackers.
+            dataset_dir: Optional dataset directory from the loader.
 
         Returns:
             :class:`VGGTTrackingResult` with tracks, visibilities, and 3D points.
@@ -675,6 +677,7 @@ class ColmapTracker(MultiViewTracker):
         model: Any = None,
         config: TrackingConfig | None = None,
         image_names: Sequence[str] | None = None,
+        dataset_dir: PathLike | None = None,
     ) -> VGGTTrackingResult:
         """Load tracks from a COLMAP database and package as tracking output.
 
@@ -683,6 +686,7 @@ class ColmapTracker(MultiViewTracker):
             model: Unused for this tracker.
             config: Optional override config.
             image_names: Image names used to resolve COLMAP image IDs.
+            dataset_dir: Dataset directory from the active loader.
         """
         cfg = config or self.config
         if model is not None:
@@ -701,7 +705,7 @@ class ColmapTracker(MultiViewTracker):
                 colors=np.zeros((0, 3), dtype=np.uint8),
             )
 
-        db_path = self._resolve_database_path(cfg)
+        db_path = self._resolve_database_path(cfg, dataset_dir=dataset_dir)
         if not Path(db_path).exists():
             raise FileNotFoundError(f"COLMAP database not found: {db_path}")
 
@@ -774,26 +778,45 @@ class ColmapTracker(MultiViewTracker):
         return loaded
 
     @classmethod
-    def _resolve_database_path(cls, config: TrackingConfig) -> Path:
+    def _resolve_database_path(
+        cls,
+        config: TrackingConfig,
+        *,
+        dataset_dir: PathLike | None = None,
+    ) -> Path:
+        def _resolve_relative_path(path_value: Path) -> Path:
+            if path_value.is_absolute():
+                return path_value
+            # Runtime CLI paths are typically relative to the process CWD (repo root).
+            cwd_candidate = (Path.cwd() / path_value).resolve()
+            if cwd_candidate.exists():
+                return cwd_candidate
+            # Backward-compatible fallback for configs historically interpreted relative to package root.
+            return (Path(__file__).resolve().parent.parent / path_value).resolve()
+
+        def _resolve_db_from_dataset_dir(dataset_dir_value: PathLike) -> Path | None:
+            dataset_path = _resolve_relative_path(Path(dataset_dir_value).expanduser())
+            db_candidate = dataset_path / "database.db"
+            if db_candidate.exists():
+                return db_candidate
+            return None
+
         if config.colmap_database_path:
             explicit = Path(config.colmap_database_path).expanduser()
-            if explicit.is_absolute():
-                return explicit
-            candidate = (Path(__file__).resolve().parent.parent / explicit).resolve()
-            if candidate.exists():
-                return candidate
-            return explicit
+            return _resolve_relative_path(explicit)
+
+        if dataset_dir:
+            db_candidate = _resolve_db_from_dataset_dir(dataset_dir)
+            if db_candidate is not None:
+                return db_candidate
 
         reference_cfg = cls._load_reference_config(Path(config.colmaptracker_config_path).expanduser())
         loader_cfg = reference_cfg.get("loader", {})
         dataset_dir = loader_cfg.get("dataset_dir")
         if isinstance(dataset_dir, str) and dataset_dir not in {"???", ""}:
-            candidate = Path(dataset_dir).expanduser()
-            if not candidate.is_absolute():
-                candidate = (Path(__file__).resolve().parent.parent / candidate).resolve()
-            candidate = candidate / "database.db"
-            if candidate.exists():
-                return candidate
+            db_candidate = _resolve_db_from_dataset_dir(dataset_dir)
+            if db_candidate is not None:
+                return db_candidate
 
         raise FileNotFoundError(
             "Could not resolve a COLMAP database path. "

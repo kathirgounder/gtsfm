@@ -180,6 +180,7 @@ def _run_vggt_pipeline(
     tracker: MultiViewTracker,
     image_indices: tuple[int, ...],
     image_names: tuple[str, ...] | None = None,
+    dataset_dir: str | None = None,
     seed: int = 42,
     model_cache_key: Hashable | None = None,
     loader_kwargs: dict[str, Any] | None = None,
@@ -211,7 +212,12 @@ def _run_vggt_pipeline(
     # Step 2: Optional tracking.
     tracking_result = None
     if tracker.config.tracking:
-        tracking_result = tracker.run_tracking(geo_output, model=cached_model, image_names=image_names)
+        tracking_result = tracker.run_tracking(
+            geo_output,
+            model=cached_model,
+            image_names=image_names,
+            dataset_dir=dataset_dir,
+        )
         if geo_output.device.type == "cuda":
             offload_vggt_model(cached_model)
 
@@ -449,6 +455,8 @@ class ClusterVGGT(ClusterOptimizerBase):
         global_indices = tuple(int(idx) for idx in keys)
         image_filenames = context.loader.image_filenames()
         image_names = tuple(str(image_filenames[idx]) for idx in keys)
+        dataset_dir = getattr(context.loader, "_dataset_dir", None)
+        dataset_dir = str(dataset_dir) if dataset_dir is not None else None
 
         # 1. Load images.
         image_batch_graph, original_coords_graph = delayed(_load_vggt_inputs, nout=2)(
@@ -468,6 +476,7 @@ class ClusterVGGT(ClusterOptimizerBase):
             tracker=self.tracker,
             image_indices=global_indices,
             image_names=image_names,
+            dataset_dir=dataset_dir,
             seed=self._seed,
             model_cache_key=self._model_cache_key,
             loader_kwargs=self._loader_kwargs or None,

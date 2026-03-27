@@ -23,6 +23,9 @@ image_pairs_generator:
 
 graph_partitioner:
   _target_: gtsfm.graph_partitioner.Metis
+  min_cameras_to_partition: 12
+  max_cameras: 40
+  split_oversized_nodes: true
 
 cluster_optimizer:
   _target_: gtsfm.cluster_optimizer.Cacher
@@ -45,8 +48,16 @@ cluster_optimizer:
         _target_: gtsfm.frontend.multi_view_tracker.TrackingConfig
         tracking: true
         vggt_max_reproj_error: 0 # 0.0 means no filtering based on reproj error
-        min_triangulation_angle: 0.0
+        min_triangulation_angle: 0.2
         ba_use_undistorted_camera_model: false
+
+    ba_options:
+      _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptions
+      shared_calib: true
+      use_calibration_prior: false
+      use_gnc: true
+      gnc_loss: TLS
+      factor_weight_outlier_threshold: 1e-8
 
     # --- VGGT operational params ---
     weights_path: null
