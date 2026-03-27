@@ -271,20 +271,62 @@ def build_and_solve(
     for c in sorted(camera_indices):
         ordering.push_back(C(c))
 
-    # Solve.
+    # Solve with per-iteration logging using optimizer.iterate().
     params = gtsam.LevenbergMarquardtParams()
     params.setMaxIterations(max_iterations)
     params.setRelativeErrorTol(1e-5)
-    params.setVerbosityLM("ERROR")
+    params.setVerbosityLM("SILENT")
     params.setOrdering(ordering)
 
     initial_error = graph.error(initial_values)
-    optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial_values, params)
-    result = optimizer.optimize()
-    final_error = graph.error(result)
+    num_factors = graph.size()
+    num_vars = len(camera_indices) * 3 + len(track_indices) * 3 + num_scales
 
-    logger.info("GlobalPositioner: error %.4f -> %.4f (%.1fx reduction)",
-                initial_error, final_error, initial_error / max(final_error, 1e-10))
+    logger.info(
+        "GlobalPositioner optimization: %d factors, %d variables "
+        "(%d cameras, %d landmarks, %d scales)",
+        num_factors, num_vars, len(camera_indices), len(track_indices), num_scales,
+    )
+    logger.info("  iter %3d: error = %.4f  lambda = n/a (initial)", 0, initial_error)
+
+    optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial_values, params)
+    prev_error = initial_error
+    iter_times = []
+
+    for iteration in range(1, max_iterations + 1):
+        t_iter = time.time()
+        optimizer.iterate()
+        dt = time.time() - t_iter
+        iter_times.append(dt)
+
+        current_error = optimizer.error()
+        lam = optimizer.lambda_()
+        rel_change = abs(prev_error - current_error) / max(prev_error, 1e-10)
+
+        if iteration <= 5 or iteration % 5 == 0 or rel_change < 1e-5:
+            logger.info(
+                "  iter %3d: error = %.4f  lambda = %.2e  (Δ=%.2e, %.2fs/iter)",
+                iteration, current_error, lam, rel_change, dt,
+            )
+
+        if iteration > 1 and rel_change < 1e-5:
+            logger.info("  Converged at iteration %d (relative change %.2e < 1e-5)", iteration, rel_change)
+            break
+
+        prev_error = current_error
+
+        prev_error = current_error
+
+    result = optimizer.values()
+    final_error = optimizer.error()
+    avg_iter_time = sum(iter_times) / len(iter_times) if iter_times else 0
+    total_opt_time = sum(iter_times)
+
+    logger.info(
+        "GlobalPositioner: error %.4f -> %.4f (%.1fx reduction) in %d iterations (%.2fs total, %.2fs/iter avg)",
+        initial_error, final_error, initial_error / max(final_error, 1e-10),
+        len(iter_times), total_opt_time, avg_iter_time,
+    )
 
     return result, graph, camera_indices, track_indices, num_scales, initial_error, final_error
 
