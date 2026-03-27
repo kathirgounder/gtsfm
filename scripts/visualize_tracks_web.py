@@ -15,7 +15,7 @@ import os
 import pickle
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
-import socketserver
+import itertools
 from typing import Any, Dict, Iterable, List, Tuple
 
 import numpy as np
@@ -206,7 +206,7 @@ def _build_image_entries(
             "tracks": tracks,
         }
         if include_file_path:
-            entry["file_path"] = str(file_path)
+            entry["file_path"] = name
         entries.append(entry)
     return entries
 
@@ -394,10 +394,8 @@ def _compute_covisibility_edges(data: GtsfmData) -> List[Dict[str, Any]]:
             cid = track.measurement(m)[0]
             if cid in id_to_name:
                 names.add(id_to_name[cid])
-        names_sorted = sorted(names)
-        for i in range(len(names_sorted)):
-            for j in range(i + 1, len(names_sorted)):
-                edge_counts[(names_sorted[i], names_sorted[j])] += 1
+        for n1, n2 in itertools.combinations(sorted(names), 2):
+            edge_counts[(n1, n2)] += 1
     return [{"i": n1, "j": n2, "n": cnt} for (n1, n2), cnt in edge_counts.items()]
 
 
@@ -2292,6 +2290,7 @@ def main() -> None:
 
     # Load baseline reconstructions.
     baseline_data: List[Tuple[str, GtsfmData]] = []
+    baseline_labels: List[Dict[str, str]] = []
     if len(args.baseline) > 2:
         logger.warning("At most 2 baselines are supported; ignoring extras.")
     for idx, bl_path_str in enumerate(args.baseline[:2]):
@@ -2304,14 +2303,10 @@ def main() -> None:
         try:
             bl_gtsfm = GtsfmData.read_colmap(str(bl_path))
             baseline_data.append((bl_key, bl_gtsfm))
+            baseline_labels.append({"key": bl_key, "label": label})
             logger.info("Loaded baseline '%s' with %d cameras from %s", label, len(bl_gtsfm.get_valid_camera_indices()), bl_path)
         except Exception as exc:
             logger.warning("Could not load baseline %d from %s: %s", idx, bl_path, exc)
-    # Store labels for JS.
-    baseline_labels: List[Dict[str, str]] = []
-    for idx, (bl_key, _) in enumerate(baseline_data):
-        label = args.baseline_label[idx] if idx < len(args.baseline_label) else f"Baseline {idx + 1}"
-        baseline_labels.append({"key": bl_key, "label": label})
 
     if not args.serve:
         payload = _build_data_payload(cluster_nodes, results_root, images_dir, num_workers, gt_data=gt_data, baseline_data=baseline_data)
@@ -2398,10 +2393,19 @@ def main() -> None:
                     if not _has_colmap_files(recon_dir):
                         cache[cache_key] = []
                     else:
-                        gtsfm_data = GtsfmData.read_colmap(str(recon_dir))
-                        cache[cache_key] = _build_image_entries(
-                            gtsfm_data, images_dir, include_file_path=False
-                        )
+                        try:
+                            gtsfm_data = GtsfmData.read_colmap(str(recon_dir))
+                            cache[cache_key] = _build_image_entries(
+                                gtsfm_data, images_dir, include_file_path=False
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Image data request failed for cluster %s, recon %s: %s",
+                                cluster,
+                                recon,
+                                exc,
+                            )
+                            cache[cache_key] = []
                 return self._send_json({"images": cache[cache_key]})
             if path == "/api/poses":
                 cluster = (query.get("cluster") or [""])[0]
@@ -2421,15 +2425,21 @@ def main() -> None:
                     self.send_error(404, "File not found")
                     return
                 candidate = (images_dir / name).resolve()
-                if not str(candidate).startswith(str(images_dir.resolve())):
+                images_root = images_dir.resolve()
+                if os.path.commonpath([str(candidate), str(images_root)]) != str(images_root):
                     self.send_error(403, "Forbidden")
                     return
                 return self._send_file(candidate)
 
-            return self._send_file(output_dir / path.lstrip("/"))
+            # Fallback: serve static files from output_dir, with path traversal protection.
+            candidate = (output_dir / path.lstrip("/")).resolve()
+            if os.path.commonpath([str(candidate), str(output_dir.resolve())]) != str(output_dir.resolve()):
+                self.send_error(403, "Forbidden")
+                return
+            return self._send_file(candidate)
 
-    with http.server.ThreadingHTTPServer(("", args.port), TracksRequestHandler) as httpd:
-        logger.info("Serving %s at http://localhost:%d", output_dir, args.port)
+    with http.server.ThreadingHTTPServer(("127.0.0.1", args.port), TracksRequestHandler) as httpd:
+        logger.info("Serving %s at http://127.0.0.1:%d", output_dir, args.port)
         httpd.serve_forever()
 
 
