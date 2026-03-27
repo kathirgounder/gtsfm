@@ -75,6 +75,7 @@ GAUGE_PRIOR_SIGMA = 1.0
 SCALE_PENALTY_WEIGHT = 100.0
 DEFAULT_MAX_ITERATIONS = 100        # GLOMAP: max_num_iterations = 100
 DEFAULT_MAX_REPROJ_ERROR = 5.0      # Pixels — for filtering output tracks
+DEFAULT_MAX_TRACKS = 500            # Cap tracks used in optimization (subsample longer tracks first)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -194,17 +195,28 @@ def compute_world_bearings(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def filter_tracks(tracks_2d, valid_cameras, min_measurements=MIN_TRACK_MEASUREMENTS):
-    """Keep tracks with >= min_measurements observations from valid cameras."""
-    filtered = []
+def filter_tracks(tracks_2d, valid_cameras, min_measurements=MIN_TRACK_MEASUREMENTS, max_tracks=DEFAULT_MAX_TRACKS):
+    """Keep tracks with >= min_measurements observations from valid cameras.
+
+    If more than max_tracks survive, subsample by preferring longer tracks
+    (they provide stronger constraints).
+    """
+    scored = []
     for track in tracks_2d:
         valid_count = sum(
             1 for m_idx in range(track.number_measurements())
             if track.measurement(m_idx).i in valid_cameras
         )
         if valid_count >= min_measurements:
-            filtered.append(track)
-    return filtered
+            scored.append((valid_count, track))
+
+    # Sort by track length descending — longer tracks constrain the problem better.
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    if max_tracks > 0 and len(scored) > max_tracks:
+        scored = scored[:max_tracks]
+
+    return [track for _, track in scored]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -490,12 +502,14 @@ class GlobalPositioner:
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         min_track_measurements: int = MIN_TRACK_MEASUREMENTS,
         max_reproj_error: float = DEFAULT_MAX_REPROJ_ERROR,
+        max_tracks: int = DEFAULT_MAX_TRACKS,
     ) -> None:
         self._noise_sigma = noise_sigma
         self._huber_loss_scale = huber_loss_scale
         self._max_iterations = max_iterations
         self._min_track_measurements = min_track_measurements
         self._max_reproj_error = max_reproj_error
+        self._max_tracks = max_tracks
 
     def run(
         self,
@@ -535,7 +549,7 @@ class GlobalPositioner:
                      len(valid_cameras), len(tracks_2d))
 
         # ── Filter tracks ──
-        filtered_tracks = filter_tracks(tracks_2d, valid_cameras, self._min_track_measurements)
+        filtered_tracks = filter_tracks(tracks_2d, valid_cameras, self._min_track_measurements, self._max_tracks)
         logger.info("GlobalPositioner: %d tracks after filtering.", len(filtered_tracks))
         if not filtered_tracks:
             logger.error("GlobalPositioner: no tracks survived filtering.")
