@@ -61,15 +61,29 @@ def cal3_bundler_from_intrinsic(matrix: np.ndarray, crop_coords) -> gtsam.Cal3Bu
     return gtsam.Cal3Bundler(f, 0.0, 0.0, cx, cy)
 
 
+def cal3ds2_from_intrinsic(matrix: np.ndarray, crop_coords) -> gtsam.Cal3_S2:
+    """Map a 3x3 intrinsic matrix to a Cal3_S2."""
+    fx = float(matrix[0, 0])
+    fy = float(matrix[1, 1])
+    cx = float(matrix[0, 2])
+    cy = float(matrix[1, 2])
+    cx = cx + float(crop_coords[0])
+    cy = cy + float(crop_coords[1])
+    return gtsam.Cal3DS2(fx, fy, 0.0, cx, cy, 0.0, 0.0, 0.0, 0.0)
+
+
 def camera_from_matrices(
     extrinsic: np.ndarray,
     intrinsic: np.ndarray,
     crop_coords: np.ndarray,
     wTc_flag: bool = False,
     use_cal3_bundler: bool = False,
+    use_cal3ds2: bool = False,
 ) -> gtsfm_types.CAMERA_TYPE:
     """Instantiate a Pinhole camera from raw extrinsic/intrinsic matrices."""
-    if use_cal3_bundler:
+    if use_cal3ds2:
+        calibration = cal3ds2_from_intrinsic(intrinsic, crop_coords)
+    elif use_cal3_bundler:
         calibration = cal3_bundler_from_intrinsic(intrinsic, crop_coords)
     else:
         calibration = cal3_s2_from_intrinsic(intrinsic, crop_coords)
