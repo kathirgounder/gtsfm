@@ -366,7 +366,7 @@ class GlobalPositioner:
         wRi_list: List[Optional[Rot3]],
         tracks_2d: List[SfmTrack2d],
         intrinsics: List[Optional[gtsfm_types.CALIBRATION_TYPE]],
-    ) -> Tuple[Optional[GtsfmData], GtsfmMetricsGroup]:
+    ) -> Tuple[GtsfmData, GtsfmMetricsGroup]:
         """Run the global positioner and produce GtsfmData for BA.
 
         Args:
@@ -376,7 +376,7 @@ class GlobalPositioner:
             intrinsics: Camera calibration per image.
 
         Returns:
-            gtsfm_data: GtsfmData with cameras + 3D tracks, or None on failure.
+            gtsfm_data: GtsfmData with cameras + 3D tracks (empty on failure).
             metrics: GtsfmMetricsGroup with positioning stats.
         """
         start_time = time.time()
@@ -384,15 +384,15 @@ class GlobalPositioner:
         # ── Input validation ──
         if not tracks_2d:
             logger.error("GlobalPositioner: no 2D tracks provided.")
-            return None, GtsfmMetricsGroup("global_positioning_metrics", [])
+            return GtsfmData(number_images=num_images), GtsfmMetricsGroup("global_positioning_metrics", [])
         if intrinsics is None:
             logger.error("GlobalPositioner: no intrinsics provided.")
-            return None, GtsfmMetricsGroup("global_positioning_metrics", [])
+            return GtsfmData(number_images=num_images), GtsfmMetricsGroup("global_positioning_metrics", [])
 
         valid_cameras = {i for i, wRi in enumerate(wRi_list) if wRi is not None}
         if len(valid_cameras) < 2:
             logger.error("GlobalPositioner: need >= 2 cameras with rotations.")
-            return None, GtsfmMetricsGroup("global_positioning_metrics", [])
+            return GtsfmData(number_images=num_images), GtsfmMetricsGroup("global_positioning_metrics", [])
 
         logger.info("GlobalPositioner: %d valid cameras, %d input tracks.",
                      len(valid_cameras), len(tracks_2d))
@@ -402,7 +402,7 @@ class GlobalPositioner:
         logger.info("GlobalPositioner: %d tracks after filtering.", len(filtered_tracks))
         if not filtered_tracks:
             logger.error("GlobalPositioner: no tracks survived filtering.")
-            return None, GtsfmMetricsGroup("global_positioning_metrics", [])
+            return GtsfmData(number_images=num_images), GtsfmMetricsGroup("global_positioning_metrics", [])
 
         # ── Compute bearings ──
         t0 = time.time()
@@ -411,7 +411,7 @@ class GlobalPositioner:
         logger.info("GlobalPositioner: %d bearing observations (%.2fs).", len(observations), dt_bearing)
 
         if not observations:
-            return None, GtsfmMetricsGroup("global_positioning_metrics", [])
+            return GtsfmData(number_images=num_images), GtsfmMetricsGroup("global_positioning_metrics", [])
 
         # ── Build factor graph and solve (native C++) ──
         t0 = time.time()
