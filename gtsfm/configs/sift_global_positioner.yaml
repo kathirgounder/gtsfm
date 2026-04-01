@@ -5,11 +5,15 @@
 #
 # Pipeline:  rot_avg → GlobalPositioner → BA
 # (instead of: rot_avg → trans_avg → data_assoc → BA)
+#
+# Front-end matches unified.yaml exactly for fair A/B comparison with CI benchmarks.
+# Only the multiview_optimizer differs: global_positioner is added.
 
 # @package _global_
 _target_: gtsfm.scene_optimizer.SceneOptimizer
+
 loader:
-  _target_: gtsfm.loader.Colmap
+  _target_: gtsfm.loader.Olsson
 
 image_pairs_generator:
   _target_: gtsfm.retriever.image_pairs_generator.ImagePairsGenerator
@@ -18,9 +22,11 @@ image_pairs_generator:
     global_descriptor_obj:
       _target_: gtsfm.frontend.global_descriptor.NetVLAD
   retriever:
-    _target_: gtsfm.retriever.Similarity
-    num_matched: 20
+    _target_: gtsfm.retriever.JointSimilaritySequential
+    num_matched: 5
     min_score: 0.3
+    max_frame_lookahead: 15
+  batch_size: 2
 
 graph_partitioner:
   _target_: gtsfm.graph_partitioner.Single
@@ -58,7 +64,6 @@ cluster_optimizer:
 
       triangulation_options:
         _target_: gtsfm.data_association.point3d_initializer.TriangulationOptions
-        reproj_error_threshold: 100.0
         mode:
           _target_: gtsfm.data_association.point3d_initializer.TriangulationSamplingMode
           value: NO_RANSAC
@@ -74,15 +79,16 @@ cluster_optimizer:
   multiview_optimizer:
     _target_: gtsfm.multi_view_optimizer.MultiViewOptimizer
 
-    # comment out to not run
+    # Matches unified.yaml exactly
     view_graph_estimator:
       _target_: gtsfm.view_graph_estimator.cycle_consistent_rotation_estimator.CycleConsistentRotationViewGraphEstimator
-      edge_error_aggregation_criterion: MEDIAN_EDGE_ERROR
+      edge_error_aggregation_criterion: MIN_EDGE_ERROR
 
     rot_avg_module:
       _target_: gtsfm.averaging.rotation.shonan.ShonanRotationAveraging
+      weight_by_inliers: True
 
-    # trans_avg_module and data_association_module are still required for
+    # trans_avg_module and data_association_module are required for
     # backwards compatibility but are unused when global_positioner is set.
     trans_avg_module:
       _target_: gtsfm.averaging.translation.averaging_1dsfm.TranslationAveraging1DSFM
@@ -94,9 +100,10 @@ cluster_optimizer:
 
     data_association_module:
       _target_: gtsfm.data_association.data_assoc.DataAssociation
-      min_track_len: 2
+      min_track_len: 3
       triangulation_options:
         _target_: gtsfm.data_association.point3d_initializer.TriangulationOptions
+        reproj_error_threshold: 10
         mode:
           _target_: gtsfm.data_association.point3d_initializer.TriangulationSamplingMode
           value: RANSAC_SAMPLE_UNIFORM
@@ -118,6 +125,9 @@ cluster_optimizer:
       reproj_error_thresholds: [10, 5, 3] # for (multistage) post-optimization filtering
       robust_ba_mode: "HUBER"
       shared_calib: False
+      cam_pose3_prior_noise_sigma: 0.1
+      calibration_prior_focal_sigma: 20.0
+      measurement_noise_sigma: 1.0
 
   # comment out to not run
   dense_multiview_optimizer:

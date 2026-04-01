@@ -133,7 +133,7 @@ execute_gtsfm() {
     
     if [[ "$config_name" == "megaloc" ]]; then
         log INFO "Running GTSFM Using MegaLoc + SIFT full pipeline configuration"
-        
+
         case "$loader_name" in
             olsson-loader)
                 ./run --num_workers 1 \
@@ -151,6 +151,34 @@ execute_gtsfm() {
                     --dataset_dir "$DATASET_DIR" \
                     --images_dir "$IMAGES_DIR" \
                     --config_name megaloc_sift_frontend \
+                    --max_frame_lookahead "$max_frame_lookahead" \
+                    --max_resolution "$max_resolution" \
+                    $share_intrinsics_arg
+                return $?
+                ;;
+        esac
+    fi
+
+    if [[ "$config_name" == "sift_global_positioner" ]]; then
+        log INFO "Running GTSFM with Global Positioner (BATA) pipeline configuration"
+
+        case "$loader_name" in
+            olsson-loader)
+                ./run --num_workers 1 \
+                    --loader olsson \
+                    --dataset_dir "$DATASET_ROOT" \
+                    --config_name sift_global_positioner \
+                    --max_frame_lookahead "$max_frame_lookahead" \
+                    --max_resolution "$max_resolution" \
+                    $share_intrinsics_arg
+                return $?
+                ;;
+            colmap-loader)
+                ./run --num_workers 1 \
+                    --loader colmap \
+                    --dataset_dir "$DATASET_DIR" \
+                    --images_dir "$IMAGES_DIR" \
+                    --config_name sift_global_positioner \
                     --max_frame_lookahead "$max_frame_lookahead" \
                     --max_resolution "$max_resolution" \
                     $share_intrinsics_arg
