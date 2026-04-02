@@ -22,9 +22,17 @@ import torch
 import trimesh
 from demo_vggt import Timer, add_common_vggt_args
 
-import gtsfm.frontend.vggt as vggt
-from gtsfm.frontend.vggt import VggtConfiguration
+from gtsfm.frontend.vggt_geometry_transformer import (
+    VggtGeometryConfig,
+    VggtGeometryTransformer,
+    default_dtype,
+    high_confidence_pointcloud,
+    load_model,
+    offload_vggt_model,
+)
+from gtsfm.frontend.multi_view_tracker import MultiViewTracker, TrackingConfig
 from gtsfm.utils import torch as torch_utils
+from vggt.utils.load_fn import load_and_preprocess_images_square  # type: ignore
 
 # Configure CUDA settings
 torch.backends.cudnn.enabled = True
@@ -61,11 +69,11 @@ def demo_fn(cluster_key: str, image_indices: List[int], args: argparse.Namespace
     print(f"[{cluster_key}] Setting seed as: {args.seed}")
 
     device = torch_utils.default_device()
-    dtype = vggt.default_dtype(device)
+    dtype = default_dtype(device)
     print(f"[{cluster_key}] Using device: {device.type}")
     print(f"[{cluster_key}] Using dtype: {dtype}")
 
-    model = vggt.load_model(device=device, dtype=dtype)
+    model = load_model(device=device, dtype=dtype)
     print(f"[{cluster_key}] Model loaded")
 
     image_dir = os.path.join(args.output_dir, cluster_key, "images")
@@ -75,46 +83,63 @@ def demo_fn(cluster_key: str, image_indices: List[int], args: argparse.Namespace
     base_image_path_list = [os.path.basename(path) for path in image_path_list]
 
     img_load_resolution = 1024
-    vggt_fixed_resolution = 518
 
-    images, original_coords = vggt.load_and_preprocess_images_square(image_path_list, img_load_resolution)
+    images, original_coords = load_and_preprocess_images_square(image_path_list, img_load_resolution)
     images = images.to(device)
     original_coords = original_coords.to(device)
     print(f"[{cluster_key}] Loaded {len(images)} images from {image_dir}")
 
-    config = VggtConfiguration(
-        vggt_fixed_resolution=vggt_fixed_resolution,
-        img_load_resolution=img_load_resolution,
+    geo_config = VggtGeometryConfig(confidence_threshold=args.confidence_threshold)
+    track_config = TrackingConfig(
+        tracking=True,
         max_query_pts=args.max_query_pts,
         query_frame_num=args.query_frame_num,
-        fine_tracking=args.fine_tracking,
-        vis_thresh=args.vis_thresh,
-        max_reproj_error=args.max_reproj_error,
-        confidence_threshold=args.confidence_threshold,
+        track_vis_thresh=args.vis_thresh,
+        vggt_max_reproj_error=args.max_reproj_error,
     )
 
     with Timer(f"[{cluster_key}] VGGT reconstruction"):
-        result = vggt.run_reconstruction(
-            images,
-            image_indices=image_indices,
-            image_names=base_image_path_list,
-            original_coords=original_coords,
-            config=config,
-            model=model,
+        transformer = VggtGeometryTransformer(geo_config)
+        geo_output = transformer.predict(images, model=model)
+
+        tracker = MultiViewTracker(track_config)
+        tracking_result = tracker.run_tracking(geo_output, model=model)
+        if geo_output.device.type == "cuda":
+            offload_vggt_model(model)
+
+        points_3d, points_rgb = high_confidence_pointcloud(
+            geo_output,
+            confidence_threshold=geo_config.confidence_threshold,
+            max_num_points=geo_config.max_num_points,
         )
 
-    if result.points_3d.size == 0:
+        gtsfm_data = tracker.build_gtsfm_data(
+            geo_output,
+            original_coords,
+            image_indices=image_indices,
+            image_names=base_image_path_list,
+            tracking_result=tracking_result,
+            points_3d=points_3d,
+            points_rgb=points_rgb,
+            cluster_label=cluster_key,
+        )
+
+        if geo_output.device.type == "cuda":
+            del geo_output
+            torch.cuda.empty_cache()
+
+    if points_3d.size == 0:
         print(f"[{cluster_key}] VGGT produced no confident 3D structure.")
 
     sparse_subdir = "sparse_wo_ba"
     sparse_reconstruction_dir = os.path.join(args.output_dir, cluster_key, sparse_subdir)
     print(f"[{cluster_key}] Saving reconstruction to {sparse_reconstruction_dir}")
     os.makedirs(sparse_reconstruction_dir, exist_ok=True)
-    result.gtsfm_data.export_as_colmap_text(sparse_reconstruction_dir)
+    gtsfm_data.export_as_colmap_text(sparse_reconstruction_dir)
 
-    if result.points_rgb is not None and result.points_3d.size > 0:
+    if points_rgb is not None and points_3d.size > 0:
         try:
-            trimesh.PointCloud(result.points_3d, colors=result.points_rgb).export(
+            trimesh.PointCloud(points_3d, colors=points_rgb).export(
                 os.path.join(sparse_reconstruction_dir, "points.ply")
             )
         except Exception as exc:  # pragma: no cover - export helper

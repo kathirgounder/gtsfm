@@ -6,14 +6,25 @@ Authors: Xinan Zhang and Frank Dellaert
 import unittest
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torchvision.transforms import v2 as transforms  # type: ignore
 
-import gtsfm.frontend.vggt as vggt
 from gtsfm.common.gtsfm_data import GtsfmData
-from gtsfm.frontend.vggt import VggtConfiguration
+from gtsfm.frontend.multi_view_tracker import (
+    MultiViewTracker,
+    TrackingConfig,
+    _TrackSelectionCandidate,
+    _select_track_ids_for_ba_coverage,
+)
+from gtsfm.frontend.vggt_geometry_transformer import (
+    VggtGeometryConfig,
+    VggtGeometryTransformer,
+    default_dtype,
+    high_confidence_pointcloud,
+    load_model,
+    offload_vggt_model,
+)
 from gtsfm.loader.olsson_loader import OlssonLoader
 from gtsfm.utils import torch as torch_utils
 from gtsfm.utils.tree import Tree  # PreOrderIter
@@ -88,14 +99,10 @@ def run_vggt(
     original_coords,
     seed=42,
     conf_threshold_value=5.0,
-    vggt_fixed_resolution=518,
-    img_load_resolution=1024,
     max_query_pts=1000,
     query_frame_num=4,
-    fine_tracking=True,
     vis_thresh=0.2,
     max_reproj_error=8.0,
-    camera_type="SIMPLE_PINHOLE",
 ) -> GtsfmData:
     """Run VGGT on the given image keys and return GtsfmData."""
 
@@ -105,41 +112,54 @@ def run_vggt(
     print(f"Setting seed as: {seed}")
 
     device = torch_utils.default_device()
-    dtype = vggt.default_dtype(device)
+    dtype = default_dtype(device)
     print(f"Using device: {device.type}")
     print(f"Using dtype: {dtype}")
 
-    model = vggt.load_model(device=device)
+    model = load_model(device=device)
     print("Model loaded")
 
     image_batch = image_batch.to(device)
     print("image_batch: ", image_batch.shape)
     original_coords = original_coords.to(device)
 
-    config = VggtConfiguration(
-        vggt_fixed_resolution=vggt_fixed_resolution,
-        img_load_resolution=img_load_resolution,
+    geo_config = VggtGeometryConfig(confidence_threshold=conf_threshold_value)
+    track_config = TrackingConfig(
+        tracking=True,
         max_query_pts=max_query_pts,
         query_frame_num=query_frame_num,
-        fine_tracking=fine_tracking,
         track_vis_thresh=vis_thresh,
-        max_reproj_error=max_reproj_error,
-        confidence_threshold=conf_threshold_value,
+        vggt_max_reproj_error=max_reproj_error,
     )
 
-    result = vggt.run_reconstruction(
-        image_batch,
+    transformer = VggtGeometryTransformer(geo_config)
+    geo_output = transformer.predict(image_batch, model=model)
+
+    tracker = MultiViewTracker(track_config)
+    tracking_result = tracker.run_tracking(geo_output, model=model)
+    if geo_output.device.type == "cuda":
+        offload_vggt_model(model)
+
+    points_3d, points_rgb = high_confidence_pointcloud(
+        geo_output,
+        confidence_threshold=geo_config.confidence_threshold,
+        max_num_points=geo_config.max_num_points,
+    )
+
+    gtsfm_data = tracker.build_gtsfm_data(
+        geo_output,
+        original_coords,
         image_indices=image_indices,
         image_names=[f"image_{idx}" for idx in image_indices],
-        original_coords=original_coords,
-        config=config,
-        model=model,
+        tracking_result=tracking_result,
+        points_3d=points_3d,
+        points_rgb=points_rgb,
     )
 
-    if result.points_3d.size == 0:
+    if points_3d.size == 0:
         print("VGGT produced no confident 3D structure.")
 
-    return result.gtsfm_data
+    return gtsfm_data
 
 
 TEST_DATA = Path(__file__).parent.parent / "data"
@@ -152,54 +172,54 @@ class TestVGGTTrackSelection(unittest.TestCase):
 
     def test_selects_only_tracks_that_introduce_new_patches(self) -> None:
         candidates = [
-            vggt._TrackSelectionCandidate(
+            _TrackSelectionCandidate(
                 track_id=0, track_length=5, mean_reprojection_error=5.0, patches_by_image={0: (0, 0)}
             ),
-            vggt._TrackSelectionCandidate(
+            _TrackSelectionCandidate(
                 track_id=1, track_length=4, mean_reprojection_error=3.0, patches_by_image={0: (0, 0)}
             ),
-            vggt._TrackSelectionCandidate(
+            _TrackSelectionCandidate(
                 track_id=2, track_length=3, mean_reprojection_error=2.0, patches_by_image={0: (0, 1)}
             ),
         ]
 
-        selected = vggt._select_track_ids_for_ba_coverage(candidates, min_track_length=3, max_reproj_error=14.0)
+        selected = _select_track_ids_for_ba_coverage(candidates, min_track_length=3, max_reproj_error=14.0)
 
         self.assertEqual(selected, {0, 2})
 
     def test_sorts_by_track_length_then_mean_reprojection_descending(self) -> None:
         candidates = [
-            vggt._TrackSelectionCandidate(
+            _TrackSelectionCandidate(
                 track_id=0, track_length=5, mean_reprojection_error=1.0, patches_by_image={0: (0, 0)}
             ),
-            vggt._TrackSelectionCandidate(
+            _TrackSelectionCandidate(
                 track_id=1, track_length=5, mean_reprojection_error=4.0, patches_by_image={0: (0, 0)}
             ),
-            vggt._TrackSelectionCandidate(
+            _TrackSelectionCandidate(
                 track_id=2, track_length=4, mean_reprojection_error=3.0, patches_by_image={0: (0, 1)}
             ),
         ]
 
-        selected = vggt._select_track_ids_for_ba_coverage(candidates, min_track_length=3, max_reproj_error=14.0)
+        selected = _select_track_ids_for_ba_coverage(candidates, min_track_length=3, max_reproj_error=14.0)
 
         # Track 0 wins over track 1 on tie-breaker (lower mean reprojection error), then track 2 adds a new patch.
         self.assertEqual(selected, {0, 2})
 
     def test_selects_track_if_any_observation_adds_new_patch(self) -> None:
         candidates = [
-            vggt._TrackSelectionCandidate(
+            _TrackSelectionCandidate(
                 track_id=0,
                 track_length=5,
                 mean_reprojection_error=2.0,
                 patches_by_image={0: (0, 0), 1: (0, 0)},
             ),
-            vggt._TrackSelectionCandidate(
+            _TrackSelectionCandidate(
                 track_id=1,
                 track_length=4,
                 mean_reprojection_error=1.0,
                 patches_by_image={0: (0, 0), 1: (0, 1)},
             ),
-            vggt._TrackSelectionCandidate(
+            _TrackSelectionCandidate(
                 track_id=2,
                 track_length=3,
                 mean_reprojection_error=0.5,
@@ -207,7 +227,7 @@ class TestVGGTTrackSelection(unittest.TestCase):
             ),
         ]
 
-        selected = vggt._select_track_ids_for_ba_coverage(candidates, min_track_length=3, max_reproj_error=14.0)
+        selected = _select_track_ids_for_ba_coverage(candidates, min_track_length=3, max_reproj_error=14.0)
 
         self.assertEqual(selected, {0, 1})
 
@@ -216,77 +236,6 @@ class TestVGGT(unittest.TestCase):
 
     def setUp(self) -> None:
         pass
-
-    @unittest.skip("Skipping VGGT end-to-end test for now since it is slow and requires GPU.")
-    def test_coordinate_round_trip(self) -> None:
-        """Ensure the helper that maps VGGT grid coordinates back to original pixels is consistent.
-
-        VGGT operates on square, padded inputs. The loader pads each image to a square, rescales it
-        to ``img_load_resolution`` (1024 in our tests), and VGGT then down-samples that square to the
-        inference resolution (518). ``_convert_measurement_to_original_resolution`` must undo both
-        scaling steps and the padding offsets so that the merged reconstructions use the correct
-        camera indices during alignment. This test uses an analytic example where we can derive the
-        expected coordinates exactly and checks that the helper inverts the forward mapping.
-        """
-
-        width, height = 640, 480
-        img_load_resolution = 1024
-        inference_resolution = 518
-
-        max_side = max(width, height)
-        pad_left = (max_side - width) / 2.0
-        pad_top = (max_side - height) / 2.0
-        scale = img_load_resolution / max_side
-        original_coord = np.array(
-            [
-                pad_left * scale,
-                pad_top * scale,
-                (pad_left + width) * scale,
-                (pad_top + height) * scale,
-                width,
-                height,
-            ],
-            dtype=np.float32,
-        )
-
-        def forward_to_inference(u: float, v: float) -> tuple[float, float]:
-            """Simulate the loader + VGGT downsampling path to produce inference-space coords."""
-
-            u_padded = (u + pad_left) * scale
-            v_padded = (v + pad_top) * scale
-            shrink = inference_resolution / img_load_resolution
-            return (u_padded * shrink, v_padded * shrink)
-
-        # Corners and center stress the padding math.
-        samples = [
-            (0.0, 0.0),
-            (width - 1.0, 0.0),
-            (0.0, height - 1.0),
-            (width - 1.0, height - 1.0),
-            (width / 2.0, height / 2.0),
-        ]
-
-        for u_orig, v_orig in samples:
-            uv_infer = forward_to_inference(u_orig, v_orig)
-            u_back, v_back = vggt._convert_measurement_to_original_resolution(
-                uv_infer,
-                original_coord,
-                inference_resolution,
-                img_load_resolution,
-            )
-            self.assertAlmostEqual(u_back, u_orig, places=3)
-            self.assertAlmostEqual(v_back, v_orig, places=3)
-
-            uv_load = ((u_orig + pad_left) * scale, (v_orig + pad_top) * scale)
-            u_back_load, v_back_load = vggt._convert_measurement_to_original_resolution(
-                uv_load,
-                original_coord,
-                inference_resolution,
-                img_load_resolution,
-                measurement_in_load_resolution=True,
-            )
-            self.assertAlmostEqual(u_back_load, u_orig, places=3)
-            self.assertAlmostEqual(v_back_load, v_orig, places=3)
 
     @unittest.skip("Skipping VGGT end-to-end test for now since it is slow and requires GPU.")
     def test_run_vggt_on_some_images(self):
@@ -327,95 +276,6 @@ class TestVGGT(unittest.TestCase):
         self.assertEqual(gtsfm_data.number_images(), len(indices))
         self.assertCountEqual(gtsfm_data.get_valid_camera_indices(), indices)
 
-    @unittest.skip("Skipping because this test will be merged to the previous test.")
-    def test_convert_measurement_to_original_resolution_door_extremes(self) -> None:
-        """Ensure VGGT coordinate conversion preserves pixel centers for a real Door image."""
-
-        img_load_resolution = 1024
-        inference_resolution = vggt.DEFAULT_FIXED_RESOLUTION
-
-        def _jpeg_size(path: Path) -> tuple[int, int]:
-            with path.open("rb") as stream:
-                if stream.read(2) != b"\xff\xd8":
-                    raise ValueError("Not a JPEG file.")
-                while True:
-                    marker_start = stream.read(1)
-                    if not marker_start:
-                        raise ValueError("Reached EOF before finding SOF marker.")
-                    if marker_start != b"\xff":
-                        continue
-                    marker_code = stream.read(1)
-                    if not marker_code or marker_code == b"\x00":
-                        continue
-                    code = marker_code[0]
-                    if code in {0xD8, 0xD9} or 0xD0 <= code <= 0xD7:
-                        continue
-                    length_bytes = stream.read(2)
-                    if len(length_bytes) != 2:
-                        raise ValueError("Unexpected end of marker payload.")
-                    block_length = int.from_bytes(length_bytes, "big")
-                    if code in {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}:
-                        payload = stream.read(block_length - 2)
-                        if len(payload) != block_length - 2:
-                            raise ValueError("Incomplete SOF payload.")
-                        height = int.from_bytes(payload[1:3], "big")
-                        width = int.from_bytes(payload[3:5], "big")
-                        return width, height
-                    stream.seek(block_length - 2, 1)
-
-        image_path = DOOR / "images" / "DSC_0004.JPG"
-        width, height = _jpeg_size(image_path)
-        max_side = max(width, height)
-        pad_width = max_side - width
-        pad_height = max_side - height
-        pad_left = pad_width // 2
-        pad_top = pad_height // 2
-        scale = img_load_resolution / max_side
-
-        original_coord = np.array(
-            [
-                pad_left * scale,
-                pad_top * scale,
-                (pad_left + width) * scale,
-                (pad_top + height) * scale,
-                width,
-                height,
-            ],
-            dtype=np.float32,
-        )
-
-        def forward_to_inference(u: float, v: float) -> tuple[float, float]:
-            u_padded = (u + pad_left) * scale
-            v_padded = (v + pad_top) * scale
-            shrink = inference_resolution / img_load_resolution
-            return (u_padded * shrink, v_padded * shrink)
-
-        samples = [
-            (0.5, 0.5),
-            (width - 0.5, height - 0.5),
-        ]
-
-        for u_orig, v_orig in samples:
-            uv_infer = forward_to_inference(u_orig, v_orig)
-            u_back, v_back = vggt._convert_measurement_to_original_resolution(
-                uv_infer,
-                original_coord,
-                inference_resolution,
-                img_load_resolution,
-            )
-            self.assertAlmostEqual(u_back, u_orig, places=3)
-            self.assertAlmostEqual(v_back, v_orig, places=3)
-
-            uv_load = ((u_orig + pad_left) * scale, (v_orig + pad_top) * scale)
-            u_back_load, v_back_load = vggt._convert_measurement_to_original_resolution(
-                uv_load,
-                original_coord,
-                inference_resolution,
-                img_load_resolution,
-                measurement_in_load_resolution=True,
-            )
-            self.assertAlmostEqual(u_back_load, u_orig, places=3)
-            self.assertAlmostEqual(v_back_load, v_orig, places=3)
 
 
 if __name__ == "__main__":
