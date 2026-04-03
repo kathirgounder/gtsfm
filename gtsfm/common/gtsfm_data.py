@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 import gtsam  # type: ignore
 import numpy as np
+from numpy.typing import NDArray
 from gtsam import Pose3, SfmTrack, Similarity3, Values
 from gtsam.symbol_shorthand import K, P, X  # type: ignore
 
@@ -85,6 +86,7 @@ class GtsfmData:
         cameras: Optional[Mapping[int, gtsfm_types.CAMERA_TYPE]] = None,
         tracks: Optional[List[SfmTrack]] = None,
         gaussian_splats: Optional[GaussianSplatsType] = None,
+        pose_covariances: Optional[Mapping[int, NDArray[np.float64]]] = None,
     ) -> None:
         """Initializes the class.
 
@@ -99,6 +101,7 @@ class GtsfmData:
         self._image_info: dict[int, ImageInfo] = {}
         self._gaussian_splats: GaussianSplatsType | None = None
         self._camera_to_measurement_map: dict[int, list[tuple[int, int]]] | None = None
+        self._pose_covariances: dict[int, NDArray[np.float64]] = {}
 
         # Initialize from inputs if provided.
         if cameras is not None:
@@ -109,6 +112,8 @@ class GtsfmData:
                 self.add_track(track)
         if gaussian_splats is not None:
             self.set_gaussian_splats(gaussian_splats)
+        if pose_covariances is not None:
+            self.set_camera_pose_covariances(pose_covariances)
 
     def __repr__(self) -> str:
         """String representation of the object."""
@@ -216,7 +221,12 @@ class GtsfmData:
 
     @classmethod
     def from_values(
-        cls, values: Values, initial_data: Optional["GtsfmData"] = None, shared_calib: bool = False
+        cls,
+        values: Values,
+        initial_data: Optional["GtsfmData"] = None,
+        shared_calib: bool = False,
+        include_cameras_not_in_values: bool = True,
+        include_tracks_not_in_values: bool = False,
     ) -> "GtsfmData":
         """Instantiate a GtsfmData from optimized factor graph results.
 
@@ -224,6 +234,7 @@ class GtsfmData:
             values: Optimizer output containing poses, points, and calibrations.
             initial_data: Optional input data used to build the factor graph; provides topology for cameras and tracks.
             shared_calib: Whether all cameras shared a single calibration variable in the optimization.
+            include_cameras_not_in_values: Whether to include cameras that are not in values (but are in initial_data).
         """
 
         def _symbol_indices(value_keys: Iterable[int], char: str) -> List[int]:
@@ -236,7 +247,9 @@ class GtsfmData:
 
         keys_list = list(values.keys())
         pose_indices = (
-            initial_data.get_valid_camera_indices() if initial_data is not None else _symbol_indices(keys_list, "x")
+            initial_data.get_valid_camera_indices()
+            if initial_data is not None and include_cameras_not_in_values
+            else _symbol_indices(keys_list, "x")
         )
 
         if not pose_indices:
@@ -300,22 +313,32 @@ class GtsfmData:
 
         for i in pose_indices:
             cal_i = _calibration_for_idx(i)
-            result.add_camera(i, camera_class(values.atPose3(X(i)), cal_i))  # type: ignore
+            if values.exists(X(i)):
+                result.add_camera(i, camera_class(values.atPose3(X(i)), cal_i))  # type: ignore
+            elif initial_data and include_cameras_not_in_values:
+                result.add_camera(i, initial_data.get_camera(i))
 
-        track_indices = _symbol_indices(keys_list, "p")
+        track_indices = (
+            _symbol_indices(keys_list, "p") if initial_data is not None else initial_data.get_valid_camera_indices()
+        )
 
         for track_idx in track_indices:
-            point = values.atPoint3(P(track_idx))
-            result_track = SfmTrack(point)
-            if initial_data is not None:
-                input_track = initial_data.get_track(track_idx)
-                result_track.r = input_track.r
-                result_track.g = input_track.g
-                result_track.b = input_track.b
-                for measurement_idx in range(input_track.numberMeasurements()):
-                    i, uv = input_track.measurement(measurement_idx)
-                    result_track.addMeasurement(i, uv)
-            result.add_track(result_track)
+            if values.exists(P(track_idx)):
+                point = values.atPoint3(P(track_idx))
+                result_track = SfmTrack(point)
+                if initial_data is not None:
+                    input_track = initial_data.get_track(track_idx)
+                    result_track.r = input_track.r
+                    result_track.g = input_track.g
+                    result_track.b = input_track.b
+                    for measurement_idx in range(input_track.numberMeasurements()):
+                        i, uv = input_track.measurement(measurement_idx)
+                        if i in result.get_valid_camera_indices():
+                            result_track.addMeasurement(i, uv)
+                result.add_track(result_track)
+            elif initial_data is not None and include_tracks_not_in_values:
+                result_track = initial_data.get_track(track_idx)
+                result.add_track(result_track)
 
         if initial_data is not None:
             result._image_info = initial_data._clone_image_info()
@@ -427,6 +450,7 @@ class GtsfmData:
 
         if self._gaussian_splats is not None:
             cloned.set_gaussian_splats(self._gaussian_splats)
+        cloned._pose_covariances = self._clone_pose_covariances(indices=cloned.get_valid_camera_indices())
 
         return cloned
 
@@ -453,6 +477,15 @@ class GtsfmData:
                 info = self._image_info[idx]
                 cloned[idx] = ImageInfo(name=info.name, shape=info.shape)
         return cloned
+
+    def _clone_pose_covariances(self, indices: Optional[Iterable[int]] = None) -> dict[int, NDArray[np.float64]]:
+        """Create a shallow copy of per-camera pose covariance blocks."""
+        source_indices = indices if indices is not None else self._pose_covariances.keys()
+        return {
+            idx: np.array(self._pose_covariances[idx], copy=True)
+            for idx in list(source_indices)
+            if idx in self._pose_covariances
+        }
 
     def _default_image_filename(self, index: int) -> str:
         """Return a placeholder filename for ``index``."""
@@ -547,6 +580,23 @@ class GtsfmData:
     def get_camera_poses(self) -> Dict[int, Pose3]:
         """Returns poses as a dictionary, without missing poses."""
         return {i: cam.pose() for i, cam in self._cameras.items()}
+
+    def set_camera_pose_covariance(self, index: int, covariance: NDArray[np.float64]) -> None:
+        """Set pose covariance for one camera index."""
+        self._pose_covariances[index] = np.array(covariance, copy=True)
+
+    def set_camera_pose_covariances(self, pose_covariances: Mapping[int, NDArray[np.float64]]) -> None:
+        """Set pose covariances for multiple camera indices."""
+        self._pose_covariances = {idx: np.array(cov, copy=True) for idx, cov in pose_covariances.items()}
+
+    def get_camera_pose_covariance(self, index: int) -> Optional[NDArray[np.float64]]:
+        """Get pose covariance for one camera index, if available."""
+        covariance = self._pose_covariances.get(index)
+        return None if covariance is None else np.array(covariance, copy=True)
+
+    def get_camera_pose_covariances(self) -> Dict[int, NDArray[np.float64]]:
+        """Get all available camera pose covariances."""
+        return self._clone_pose_covariances()
 
     def get_track(self, index: int) -> SfmTrack:
         """Returns track at given index."""
@@ -674,6 +724,7 @@ class GtsfmData:
         if len(camera_edges) == 0:
             data = GtsfmData(self._number_images, gaussian_splats=self._gaussian_splats)
             data._image_info = self._clone_image_info()
+            data._pose_covariances = self._clone_pose_covariances()
             return data
 
         cameras_in_largest_cc = graph_utils.get_nodes_in_largest_connected_component(camera_edges)
@@ -692,6 +743,7 @@ class GtsfmData:
         number_images: int,
         image_info: Optional[Mapping[int, ImageInfo]] = None,
         gaussian_splats: Optional[GaussianSplatsType] = None,
+        pose_covariances: Optional[Mapping[int, NDArray[np.float64]]] = None,
     ) -> "GtsfmData":
         """Creates a GtsfmData object from a pre-existing set of cameras and tracks."""
         new_data = cls(number_images=number_images, gaussian_splats=gaussian_splats)
@@ -701,6 +753,8 @@ class GtsfmData:
             new_data._image_info = {
                 idx: ImageInfo(name=info.name, shape=info.shape) for idx, info in image_info.items()
             }
+        if pose_covariances is not None:
+            new_data.set_camera_pose_covariances(pose_covariances)
         return new_data
 
     @classmethod
@@ -752,6 +806,7 @@ class GtsfmData:
             new_data._camera_to_measurement_map = {
                 k: v for k, v in gtsfm_data._camera_to_measurement_map.items() if k in new_camera_indices
             }
+        new_data._pose_covariances = gtsfm_data._clone_pose_covariances(indices=new_camera_indices)
 
         return new_data
 
@@ -881,6 +936,7 @@ class GtsfmData:
                 filtered_data.set_image_info(i, name=source_info.name, shape=source_info.shape)
             filtered_data.add_track(track)
 
+        filtered_data._pose_covariances = self._clone_pose_covariances(indices=filtered_data.get_valid_camera_indices())
         return filtered_data, valid_mask
 
     def filter_landmark_measurements(
@@ -932,6 +988,7 @@ class GtsfmData:
                     continue
                 filtered_data.add_camera(i, camera_i)
 
+        filtered_data._pose_covariances = self._clone_pose_covariances(indices=filtered_data.get_valid_camera_indices())
         return filtered_data
 
     def align_via_sim3_and_transform(self, aTi: dict[int, Pose3]) -> "GtsfmData":
@@ -1057,6 +1114,9 @@ class GtsfmData:
             else:
                 merged_gaussians = merge_gaussian_splats(merged_gaussians, transformed_other_gaussians)
         merged_data.set_gaussian_splats(merged_gaussians)
+        # Keep only covariances for unchanged cameras from `self`. Cameras transformed from `other`
+        # would require uncertainty transport through Sim(3), which is not handled here.
+        merged_data._pose_covariances = self._clone_pose_covariances(indices=merged_data.get_valid_camera_indices())
 
         return merged_data
 
@@ -1074,6 +1134,7 @@ class GtsfmData:
             gaussian_splats=self._gaussian_splats,
         )
         downsampled._image_info = self._clone_image_info()
+        downsampled._pose_covariances = self._clone_pose_covariances(indices=downsampled.get_valid_camera_indices())
         return downsampled
 
     # COLMAP export functions
@@ -1108,6 +1169,26 @@ class GtsfmData:
                 to_write = [colmap_cam.id, colmap_cam.model, colmap_cam.width, colmap_cam.height, *colmap_cam.params]
                 line = " ".join([str(elem) for elem in to_write])
                 f.write(line + "\n")
+
+        if self._pose_covariances:
+            covariance_path = dir_path / "covariance.txt"
+            valid_camera_indices = self.get_valid_camera_indices()
+            with open(covariance_path, "w") as f:
+                f.write("# Camera pose covariance list with one line of data per camera:\n")
+                f.write("#   CAMERA_ID, COVARIANCE_6X6_ROW_MAJOR[]\n")
+                f.write(
+                    "# Number of covariances: "
+                    f"{sum(1 for i in valid_camera_indices if i in self._pose_covariances)}\n"
+                )
+
+                for i in valid_camera_indices:
+                    covariance = self._pose_covariances.get(i)
+                    if covariance is None:
+                        continue
+                    covariance_6x6 = np.asarray(covariance)[:6, :6]
+                    row_major_values = covariance_6x6.reshape(-1)
+                    line = " ".join([str(i), *[str(val) for val in row_major_values]])
+                    f.write(line + "\n")
 
     def write_images(self, save_dir: str | Path) -> None:
         """Writes the image data file in the COLMAP format.
@@ -1221,6 +1302,7 @@ class GtsfmData:
         """Emulates the COLMAP option to `Export model as text`.
 
         Three text files will be saved to disk: "points3D.txt", "images.txt", and "cameras.txt".
+        If pose covariances are available, "covariance.txt" is also saved.
 
         Args:
             save_dir: Folder where text files will be saved.
