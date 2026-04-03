@@ -82,7 +82,9 @@ class ColmapLoader(LoaderBase):
         else:
             self._colmap_files_subdir = self._dataset_dir
 
-        wTi_list, img_fnames, calibrations, _, _, _ = io_utils.read_scene_data_from_colmap_format(colmap_data_dir)
+        wTi_list, img_fnames, calibrations, _, _, _ = io_utils.read_scene_data_from_colmap_format(
+            self._colmap_files_subdir
+        )
         # TODO in future PR: if img_fnames is None, default to using everything inside image directory
 
         if calibrations is None:
