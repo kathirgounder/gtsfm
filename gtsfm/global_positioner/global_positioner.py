@@ -34,6 +34,8 @@ References:
 Authors: Kathir Gounder
 """
 
+import os
+import pickle
 import time
 from typing import List, Optional, Set, Tuple
 
@@ -42,10 +44,12 @@ import numpy as np
 from gtsam import (
     BinaryMeasurementUnit3,
     BinaryMeasurementsUnit3,
+    NonlinearFactorGraph,
     Point3,
     Pose3,
     Rot3,
     SfmTrack,
+    Symbol,
     TranslationRecovery,
     Unit3,
     Values,
@@ -179,24 +183,9 @@ def build_and_solve(
 
     Returns: (result_values, camera_indices, track_indices)
     """
-    # Build BinaryMeasurementsUnit3 — same format as 1DSfM uses.
-    # Noise dim=2 for Unit3 chordal distance; TranslationRecovery converts to dim=3 internally.
-    noise_model = gtsam.noiseModel.Isotropic.Sigma(2, noise_sigma)
-    huber = gtsam.noiseModel.mEstimator.Huber.Create(huber_loss_scale)
-    robust_noise = gtsam.noiseModel.Robust.Create(huber, noise_model)
-
-    measurements = BinaryMeasurementsUnit3()
-    camera_indices: Set[int] = set()
-    track_indices: Set[int] = set()
-
-    for track_idx, cam_idx, bearing in observations:
-        measurements.append(BinaryMeasurementUnit3(
-            C(cam_idx), L(track_idx),
-            Unit3(Point3(*bearing)),
-            robust_noise,
-        ))
-        camera_indices.add(cam_idx)
-        track_indices.add(track_idx)
+    measurements, camera_indices, track_indices = _build_measurements(
+        observations, noise_sigma, huber_loss_scale
+    )
 
     logger.info(
         "GlobalPositioner: built %d measurements (%d cameras, %d landmarks)",
@@ -213,6 +202,98 @@ def build_and_solve(
     result_values = algorithm.run(measurements, 1.0)
 
     return result_values, camera_indices, track_indices
+
+
+def _build_measurements(
+    observations: List[Tuple[int, int, np.ndarray]],
+    noise_sigma: float,
+    huber_loss_scale: float,
+) -> Tuple[BinaryMeasurementsUnit3, Set[int], Set[int]]:
+    """Build BinaryMeasurementsUnit3 from bearing observations (shared by both solve functions)."""
+    noise_model = gtsam.noiseModel.Isotropic.Sigma(2, noise_sigma)
+    huber = gtsam.noiseModel.mEstimator.Huber.Create(huber_loss_scale)
+    robust_noise = gtsam.noiseModel.Robust.Create(huber, noise_model)
+
+    measurements = BinaryMeasurementsUnit3()
+    camera_indices: Set[int] = set()
+    track_indices: Set[int] = set()
+
+    for track_idx, cam_idx, bearing in observations:
+        measurements.append(BinaryMeasurementUnit3(
+            C(cam_idx), L(track_idx), Unit3(Point3(*bearing)), robust_noise,
+        ))
+        camera_indices.add(cam_idx)
+        track_indices.add(track_idx)
+
+    return measurements, camera_indices, track_indices
+
+
+def build_and_solve_with_trace(
+    observations: List[Tuple[int, int, np.ndarray]],
+    noise_sigma: float,
+    huber_loss_scale: float,
+    max_iterations: int,
+) -> Tuple[Values, Set[int], Set[int], List[Values], List[float]]:
+    """Build graph manually and solve with per-iteration value capture.
+
+    Uses TranslationRecovery.buildGraph() + addPrior() to get the native C++
+    factor graph, then iterates manually with LevenbergMarquardtOptimizer to
+    capture optimizer.values() at each step for convergence visualization.
+
+    Returns: (result_values, camera_indices, track_indices, values_trace, error_trace)
+    """
+    measurements, camera_indices, track_indices = _build_measurements(
+        observations, noise_sigma, huber_loss_scale
+    )
+
+    logger.info(
+        "GlobalPositioner (trace): built %d measurements (%d cameras, %d landmarks)",
+        len(observations), len(camera_indices), len(track_indices),
+    )
+
+    # Build graph via TranslationRecovery (uses native C++ BilinearAngleTranslationFactor)
+    lm_params = gtsam.LevenbergMarquardtParams()
+    lm_params.setMaxIterations(max_iterations)
+    lm_params.setRelativeErrorTol(1e-5)
+    lm_params.setVerbosityLM("SILENT")
+    tr = TranslationRecovery(lm_params, use_bilinear_translation_factor=True)
+
+    graph = tr.buildGraph(measurements)
+    tr.addPrior(measurements, 1.0, gtsam.BinaryMeasurementsPoint3(), graph)
+
+    # Initialize randomly (matching TranslationRecovery C++ code)
+    rng = np.random.RandomState(42)
+    initial = Values()
+    for cam_idx in camera_indices:
+        initial.insert(C(cam_idx), Point3(*rng.uniform(-1, 1, 3)))
+    for track_idx in track_indices:
+        initial.insert(L(track_idx), Point3(*rng.uniform(-1, 1, 3)))
+    for i in range(len(observations)):
+        initial.insert(Symbol('S', i).key(), np.array([[1.0]]))
+
+    initial_error = graph.error(initial)
+    logger.info("GlobalPositioner (trace): initial error = %.2f", initial_error)
+
+    # Iterate manually, capturing values at each step
+    optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial, lm_params)
+    values_trace = [initial]
+    error_trace = [initial_error]
+
+    for iteration in range(1, max_iterations + 1):
+        t0 = time.time()
+        optimizer.iterate()
+        dt = time.time() - t0
+        error = optimizer.error()
+        values_trace.append(optimizer.values())
+        error_trace.append(error)
+
+        if iteration <= 5 or iteration % 5 == 0:
+            logger.info("  iter %3d: error=%.2f  (%.2fs)", iteration, error, dt)
+
+    result = optimizer.values()
+    logger.info("GlobalPositioner (trace): final error = %.4f (%d frames captured)", error_trace[-1], len(values_trace))
+
+    return result, camera_indices, track_indices, values_trace, error_trace
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -352,6 +433,7 @@ class GlobalPositioner:
         min_track_measurements: int = MIN_TRACK_MEASUREMENTS,
         max_reproj_error: float = DEFAULT_MAX_REPROJ_ERROR,
         max_tracks: int = DEFAULT_MAX_TRACKS,
+        save_iteration_visualization: bool = False,
     ) -> None:
         self._noise_sigma = noise_sigma
         self._huber_loss_scale = huber_loss_scale
@@ -359,6 +441,7 @@ class GlobalPositioner:
         self._min_track_measurements = min_track_measurements
         self._max_reproj_error = max_reproj_error
         self._max_tracks = max_tracks
+        self._save_iteration_visualization = save_iteration_visualization
 
     def run(
         self,
@@ -413,11 +496,31 @@ class GlobalPositioner:
         if not observations:
             return GtsfmData(number_images=num_images), GtsfmMetricsGroup("global_positioning_metrics", [])
 
-        # ── Build factor graph and solve (native C++) ──
+        # ── Build factor graph and solve ──
         t0 = time.time()
-        result_values, cam_indices, track_indices = build_and_solve(
-            observations, self._noise_sigma, self._huber_loss_scale, self._max_iterations,
-        )
+        if self._save_iteration_visualization:
+            result_values, cam_indices, track_indices, values_trace, error_trace = build_and_solve_with_trace(
+                observations, self._noise_sigma, self._huber_loss_scale, self._max_iterations,
+            )
+            # Save trace to disk for visualization script
+            trace_path = "results/gp_convergence_trace.pkl"
+            os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+            trace_data = {
+                "values_trace": values_trace,
+                "error_trace": error_trace,
+                "camera_indices": cam_indices,
+                "track_indices": track_indices,
+                "wRi_list": [wRi_list[i] for i in sorted(cam_indices)],
+                "wRi_indices": sorted(cam_indices),
+                "filtered_tracks": filtered_tracks,
+            }
+            with open(trace_path, "wb") as f:
+                pickle.dump(trace_data, f)
+            logger.info("GlobalPositioner: saved convergence trace to %s (%d frames)", trace_path, len(values_trace))
+        else:
+            result_values, cam_indices, track_indices = build_and_solve(
+                observations, self._noise_sigma, self._huber_loss_scale, self._max_iterations,
+            )
         dt_solve = time.time() - t0
         logger.info("GlobalPositioner: optimization took %.2fs.", dt_solve)
 
