@@ -44,7 +44,6 @@ import numpy as np
 from gtsam import (
     BinaryMeasurementUnit3,
     BinaryMeasurementsUnit3,
-    NonlinearFactorGraph,
     Point3,
     Pose3,
     Rot3,
