@@ -477,7 +477,7 @@ class GlobalPositioner:
             return GtsfmData(number_images=num_images), GtsfmMetricsGroup("global_positioning_metrics", [])
 
         logger.info("GlobalPositioner: %d valid cameras, %d input tracks.",
-                     len(valid_cameras), len(tracks_2d))
+                    len(valid_cameras), len(tracks_2d))
 
         # ── Filter tracks ──
         filtered_tracks = filter_tracks(tracks_2d, valid_cameras, self._min_track_measurements, self._max_tracks)
@@ -557,8 +557,8 @@ class GlobalPositioner:
         ])
 
         logger.info("GlobalPositioner: done in %.2fs — %d cameras, %d tracks.",
-                     total_duration,
-                     len(gtsfm_data.get_valid_camera_indices()) if gtsfm_data else 0,
-                     gtsfm_data.number_tracks() if gtsfm_data else 0)
+                    total_duration,
+                    len(gtsfm_data.get_valid_camera_indices()) if gtsfm_data else 0,
+                    gtsfm_data.number_tracks() if gtsfm_data else 0)
 
         return gtsfm_data, metrics
