@@ -427,7 +427,7 @@ class BundleAdjustmentOptimizer:
 
         if not self._use_gnc:
             if self._optimizer_relative_cost_tol is not None:
-                params.setRelativeCostTol(self._optimizer_relative_cost_tol)
+                params.setRelativeErrorTol(self._optimizer_relative_cost_tol)
             lm = gtsam.LevenbergMarquardtOptimizer(graph, initial_values, params)
         else:
             gnc_params = gtsam.GncLMParams(params)
