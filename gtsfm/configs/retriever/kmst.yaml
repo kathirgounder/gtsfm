@@ -1,8 +1,6 @@
 retriever:
   _target_: gtsfm.retriever.KMst
   num_matched: 20
-  num_msts: 3
-  lambda_modulation: 0.3
-  min_rank_threshold: 0.5
-  top_k_modulate: 5
-  min_score: 0.2
+  min_score: 0.4
+  mst_min_score: 0.25
+  num_msts: 2
