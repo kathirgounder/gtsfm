@@ -319,7 +319,7 @@ class GtsfmData:
                 result.add_camera(i, initial_data.get_camera(i))
 
         track_indices = (
-            _symbol_indices(keys_list, "p") if initial_data is not None else initial_data.get_valid_camera_indices()
+            _symbol_indices(keys_list, "p") if initial_data is None else initial_data.get_valid_camera_indices()
         )
 
         for track_idx in track_indices:
