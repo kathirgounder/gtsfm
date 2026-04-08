@@ -96,6 +96,7 @@ class TwoViewEstimator(DaskDBModuleBase):
             calibration_prior_dist_sigma=1e-5,
             cam_pose3_prior_noise_sigma=0.1,
             measurement_noise_sigma=1.0,
+            min_tracks_per_camera=5,
         )
         self.postgres_params = postgres_params  # save connection parameters for use on remote worker
 
