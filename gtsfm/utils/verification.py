@@ -214,3 +214,139 @@ def compute_epipolar_distances_sq_sampson(
     denominator = line_sq_norms_i1 + line_sq_norms_i2
 
     return numerator / denominator
+
+
+def filter_correspondences_for_track_quality(
+    keypoints_i1: "Keypoints",
+    keypoints_i2: "Keypoints",
+    v_corr_idxs: np.ndarray,
+    camera_intrinsics_i1: CALIBRATION_TYPE,
+    camera_intrinsics_i2: CALIBRATION_TYPE,
+    i2Ri1: Rot3,
+    i2Ui1: Unit3,
+    epipole_threshold_px: float = 20.0,
+    min_triangulation_angle_deg: float = 1.0,
+) -> np.ndarray:
+    """Filter correspondences by epipole proximity, cheirality, and triangulation angle.
+
+    Implements GLOMAP Section 3.1 filtering to remove matches that would create
+    poorly-constrained tracks: matches near epipoles (near-zero parallax),
+    matches that fail cheirality (triangulate behind cameras), and matches with
+    small triangulation angles.
+
+    Args:
+        keypoints_i1: Keypoints from image i1.
+        keypoints_i2: Keypoints from image i2.
+        v_corr_idxs: Verified correspondence indices, shape (N, 2).
+        camera_intrinsics_i1: Intrinsics for image i1.
+        camera_intrinsics_i2: Intrinsics for image i2.
+        i2Ri1: Relative rotation from camera i1 to i2.
+        i2Ui1: Relative translation direction from camera i1 to i2.
+        epipole_threshold_px: Remove matches within this distance of epipole.
+        min_triangulation_angle_deg: Minimum triangulation angle in degrees.
+
+    Returns:
+        Filtered correspondence indices, shape (M, 2) where M <= N.
+    """
+    import gtsam
+
+    if v_corr_idxs.shape[0] == 0:
+        return v_corr_idxs
+
+    coords_i1 = keypoints_i1.coordinates[v_corr_idxs[:, 0]]
+    coords_i2 = keypoints_i2.coordinates[v_corr_idxs[:, 1]]
+
+    # --- Epipole filtering ---
+    # Compute F-matrix from E = [t]_x R and intrinsics.
+    i2Ei1 = EssentialMatrix(i2Ri1, i2Ui1)
+    K1_inv = np.linalg.inv(camera_intrinsics_i1.K())
+    K2_inv_T = np.linalg.inv(camera_intrinsics_i2.K()).T
+    F = K2_inv_T @ i2Ei1.matrix() @ K1_inv
+
+    # Epipoles via SVD of F.
+    _, _, Vt = np.linalg.svd(F)
+    e1 = Vt[-1]  # epipole in image 1
+    if abs(e1[2]) > 1e-10:
+        e1 = e1[:2] / e1[2]
+    else:
+        e1 = None
+
+    U, _, _ = np.linalg.svd(F)
+    e2 = U[:, -1]  # epipole in image 2
+    if abs(e2[2]) > 1e-10:
+        e2 = e2[:2] / e2[2]
+    else:
+        e2 = None
+
+    keep_mask = np.ones(len(v_corr_idxs), dtype=bool)
+
+    if e1 is not None:
+        dist_to_e1 = np.linalg.norm(coords_i1 - e1[np.newaxis, :], axis=1)
+        keep_mask &= dist_to_e1 > epipole_threshold_px
+
+    if e2 is not None:
+        dist_to_e2 = np.linalg.norm(coords_i2 - e2[np.newaxis, :], axis=1)
+        keep_mask &= dist_to_e2 > epipole_threshold_px
+
+    # --- Cheirality + triangulation angle filtering ---
+    # Build poses and shared calibration for triangulation.
+    try:
+        i2Ti1 = Pose3(i2Ri1, i2Ui1.point3())
+        wTi1 = Pose3()  # camera 1 at origin
+        wTi2 = i2Ti1.inverse()  # camera 2 in world frame
+        poses = [wTi1, wTi2]
+    except Exception:
+        return v_corr_idxs[keep_mask]
+
+    cam1_center = np.zeros(3)
+    cam2_center = wTi2.translation()
+    min_angle_rad = np.radians(min_triangulation_angle_deg)
+
+    for idx in range(len(v_corr_idxs)):
+        if not keep_mask[idx]:
+            continue
+        try:
+            # Normalize pixel coordinates to camera coordinates for triangulation.
+            uv1_norm = feature_utils.normalize_coordinates(
+                coords_i1[idx:idx+1], camera_intrinsics_i1
+            )
+            uv2_norm = feature_utils.normalize_coordinates(
+                coords_i2[idx:idx+1], camera_intrinsics_i2
+            )
+            # Use DLT triangulation via bearing vectors.
+            ray1_cam = np.array([uv1_norm[0, 0], uv1_norm[0, 1], 1.0])
+            ray2_cam = np.array([uv2_norm[0, 0], uv2_norm[0, 1], 1.0])
+            ray1_world = wTi1.rotation().rotate(ray1_cam)
+            ray2_world = wTi2.rotation().rotate(ray2_cam)
+
+            # Midpoint triangulation.
+            A = np.column_stack([ray1_world, -ray2_world])
+            b = cam2_center - cam1_center
+            result = np.linalg.lstsq(A, b, rcond=None)
+            t_vals = result[0]
+
+            # Cheirality: both t values must be positive.
+            if t_vals[0] < 0 or t_vals[1] < 0:
+                keep_mask[idx] = False
+                continue
+
+            pt_3d = cam1_center + t_vals[0] * ray1_world
+
+            # Triangulation angle check.
+            vec1 = pt_3d - cam1_center
+            vec2 = pt_3d - cam2_center
+            cos_angle = np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2) + 1e-12)
+            cos_angle = np.clip(cos_angle, -1.0, 1.0)
+            if np.arccos(cos_angle) < min_angle_rad:
+                keep_mask[idx] = False
+        except Exception:
+            keep_mask[idx] = False
+
+    num_filtered = len(v_corr_idxs) - np.sum(keep_mask)
+    if num_filtered > 0:
+        logger.debug(
+            "Track quality filter: removed %d / %d correspondences (epipole + cheirality + angle).",
+            num_filtered, len(v_corr_idxs),
+        )
+
+    return v_corr_idxs[keep_mask]
