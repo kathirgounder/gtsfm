@@ -93,8 +93,11 @@ def calibrate_view_graph(
     min_correspondences: int = 30,
     min_focal_ratio: float = 0.5,
     max_focal_ratio: float = 2.0,
-) -> List[gtsfm_types.CALIBRATION_TYPE]:
+    max_edge_error: float = 0.5,
+) -> Tuple[List[gtsfm_types.CALIBRATION_TYPE], set]:
     """Refine camera focal lengths via joint Fetzer optimization over all F-matrix edges.
+
+    Also filters edges with high calibration error (GLOMAP FilterImagePairs).
 
     Args:
         v_corr_idxs_dict: Verified correspondence indices per image pair.
@@ -104,9 +107,11 @@ def calibrate_view_graph(
         min_correspondences: Minimum correspondences to attempt F estimation.
         min_focal_ratio: Minimum allowed ratio of optimized/initial focal length.
         max_focal_ratio: Maximum allowed ratio of optimized/initial focal length.
+        max_edge_error: Maximum Fetzer residual norm to keep an edge.
 
     Returns:
         Refined intrinsics list (same length as initial_intrinsics).
+        Set of edge keys (i1, i2) to remove from the view graph.
     """
     # Step 1: Estimate F-matrices and collect optimization edges.
     edges = []  # (cam_idx1, cam_idx2, F, pp1, pp2)
@@ -134,7 +139,7 @@ def calibrate_view_graph(
 
     if not edges:
         logger.info("View graph calibration: no valid edges, skipping.")
-        return list(initial_intrinsics)
+        return list(initial_intrinsics), set()
 
     # Step 2: Set up optimization variables.
     sorted_cameras = sorted(cameras_in_edges)
@@ -185,14 +190,24 @@ def calibrate_view_graph(
         else:
             num_rejected += 1
 
+    # Step 5: Filter edges with high calibration error (GLOMAP FilterImagePairs).
+    final_residuals = _fetzer_residuals(optimized_focals, edges, cam_idx_to_var_idx)
+    edges_to_remove = set()
+    for i, (cam1, cam2, F, pp1, pp2) in enumerate(edges):
+        edge_error = np.linalg.norm(final_residuals[2*i:2*i+2])
+        if edge_error > max_edge_error:
+            edges_to_remove.add((cam1, cam2))
+
     logger.info(
         "View graph calibration (Fetzer): refined %d, rejected %d / %d cameras. "
         "Optimized focals: min=%.1f, med=%.1f, max=%.1f. "
+        "Filtered %d / %d edges by calibration error (threshold=%.2f). "
         "Solver: %s in %d evaluations, cost %.4f → %.4f.",
         num_refined, num_rejected, len(sorted_cameras),
         optimized_focals.min(), np.median(optimized_focals), optimized_focals.max(),
+        len(edges_to_remove), len(edges), max_edge_error,
         result.message, result.nfev, 0.5 * np.sum(_fetzer_residuals(initial_focals, edges, cam_idx_to_var_idx)**2),
         result.cost,
     )
 
-    return refined
+    return refined, edges_to_remove

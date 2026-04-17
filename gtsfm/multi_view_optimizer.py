@@ -184,9 +184,13 @@ class MultiViewOptimizer:
 
         # View graph calibration: refine focal lengths from F-matrices before global positioning.
         if self._run_view_graph_calibration:
-            all_intrinsics = delayed(calibrate_view_graph)(
+            all_intrinsics, edges_to_remove = delayed(calibrate_view_graph, nout=2)(
                 viewgraph_v_corr_idxs_graph, keypoints_graph, all_intrinsics, num_images
             )
+            # Remove edges with high calibration error (GLOMAP FilterImagePairs).
+            viewgraph_i2Ri1_graph, viewgraph_i2Ui1_graph, viewgraph_v_corr_idxs_graph = delayed(
+                _filter_edges, nout=3
+            )(viewgraph_i2Ri1_graph, viewgraph_i2Ui1_graph, viewgraph_v_corr_idxs_graph, edges_to_remove)
             # Re-estimate relative poses with refined intrinsics (GLOMAP Section 3.5).
             viewgraph_i2Ri1_graph, viewgraph_i2Ui1_graph = delayed(reestimate_relative_poses, nout=2)(
                 viewgraph_i2Ri1_graph, viewgraph_i2Ui1_graph,
@@ -282,6 +286,22 @@ class MultiViewOptimizer:
         ba_input_graph = delayed(GtsfmData.align_via_sim3_and_transform)(ba_input_graph, gt_wTi_dict)
 
         return ba_input_graph, ba_result_graph, viewgraph_two_view_reports_graph, multiview_optimizer_metrics_graph
+
+
+def _filter_edges(
+    i2Ri1_dict: Dict[Tuple[int, int], Rot3],
+    i2Ui1_dict: Dict[Tuple[int, int], Unit3],
+    v_corr_idxs_dict: AnnotatedGraph[np.ndarray],
+    edges_to_remove: set,
+) -> Tuple[Dict[Tuple[int, int], Rot3], Dict[Tuple[int, int], Unit3], AnnotatedGraph[np.ndarray]]:
+    """Remove edges flagged by view graph calibration."""
+    if not edges_to_remove:
+        return i2Ri1_dict, i2Ui1_dict, v_corr_idxs_dict
+    filtered_R = {k: v for k, v in i2Ri1_dict.items() if k not in edges_to_remove}
+    filtered_U = {k: v for k, v in i2Ui1_dict.items() if k not in edges_to_remove}
+    filtered_corr = {k: v for k, v in v_corr_idxs_dict.items() if k not in edges_to_remove}
+    logger.info("Edge filtering: removed %d edges, %d remain.", len(edges_to_remove), len(filtered_R))
+    return filtered_R, filtered_U, filtered_corr
 
 
 def reestimate_relative_poses(
