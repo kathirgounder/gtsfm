@@ -42,7 +42,7 @@ class ColmapLoader(LoaderBase):
         dataset_dir: str,
         images_dir: Optional[str] = None,
         colmap_files_subdir: Optional[str] = None,
-        use_gt_intrinsics: bool = True,
+        use_gt_intrinsics: bool = False,
         use_gt_extrinsics: bool = True,
         max_resolution: int = 760,
         default_focal_length_factor: Optional[float] = None,
@@ -165,8 +165,10 @@ class ColmapLoader(LoaderBase):
             raise IndexError(f"Image index {index} is invalid. Valid indices are in [0,{len(self) - 1}].")
 
         if not self._use_gt_intrinsics:
-            # get intrinsics from exif
-            intrinsics = io_utils.load_image(self._image_paths[index]).get_intrinsics_from_exif()
+            # get intrinsics from exif, falling back to default focal length heuristic if exif is unavailable
+            intrinsics = io_utils.load_image(self._image_paths[index]).get_intrinsics(
+                default_focal_length_factor=self._default_focal_length_factor or 1.2
+            )
         else:
             intrinsics = self._calibrations[index]
             if self._default_focal_length_factor is not None and intrinsics.fx() <= 0:

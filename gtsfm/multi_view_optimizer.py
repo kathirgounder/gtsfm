@@ -3,6 +3,7 @@
 Authors: Ayush Baid, John Lambert
 """
 
+import logging
 import os
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Tuple
@@ -26,6 +27,7 @@ from gtsfm.data_association.cpp_dsf_tracks_estimator import CppDsfTracksEstimato
 from gtsfm.data_association.data_assoc import DataAssociation
 from gtsfm.evaluation.metrics import GtsfmMetricsGroup
 from gtsfm.global_positioner.global_positioner import GlobalPositioner
+from gtsfm.global_positioner.mixed_global_positioner import MixedGlobalPositioner
 from gtsfm.products.one_view_data import OneViewData
 from gtsfm.products.two_view_result import TwoViewResult
 from gtsfm.products.visibility_graph import AnnotatedGraph
@@ -33,7 +35,10 @@ from gtsfm.view_graph_estimator.cycle_consistent_rotation_estimator import (
     CycleConsistentRotationViewGraphEstimator,
     EdgeErrorAggregationCriterion,
 )
+from gtsfm.view_graph_estimator.view_graph_calibration import calibrate_view_graph
 from gtsfm.view_graph_estimator.view_graph_estimator_base import ViewGraphEstimatorBase
+
+logger = logging.getLogger(__name__)
 
 
 class MultiViewOptimizer:
@@ -73,6 +78,8 @@ class MultiViewOptimizer:
         bundle_adjustment_module: GlobalBundleAdjustment,
         view_graph_estimator: Optional[ViewGraphEstimatorBase] = None,
         global_positioner: Optional[GlobalPositioner] = None,
+        run_view_graph_calibration: bool = False,
+        rotation_outlier_threshold_deg: float = 0.0,
     ) -> None:
         self.view_graph_estimator = view_graph_estimator
         self.rot_avg_module = rot_avg_module
@@ -81,6 +88,8 @@ class MultiViewOptimizer:
         self.ba_optimizer = bundle_adjustment_module
         self.global_positioner = global_positioner
         self._run_view_graph_estimator: bool = self.view_graph_estimator is not None
+        self._run_view_graph_calibration = run_view_graph_calibration
+        self._rotation_outlier_threshold_deg = rotation_outlier_threshold_deg
 
         self.view_graph_estimator_v2 = CycleConsistentRotationViewGraphEstimator(
             edge_error_aggregation_criterion=EdgeErrorAggregationCriterion.MEDIAN_EDGE_ERROR
@@ -172,6 +181,12 @@ class MultiViewOptimizer:
             viewgraph_two_view_reports_graph = two_view_reports
             viewgraph_estimation_metrics = delayed(GtsfmMetricsGroup("view_graph_estimation_metrics", []))
 
+        # View graph calibration: refine focal lengths from F-matrices before global positioning.
+        if self._run_view_graph_calibration:
+            all_intrinsics = delayed(calibrate_view_graph)(
+                viewgraph_v_corr_idxs_graph, keypoints_graph, all_intrinsics, num_images
+            )
+
         # Prune the graph to a single connected component.
         gt_wTi = {k: val.pose_gt for k, val in one_view_data_dict.items()}
         gt_wTi_list = [gt_wTi[i] for i in sorted(list(gt_wTi.keys()))]
@@ -185,6 +200,11 @@ class MultiViewOptimizer:
             gt_wTi_list=gt_wTi_list,
             v_corr_idxs=viewgraph_v_corr_idxs_graph,
         )
+        # Prune cameras with inconsistent rotations after averaging.
+        if self._rotation_outlier_threshold_deg > 0:
+            delayed_wRi = delayed(prune_rotation_outliers)(
+                delayed_wRi, pruned_i2Ri1_graph, self._rotation_outlier_threshold_deg
+            )
         tracks2d_graph = delayed(get_2d_tracks)(viewgraph_v_corr_idxs_graph, keypoints_graph)
 
         absolute_pose_priors = [one_view_data_dict[idx].absolute_pose_prior for idx in range(num_images)]
@@ -192,9 +212,15 @@ class MultiViewOptimizer:
 
         if self.global_positioner is not None:
             # Path B: Global positioner replaces trans_avg + data_assoc.
-            ba_input_graph, gp_metrics = delayed(self.global_positioner.run, nout=2)(
-                num_images, delayed_wRi, tracks2d_graph, all_intrinsics,
-            )
+            if isinstance(self.global_positioner, MixedGlobalPositioner):
+                # Mixed GP needs relative translations for camera-camera edges.
+                ba_input_graph, gp_metrics = delayed(self.global_positioner.run, nout=2)(
+                    num_images, delayed_wRi, tracks2d_graph, all_intrinsics, pruned_i2Ui1_graph,
+                )
+            else:
+                ba_input_graph, gp_metrics = delayed(self.global_positioner.run, nout=2)(
+                    num_images, delayed_wRi, tracks2d_graph, all_intrinsics,
+                )
             ta_metrics = gp_metrics
             data_assoc_metrics_graph = delayed(GtsfmMetricsGroup)("data_association_metrics", [])
         else:
@@ -250,6 +276,71 @@ class MultiViewOptimizer:
         ba_input_graph = delayed(GtsfmData.align_via_sim3_and_transform)(ba_input_graph, gt_wTi_dict)
 
         return ba_input_graph, ba_result_graph, viewgraph_two_view_reports_graph, multiview_optimizer_metrics_graph
+
+
+def prune_rotation_outliers(
+    wRi_list: List[Optional[Rot3]],
+    i2Ri1_dict: Dict[Tuple[int, int], Rot3],
+    max_median_error_deg: float = 8.0,
+) -> List[Optional[Rot3]]:
+    """Null out cameras whose estimated global rotation is inconsistent with their pairwise edges.
+
+    For each camera, computes the angular residual against all its relative rotation edges:
+        error = angle(wRj * wRi^T, i2Ri1_measured)
+    Cameras with median residual above the threshold are set to None.
+
+    Args:
+        wRi_list: Global rotations from rotation averaging.
+        i2Ri1_dict: Relative rotations from the view graph.
+        max_median_error_deg: Threshold in degrees for median edge residual.
+
+    Returns:
+        Pruned rotation list with outlier cameras set to None.
+    """
+    from collections import defaultdict
+
+    num_images = len(wRi_list)
+    per_camera_errors: Dict[int, List[float]] = defaultdict(list)
+
+    for (i1, i2), i2Ri1 in i2Ri1_dict.items():
+        wRi1 = wRi_list[i1] if i1 < num_images else None
+        wRi2 = wRi_list[i2] if i2 < num_images else None
+        if wRi1 is None or wRi2 is None:
+            continue
+        # Expected relative rotation from global estimates.
+        i2Ri1_expected = wRi2.compose(wRi1.inverse())
+        # Angular error between expected and measured.
+        error_rot = i2Ri1_expected.compose(i2Ri1.inverse())
+        error_deg = abs(error_rot.axisAngle()[1]) * 180.0 / np.pi
+        per_camera_errors[i1].append(error_deg)
+        per_camera_errors[i2].append(error_deg)
+
+    pruned = list(wRi_list)
+    num_pruned = 0
+    all_median_errors = []
+    for cam_idx in range(num_images):
+        errors = per_camera_errors.get(cam_idx, [])
+        if len(errors) == 0:
+            continue
+        median_err = float(np.mean(errors))
+        all_median_errors.append(median_err)
+        if median_err > max_median_error_deg:
+            pruned[cam_idx] = None
+            num_pruned += 1
+
+    if all_median_errors:
+        arr = np.array(sorted(all_median_errors))
+        logger.info(
+            "Rotation outlier pruning: per-camera median errors (deg): "
+            "min=%.2f, p50=%.2f, p75=%.2f, p90=%.2f, p95=%.2f, max=%.2f",
+            arr[0], np.median(arr), np.percentile(arr, 75),
+            np.percentile(arr, 90), np.percentile(arr, 95), arr[-1],
+        )
+    logger.info(
+        "Rotation outlier pruning: removed %d / %d cameras (threshold=%.1f deg).",
+        num_pruned, sum(1 for r in wRi_list if r is not None), max_median_error_deg,
+    )
+    return pruned
 
 
 def init_cameras(

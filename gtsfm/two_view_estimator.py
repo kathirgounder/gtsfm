@@ -93,8 +93,8 @@ class TwoViewEstimator(DaskDBModuleBase):
             robust_noise_basin=1.345,
             use_karcher_mean_factor=False,
             use_pose_prior_first_camera=True,
-            calibration_prior_focal_sigma=1e-5,
-            calibration_prior_dist_sigma=1e-5,
+            calibration_prior_focal_sigma=20.0,
+            calibration_prior_dist_sigma=0.1,
             cam_pose3_prior_noise_sigma=0.1,
             measurement_noise_sigma=1.0,
         )

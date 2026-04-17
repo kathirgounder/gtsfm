@@ -20,6 +20,7 @@ from gtsam.symbol_shorthand import K, P, X  # type: ignore
 from numpy.typing import NDArray
 
 import gtsfm.common.types as gtsfm_types
+import gtsfm.utils.reprojection as reprojection_utils
 import gtsfm.utils.logger as logger_utils
 import gtsfm.utils.metrics as metrics_utils
 import gtsfm.utils.tracks as track_utils
@@ -101,6 +102,133 @@ class BundleAdjustmentOptions:
         )
         kwargs.update(overrides)
         return BundleAdjustmentOptimizer(**kwargs)
+
+
+def filter_outlier_cameras(data: GtsfmData, min_covisibility_count: int = 5, min_track_len: int = 2) -> GtsfmData:
+    """Remove outlier cameras via covisibility clustering (GLOMAP Section 3.4).
+
+    Builds a covisibility graph from shared 3D points, finds strongly connected components
+    using an adaptive threshold, and keeps only the largest cluster. Small clusters weakly
+    connected to the main reconstruction are merged if possible.
+
+    Args:
+        data: GtsfmData with BA-optimized cameras and tracks.
+        min_covisibility_count: Minimum shared points to consider an edge in covisibility graph.
+        min_track_len: Minimum track length to keep after camera removal.
+
+    Returns:
+        New GtsfmData with only the largest camera cluster retained.
+    """
+    from gtsam import SfmTrack
+
+    camera_dict = data.cameras()
+    if len(camera_dict) < 3:
+        return data
+
+    # Step 1: Build covisibility graph — count shared 3D points per camera pair.
+    covisibility: dict[tuple[int, int], int] = defaultdict(int)
+    for track in data.get_tracks():
+        cam_idxs = []
+        for k in range(track.numberMeasurements()):
+            cam_idx, _ = track.measurement(k)
+            if cam_idx in camera_dict:
+                cam_idxs.append(cam_idx)
+        for a in range(len(cam_idxs)):
+            for b in range(a + 1, len(cam_idxs)):
+                i, j = min(cam_idxs[a], cam_idxs[b]), max(cam_idxs[a], cam_idxs[b])
+                covisibility[(i, j)] += 1
+
+    # Discard pairs below minimum count.
+    covisibility = {k: v for k, v in covisibility.items() if v >= min_covisibility_count}
+
+    if not covisibility:
+        logger.info("Covisibility clustering: no edges with >= %d shared points.", min_covisibility_count)
+        return data
+
+    # Step 2: Compute threshold τ = median of remaining pair counts.
+    counts = np.array(list(covisibility.values()))
+    tau = float(np.median(counts))
+
+    logger.info(
+        "Covisibility clustering: %d edges, counts min=%d, med=%d, max=%d, tau=%d",
+        len(covisibility), counts.min(), int(np.median(counts)), counts.max(), int(tau),
+    )
+
+    # Step 3: Build strong graph (edges with count > τ) and find connected components.
+    all_cameras = set(camera_dict.keys())
+    strong_adj: dict[int, set[int]] = defaultdict(set)
+    for (i, j), count in covisibility.items():
+        if count > tau:
+            strong_adj[i].add(j)
+            strong_adj[j].add(i)
+
+    # BFS to find connected components in strong graph.
+    visited = set()
+    components = []
+    for cam in all_cameras:
+        if cam in visited:
+            continue
+        component = set()
+        queue = [cam]
+        while queue:
+            node = queue.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            component.add(node)
+            for neighbor in strong_adj.get(node, []):
+                if neighbor not in visited:
+                    queue.append(neighbor)
+        components.append(component)
+
+    components.sort(key=len, reverse=True)
+    main_component = components[0]
+
+    # Step 4: Try to merge smaller components if they have ≥ 2 edges with count > 0.75τ to main.
+    merge_threshold = 0.75 * tau
+    for comp in components[1:]:
+        strong_edges_to_main = 0
+        for cam in comp:
+            for main_cam in main_component:
+                edge = (min(cam, main_cam), max(cam, main_cam))
+                if covisibility.get(edge, 0) > merge_threshold:
+                    strong_edges_to_main += 1
+        if strong_edges_to_main >= 2:
+            main_component = main_component | comp
+
+    logger.info(
+        "Covisibility clustering: %d components (sizes: %s). Keeping %d / %d cameras.",
+        len(components),
+        ", ".join(str(len(c)) for c in components[:5]),
+        len(main_component),
+        len(all_cameras),
+    )
+
+    if len(main_component) == len(all_cameras):
+        logger.info("Covisibility clustering: all cameras in one component, no filtering needed.")
+        return data
+
+    # Step 5: Rebuild GtsfmData with only the main component.
+    filtered = GtsfmData(number_images=data.number_images())
+    for cam_idx in main_component:
+        filtered.add_camera(cam_idx, camera_dict[cam_idx])
+        info = data.get_image_info(cam_idx)
+        filtered.set_image_info(cam_idx, name=info.name, shape=info.shape)
+
+    for track in data.get_tracks():
+        new_track = SfmTrack(track.point3())
+        for k in range(track.numberMeasurements()):
+            cam_idx, uv = track.measurement(k)
+            if cam_idx in main_component:
+                new_track.addMeasurement(cam_idx, uv)
+        if new_track.numberMeasurements() >= min_track_len:
+            filtered.add_track(new_track)
+
+    logger.info(
+        "Covisibility clustering: removed %d cameras, %d tracks remain.",
+        len(all_cameras) - len(main_component), filtered.number_tracks(),
+    )
+    return filtered
 
 
 class BundleAdjustmentOptimizer:
@@ -742,6 +870,12 @@ class BundleAdjustmentOptimizer:
                         filtered_result.number_tracks(),
                     )
                 )
+
+            # After the first BA stage, filter outlier cameras via covisibility clustering.
+            if step == 0 and num_ba_steps > 1:
+                filtered_result = filter_outlier_cameras(filtered_result)
+                initial_data = filtered_result
+
         total_time = time.time() - start_time
 
         metrics = self.evaluate(optimized_data, filtered_result, cameras_gt, save_dir)  # type: ignore
