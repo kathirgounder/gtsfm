@@ -215,6 +215,7 @@ def build_gtsfm_data(
     track_indices: Set[int],
     valid_cameras: Set[int],
     max_reproj_error: float = DEFAULT_MAX_REPROJ_ERROR,
+    max_angle_error_deg: float = 1.0,
 ) -> Tuple[GtsfmData, int, int]:
     """Build GtsfmData from optimized camera + landmark positions."""
     gtsfm_data = GtsfmData(number_images=num_images)
@@ -255,22 +256,38 @@ def build_gtsfm_data(
             continue
 
         num_tracks_before += 1
-        keep = True
+        # Per-observation angular error filter (GLOMAP FilterTracksByAngle).
+        # Remove observations where camera ray disagrees with 3D point direction.
+        cos_angle_thresh = np.cos(np.radians(max_angle_error_deg))
+        filtered_track = SfmTrack(point_3d)
         for m_idx in range(sfm_track.numberMeasurements()):
             cam_idx_m, uv_m = sfm_track.measurement(m_idx)
             camera_m = gtsfm_data.get_camera(cam_idx_m)
             if camera_m is None:
                 continue
             try:
+                # Compute normalized ray from camera to 3D point.
+                pt_cam = camera_m.pose().transformTo(point_3d)
+                if pt_cam[2] < 1e-12:
+                    continue  # Behind camera.
+                pt_cam_dir = pt_cam / np.linalg.norm(pt_cam)
+                # Compute observed feature ray direction.
+                Ki = intrinsics[cam_idx_m]
+                uv_norm = Ki.calibrate(uv_m)
+                obs_dir = np.array([uv_norm[0], uv_norm[1], 1.0])
+                obs_dir /= np.linalg.norm(obs_dir)
+                # Angular consistency check.
+                if pt_cam_dir.dot(obs_dir) < cos_angle_thresh:
+                    continue  # Angle too large, skip this observation.
+                # Also check reprojection error.
                 proj = camera_m.project(point_3d)
                 if np.sqrt((proj[0] - uv_m[0])**2 + (proj[1] - uv_m[1])**2) > max_reproj_error:
-                    keep = False
-                    break
+                    continue
+                filtered_track.addMeasurement(cam_idx_m, uv_m)
             except RuntimeError:
-                keep = False
-                break
-        if keep:
-            gtsfm_data.add_track(sfm_track)
+                continue
+        if filtered_track.numberMeasurements() >= 2:
+            gtsfm_data.add_track(filtered_track)
             num_tracks_after += 1
 
     logger.info("GlobalPositioner: %d cameras, %d/%d tracks (%.1f%% kept).",

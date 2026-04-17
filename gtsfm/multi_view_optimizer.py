@@ -203,9 +203,28 @@ class MultiViewOptimizer:
         pruned_i2Ri1_graph, pruned_i2Ui1_graph = delayed(graph_utils.prune_to_largest_connected_component, nout=2)(
             viewgraph_i2Ri1_graph, viewgraph_i2Ui1_graph, pose_priors_graph
         )
-        delayed_wRi, rot_avg_metrics = self.rot_avg_module.create_computation_graph(
+
+        # --- GLOMAP Stage 3: Double rotation averaging ---
+        # Pass 1: estimate rotations for edge filtering.
+        delayed_wRi_pass1, _ = self.rot_avg_module.create_computation_graph(
             num_images,
             pruned_i2Ri1_graph,
+            i1Ti2_priors=pose_priors_graph,
+            gt_wTi_list=gt_wTi_list,
+            v_corr_idxs=viewgraph_v_corr_idxs_graph,
+        )
+        # Filter edges by rotation consistency, then prune to connected component.
+        filtered_i2Ri1_graph, filtered_i2Ui1_graph = delayed(filter_edges_by_rotation, nout=2)(
+            delayed_wRi_pass1, pruned_i2Ri1_graph, pruned_i2Ui1_graph,
+        )
+        filtered_i2Ri1_graph, filtered_i2Ui1_graph = delayed(
+            graph_utils.prune_to_largest_connected_component, nout=2
+        )(filtered_i2Ri1_graph, filtered_i2Ui1_graph, pose_priors_graph)
+
+        # Pass 2: final rotation estimation on cleaned graph.
+        delayed_wRi, rot_avg_metrics = self.rot_avg_module.create_computation_graph(
+            num_images,
+            filtered_i2Ri1_graph,
             i1Ti2_priors=pose_priors_graph,
             gt_wTi_list=gt_wTi_list,
             v_corr_idxs=viewgraph_v_corr_idxs_graph,
@@ -213,7 +232,7 @@ class MultiViewOptimizer:
         # Prune cameras with inconsistent rotations after averaging.
         if self._rotation_outlier_threshold_deg > 0:
             delayed_wRi = delayed(prune_rotation_outliers)(
-                delayed_wRi, pruned_i2Ri1_graph, self._rotation_outlier_threshold_deg
+                delayed_wRi, filtered_i2Ri1_graph, self._rotation_outlier_threshold_deg
             )
         tracks2d_graph = delayed(get_2d_tracks)(viewgraph_v_corr_idxs_graph, keypoints_graph)
 
@@ -286,6 +305,58 @@ class MultiViewOptimizer:
         ba_input_graph = delayed(GtsfmData.align_via_sim3_and_transform)(ba_input_graph, gt_wTi_dict)
 
         return ba_input_graph, ba_result_graph, viewgraph_two_view_reports_graph, multiview_optimizer_metrics_graph
+
+
+def filter_edges_by_rotation(
+    wRi_list: List[Optional[Rot3]],
+    i2Ri1_dict: Dict[Tuple[int, int], Rot3],
+    i2Ui1_dict: Dict[Tuple[int, int], Unit3],
+    max_rotation_error_deg: float = 10.0,
+) -> Tuple[Dict[Tuple[int, int], Rot3], Dict[Tuple[int, int], Unit3]]:
+    """Filter edges whose relative rotation is inconsistent with global rotations (GLOMAP FilterRotations).
+
+    For each edge (i1, i2), compares the measured i2Ri1 with the expected wRi2 * wRi1^T.
+    Removes edges where the angular error exceeds the threshold.
+
+    Args:
+        wRi_list: Global rotations from rotation averaging.
+        i2Ri1_dict: Relative rotations from the view graph.
+        i2Ui1_dict: Relative translation directions.
+        max_rotation_error_deg: Maximum angular error in degrees to keep an edge.
+
+    Returns:
+        Filtered relative rotations and translation directions.
+    """
+    num_images = len(wRi_list)
+    filtered_R = {}
+    filtered_U = {}
+    num_removed = 0
+
+    for (i1, i2), i2Ri1 in i2Ri1_dict.items():
+        wRi1 = wRi_list[i1] if i1 < num_images else None
+        wRi2 = wRi_list[i2] if i2 < num_images else None
+        if wRi1 is None or wRi2 is None:
+            # Can't check — keep the edge.
+            filtered_R[(i1, i2)] = i2Ri1
+            if (i1, i2) in i2Ui1_dict:
+                filtered_U[(i1, i2)] = i2Ui1_dict[(i1, i2)]
+            continue
+        # Expected relative rotation from global estimates.
+        i2Ri1_expected = wRi2.compose(wRi1.inverse())
+        error_rot = i2Ri1_expected.compose(i2Ri1.inverse())
+        error_deg = abs(error_rot.axisAngle()[1]) * 180.0 / np.pi
+        if error_deg <= max_rotation_error_deg:
+            filtered_R[(i1, i2)] = i2Ri1
+            if (i1, i2) in i2Ui1_dict:
+                filtered_U[(i1, i2)] = i2Ui1_dict[(i1, i2)]
+        else:
+            num_removed += 1
+
+    logger.info(
+        "Rotation edge filtering: removed %d / %d edges (threshold=%.1f deg), %d remain.",
+        num_removed, len(i2Ri1_dict), max_rotation_error_deg, len(filtered_R),
+    )
+    return filtered_R, filtered_U
 
 
 def _filter_edges(

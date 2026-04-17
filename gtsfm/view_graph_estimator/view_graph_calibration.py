@@ -48,8 +48,9 @@ def _fetzer_residuals(
     focal_lengths: np.ndarray,
     edges: List[Tuple[int, int, np.ndarray, np.ndarray, np.ndarray]],
     cam_idx_to_var_idx: Dict[int, int],
+    precomputed: Optional[Dict] = None,
 ) -> np.ndarray:
-    """Compute Fetzer residuals for all edges.
+    """Compute Fetzer residuals for all edges (vectorized).
 
     For each edge, constructs E = K2^T F K1 from current focal lengths and measures
     deviation from a valid essential matrix via singular value ratios.
@@ -58,29 +59,63 @@ def _fetzer_residuals(
         focal_lengths: Current focal length estimates, one per optimized camera.
         edges: List of (cam_idx1, cam_idx2, F, pp1, pp2) tuples.
         cam_idx_to_var_idx: Maps camera index to position in focal_lengths array.
+        precomputed: Optional dict with precomputed index arrays for vectorization.
 
     Returns:
         Stacked residuals, 2 per edge.
     """
-    residuals = np.zeros(2 * len(edges))
+    n = len(edges)
+    if precomputed is None:
+        # Fallback to loop (used for final residual evaluation).
+        residuals = np.zeros(2 * n)
+        for i, (cam1, cam2, F, pp1, pp2) in enumerate(edges):
+            f1 = focal_lengths[cam_idx_to_var_idx[cam1]]
+            f2 = focal_lengths[cam_idx_to_var_idx[cam2]]
+            K1 = np.array([[f1, 0, pp1[0]], [0, f1, pp1[1]], [0, 0, 1.0]])
+            K2 = np.array([[f2, 0, pp2[0]], [0, f2, pp2[1]], [0, 0, 1.0]])
+            E = K2.T @ F @ K1
+            _, s, _ = np.linalg.svd(E)
+            if s[0] > 1e-12:
+                residuals[2 * i] = s[1] / s[0] - 1.0
+                residuals[2 * i + 1] = s[2] / s[0]
+        return residuals
 
-    for i, (cam1, cam2, F, pp1, pp2) in enumerate(edges):
-        f1 = focal_lengths[cam_idx_to_var_idx[cam1]]
-        f2 = focal_lengths[cam_idx_to_var_idx[cam2]]
+    # Vectorized path using precomputed arrays.
+    idx1 = precomputed["idx1"]
+    idx2 = precomputed["idx2"]
+    F_stack = precomputed["F_stack"]  # (n, 3, 3)
+    pp1_stack = precomputed["pp1_stack"]  # (n, 2)
+    pp2_stack = precomputed["pp2_stack"]  # (n, 2)
 
-        K1 = np.array([[f1, 0, pp1[0]], [0, f1, pp1[1]], [0, 0, 1.0]])
-        K2 = np.array([[f2, 0, pp2[0]], [0, f2, pp2[1]], [0, 0, 1.0]])
+    f1 = focal_lengths[idx1]  # (n,)
+    f2 = focal_lengths[idx2]  # (n,)
 
-        E = K2.T @ F @ K1
-        _, s, _ = np.linalg.svd(E)
+    # Build K1, K2 as batch: K = [[f, 0, px], [0, f, py], [0, 0, 1]]
+    K1 = np.zeros((n, 3, 3))
+    K1[:, 0, 0] = f1
+    K1[:, 1, 1] = f1
+    K1[:, 0, 2] = pp1_stack[:, 0]
+    K1[:, 1, 2] = pp1_stack[:, 1]
+    K1[:, 2, 2] = 1.0
 
-        if s[0] < 1e-12:
-            residuals[2 * i] = 0.0
-            residuals[2 * i + 1] = 0.0
-        else:
-            # Valid E has s[0] == s[1] and s[2] == 0.
-            residuals[2 * i] = s[1] / s[0] - 1.0
-            residuals[2 * i + 1] = s[2] / s[0]
+    K2 = np.zeros((n, 3, 3))
+    K2[:, 0, 0] = f2
+    K2[:, 1, 1] = f2
+    K2[:, 0, 2] = pp2_stack[:, 0]
+    K2[:, 1, 2] = pp2_stack[:, 1]
+    K2[:, 2, 2] = 1.0
+
+    # E = K2^T @ F @ K1, batched.
+    K2T = np.transpose(K2, (0, 2, 1))
+    E = K2T @ F_stack @ K1  # (n, 3, 3)
+
+    # Batch SVD.
+    _, S, _ = np.linalg.svd(E)  # S shape (n, 3)
+
+    residuals = np.zeros(2 * n)
+    valid = S[:, 0] > 1e-12
+    residuals[0::2] = np.where(valid, S[:, 1] / np.maximum(S[:, 0], 1e-12) - 1.0, 0.0)
+    residuals[1::2] = np.where(valid, S[:, 2] / np.maximum(S[:, 0], 1e-12), 0.0)
 
     return residuals
 
@@ -153,11 +188,21 @@ def calibrate_view_graph(
         initial_focals.min(), np.median(initial_focals), initial_focals.max(),
     )
 
+    # Precompute arrays for vectorized residual evaluation.
+    n = len(edges)
+    precomputed = {
+        "idx1": np.array([cam_idx_to_var_idx[e[0]] for e in edges]),
+        "idx2": np.array([cam_idx_to_var_idx[e[1]] for e in edges]),
+        "F_stack": np.array([e[2] for e in edges]),  # (n, 3, 3)
+        "pp1_stack": np.array([e[3] for e in edges]),  # (n, 2)
+        "pp2_stack": np.array([e[4] for e in edges]),  # (n, 2)
+    }
+
     # Step 3: Joint optimization with Cauchy robust loss.
     result = least_squares(
         _fetzer_residuals,
         x0=initial_focals,
-        args=(edges, cam_idx_to_var_idx),
+        args=(edges, cam_idx_to_var_idx, precomputed),
         loss="cauchy",
         f_scale=0.1,
         bounds=(100.0, np.inf),
