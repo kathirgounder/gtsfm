@@ -35,6 +35,7 @@ from gtsfm.view_graph_estimator.cycle_consistent_rotation_estimator import (
     CycleConsistentRotationViewGraphEstimator,
     EdgeErrorAggregationCriterion,
 )
+from gtsfm.utils import verification as verification_utils
 from gtsfm.view_graph_estimator.view_graph_calibration import calibrate_view_graph
 from gtsfm.view_graph_estimator.view_graph_estimator_base import ViewGraphEstimatorBase
 
@@ -186,6 +187,11 @@ class MultiViewOptimizer:
             all_intrinsics = delayed(calibrate_view_graph)(
                 viewgraph_v_corr_idxs_graph, keypoints_graph, all_intrinsics, num_images
             )
+            # Re-estimate relative poses with refined intrinsics (GLOMAP Section 3.5).
+            viewgraph_i2Ri1_graph, viewgraph_i2Ui1_graph = delayed(reestimate_relative_poses, nout=2)(
+                viewgraph_i2Ri1_graph, viewgraph_i2Ui1_graph,
+                viewgraph_v_corr_idxs_graph, keypoints_graph, all_intrinsics,
+            )
 
         # Prune the graph to a single connected component.
         gt_wTi = {k: val.pose_gt for k, val in one_view_data_dict.items()}
@@ -276,6 +282,85 @@ class MultiViewOptimizer:
         ba_input_graph = delayed(GtsfmData.align_via_sim3_and_transform)(ba_input_graph, gt_wTi_dict)
 
         return ba_input_graph, ba_result_graph, viewgraph_two_view_reports_graph, multiview_optimizer_metrics_graph
+
+
+def reestimate_relative_poses(
+    i2Ri1_dict: Dict[Tuple[int, int], Rot3],
+    i2Ui1_dict: Dict[Tuple[int, int], Unit3],
+    v_corr_idxs_dict: AnnotatedGraph[np.ndarray],
+    keypoints_list: List[Keypoints],
+    intrinsics: List[gtsfm_types.CALIBRATION_TYPE],
+) -> Tuple[Dict[Tuple[int, int], Rot3], Dict[Tuple[int, int], Unit3]]:
+    """Re-estimate relative poses using refined intrinsics.
+
+    After view graph calibration improves focal lengths, re-compute E-matrices
+    and decompose into relative rotation/translation using the updated intrinsics.
+    This ensures rotation averaging receives poses consistent with the refined calibration.
+
+    Args:
+        i2Ri1_dict: Current relative rotations.
+        i2Ui1_dict: Current relative translation directions.
+        v_corr_idxs_dict: Verified correspondence indices per image pair.
+        keypoints_list: Keypoints for all images.
+        intrinsics: Refined intrinsics from view graph calibration.
+
+    Returns:
+        Updated relative rotations and translation directions.
+    """
+    import cv2
+
+    updated_i2Ri1 = {}
+    updated_i2Ui1 = {}
+    num_updated = 0
+    num_failed = 0
+
+    for (i1, i2) in i2Ri1_dict:
+        if (i1, i2) not in v_corr_idxs_dict:
+            # Keep original if no correspondences available.
+            updated_i2Ri1[(i1, i2)] = i2Ri1_dict[(i1, i2)]
+            updated_i2Ui1[(i1, i2)] = i2Ui1_dict[(i1, i2)]
+            continue
+
+        v_corr_idxs = v_corr_idxs_dict[(i1, i2)]
+        if v_corr_idxs.shape[0] < 5:
+            updated_i2Ri1[(i1, i2)] = i2Ri1_dict[(i1, i2)]
+            updated_i2Ui1[(i1, i2)] = i2Ui1_dict[(i1, i2)]
+            continue
+
+        coords_i1 = keypoints_list[i1].coordinates[v_corr_idxs[:, 0]]
+        coords_i2 = keypoints_list[i2].coordinates[v_corr_idxs[:, 1]]
+
+        K1 = intrinsics[i1]
+        K2 = intrinsics[i2]
+
+        # Estimate F-matrix from verified correspondences.
+        F, mask = cv2.findFundamentalMat(coords_i1, coords_i2, method=cv2.FM_8POINT)
+        if F is None or F.shape != (3, 3):
+            updated_i2Ri1[(i1, i2)] = i2Ri1_dict[(i1, i2)]
+            updated_i2Ui1[(i1, i2)] = i2Ui1_dict[(i1, i2)]
+            num_failed += 1
+            continue
+
+        # Convert F → E using refined intrinsics, then decompose.
+        i2Ei1 = verification_utils.fundamental_to_essential_matrix(F, K1, K2)
+        i2Ri1_new, i2Ui1_new = verification_utils.recover_relative_pose_from_essential_matrix(
+            i2Ei1, coords_i1, coords_i2, K1, K2,
+        )
+
+        if i2Ri1_new is not None and i2Ui1_new is not None:
+            updated_i2Ri1[(i1, i2)] = i2Ri1_new
+            updated_i2Ui1[(i1, i2)] = i2Ui1_new
+            num_updated += 1
+        else:
+            updated_i2Ri1[(i1, i2)] = i2Ri1_dict[(i1, i2)]
+            updated_i2Ui1[(i1, i2)] = i2Ui1_dict[(i1, i2)]
+            num_failed += 1
+
+    logger.info(
+        "Re-estimated relative poses: %d updated, %d failed, %d total.",
+        num_updated, num_failed, len(i2Ri1_dict),
+    )
+    return updated_i2Ri1, updated_i2Ui1
 
 
 def prune_rotation_outliers(

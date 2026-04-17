@@ -1,20 +1,21 @@
 """View graph calibration: estimate camera focal lengths from fundamental matrices.
 
-Uses Bougnoux's formula to estimate focal lengths from F-matrices computed from
-verified correspondences. Per-camera focal estimates are aggregated via median
-for robustness.
+Joint optimization of all focal lengths using Fetzer et al. (WACV 2020) residuals.
+For each F-matrix edge, measures how close E = K2^T F K1 is to a valid essential matrix
+(valid E has singular values σ1 = σ2, σ3 = 0).
 
-Reference: Hartley & Zisserman, Multiple View Geometry, Section 19.4.
+Reference: Fetzer et al., "Stable Intrinsic Auto-Calibration from Fundamental Matrices
+of Devices with Uncorrelated Camera Parameters", WACV 2020.
 GLOMAP paper Section 3.5 — view graph calibration before global positioning.
 """
 
 import logging
-from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from gtsam import Cal3Bundler, Rot3, Unit3
+from gtsam import Cal3Bundler
+from scipy.optimize import least_squares
 
 import gtsfm.common.types as gtsfm_types
 from gtsfm.common.keypoints import Keypoints
@@ -26,7 +27,7 @@ def estimate_fundamental_from_correspondences(
     coords_i1: np.ndarray,
     coords_i2: np.ndarray,
 ) -> Optional[np.ndarray]:
-    """Estimate F-matrix from verified correspondences using 8-point algorithm (no RANSAC needed).
+    """Estimate F-matrix from verified correspondences using 8-point algorithm.
 
     Args:
         coords_i1: (N, 2) pixel coordinates in image 1.
@@ -43,86 +44,45 @@ def estimate_fundamental_from_correspondences(
     return F
 
 
-def estimate_focal_from_fundamental(
-    F: np.ndarray,
-    pp1: np.ndarray,
-    pp2: np.ndarray,
-) -> Tuple[Optional[float], Optional[float]]:
-    """Estimate focal lengths from fundamental matrix using Bougnoux's formula.
+def _fetzer_residuals(
+    focal_lengths: np.ndarray,
+    edges: List[Tuple[int, int, np.ndarray, np.ndarray, np.ndarray]],
+    cam_idx_to_var_idx: Dict[int, int],
+) -> np.ndarray:
+    """Compute Fetzer residuals for all edges.
 
-    Given F and principal points, estimates the squared focal lengths:
-        f1^2 = -pp2^T F e1 e1^T F^T pp2_x / (pp2_x^T F e1 e1^T F^T pp2_x)
-        f2^2 = -pp1^T F^T e2 e2^T F pp1_x / (pp1_x^T F^T e2 e2^T F pp1_x)
-
-    where e1, e2 are the epipoles (null spaces of F^T and F respectively),
-    and pp_x is the skew-symmetric matrix of the principal point.
-
-    Reference: Bougnoux, "From Projective to Euclidean Space under any Practical
-    Situation", ICCV 1998. Also Hartley & Zisserman Section 19.4.
+    For each edge, constructs E = K2^T F K1 from current focal lengths and measures
+    deviation from a valid essential matrix via singular value ratios.
 
     Args:
-        F: 3x3 fundamental matrix.
-        pp1: (2,) principal point of camera 1 (typically image center).
-        pp2: (2,) principal point of camera 2.
+        focal_lengths: Current focal length estimates, one per optimized camera.
+        edges: List of (cam_idx1, cam_idx2, F, pp1, pp2) tuples.
+        cam_idx_to_var_idx: Maps camera index to position in focal_lengths array.
 
     Returns:
-        (f1, f2) estimated focal lengths. Either may be None if estimation is degenerate.
+        Stacked residuals, 2 per edge.
     """
-    # Compute epipoles: e1 = null(F^T), e2 = null(F)
-    _, _, Vt = np.linalg.svd(F)
-    e1 = Vt[-1]  # right null vector of F (epipole in image 1)
-    e1 = e1 / e1[2] if abs(e1[2]) > 1e-10 else e1
+    residuals = np.zeros(2 * len(edges))
 
-    U, _, _ = np.linalg.svd(F)
-    e2 = U[:, -1]  # left null vector of F (epipole in image 2)
-    e2 = e2 / e2[2] if abs(e2[2]) > 1e-10 else e2
+    for i, (cam1, cam2, F, pp1, pp2) in enumerate(edges):
+        f1 = focal_lengths[cam_idx_to_var_idx[cam1]]
+        f2 = focal_lengths[cam_idx_to_var_idx[cam2]]
 
-    # Homogeneous principal points.
-    p1 = np.array([pp1[0], pp1[1], 1.0])
-    p2 = np.array([pp2[0], pp2[1], 1.0])
+        K1 = np.array([[f1, 0, pp1[0]], [0, f1, pp1[1]], [0, 0, 1.0]])
+        K2 = np.array([[f2, 0, pp2[0]], [0, f2, pp2[1]], [0, 0, 1.0]])
 
-    # Skew-symmetric (cross-product) matrix of a 3-vector.
-    def skew(v):
-        return np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+        E = K2.T @ F @ K1
+        _, s, _ = np.linalg.svd(E)
 
-    # Bougnoux formula for f1^2:
-    # f1^2 = - (p2^T F e1) (e1^T F^T p2) / (p2_x^T F e1) (e1^T F^T p2_x)
-    # where p2_x = skew(p2) selects the "cross" part
-    # Simplified: use the diagonal element form from the epipolar constraint.
+        if s[0] < 1e-12:
+            residuals[2 * i] = 0.0
+            residuals[2 * i + 1] = 0.0
+        else:
+            # Valid E has s[0] == s[1] and s[2] == 0.
+            residuals[2 * i] = s[1] / s[0] - 1.0
+            residuals[2 * i + 1] = s[2] / s[0]
 
-    # Following the formulation from Hartley & Zisserman (Result 19.2):
-    # Let e' = e2 (epipole in image 2), e = e1 (epipole in image 1)
-    # f1^2 = - (e'^T [p2]_x F diag(1,1,0) F^T p2) / (e'^T [p2]_x F diag(0,0,1) F^T p2)
-    # f2^2 = - (e^T [p1]_x F^T diag(1,1,0) F p1) / (e^T [p1]_x F^T diag(0,0,1) F p1)
-
-    D_xy = np.diag([1.0, 1.0, 0.0])
-    D_z = np.diag([0.0, 0.0, 1.0])
-
-    # Estimate f2 (focal length of camera 2)
-    skew_p2 = skew(p2)
-    A = skew_p2 @ F
-    num_f1 = -(e2 @ A @ D_xy @ F.T @ p2)
-    den_f1 = -(e2 @ A @ D_z @ F.T @ p2)
-
-    # Estimate f1 (focal length of camera 1)
-    skew_p1 = skew(p1)
-    B = skew_p1 @ F.T
-    num_f2 = -(e1 @ B @ D_xy @ F @ p1)
-    den_f2 = -(e1 @ B @ D_z @ F @ p1)
-
-    f1, f2 = None, None
-
-    if abs(den_f1) > 1e-10:
-        f1_sq = num_f1 / den_f1
-        if f1_sq > 0:
-            f1 = np.sqrt(f1_sq)
-
-    if abs(den_f2) > 1e-10:
-        f2_sq = num_f2 / den_f2
-        if f2_sq > 0:
-            f2 = np.sqrt(f2_sq)
-
-    return f1, f2
+    return residuals
 
 
 def calibrate_view_graph(
@@ -131,12 +91,10 @@ def calibrate_view_graph(
     initial_intrinsics: List[gtsfm_types.CALIBRATION_TYPE],
     num_images: int,
     min_correspondences: int = 30,
+    min_focal_ratio: float = 0.5,
+    max_focal_ratio: float = 2.0,
 ) -> List[gtsfm_types.CALIBRATION_TYPE]:
-    """Refine camera focal lengths from view graph F-matrices using Bougnoux's formula.
-
-    For each edge in the view graph, estimates an F-matrix from verified correspondences
-    and extracts focal length estimates via Bougnoux. Per-camera estimates are aggregated
-    via median.
+    """Refine camera focal lengths via joint Fetzer optimization over all F-matrix edges.
 
     Args:
         v_corr_idxs_dict: Verified correspondence indices per image pair.
@@ -144,12 +102,15 @@ def calibrate_view_graph(
         initial_intrinsics: Initial intrinsics (e.g., from EXIF or heuristic).
         num_images: Total number of images.
         min_correspondences: Minimum correspondences to attempt F estimation.
+        min_focal_ratio: Minimum allowed ratio of optimized/initial focal length.
+        max_focal_ratio: Maximum allowed ratio of optimized/initial focal length.
 
     Returns:
         Refined intrinsics list (same length as initial_intrinsics).
     """
-    # Collect focal length estimates per camera.
-    focal_estimates: Dict[int, List[float]] = defaultdict(list)
+    # Step 1: Estimate F-matrices and collect optimization edges.
+    edges = []  # (cam_idx1, cam_idx2, F, pp1, pp2)
+    cameras_in_edges = set()
 
     for (i1, i2), v_corr_idxs in v_corr_idxs_dict.items():
         if v_corr_idxs.shape[0] < min_correspondences:
@@ -162,61 +123,76 @@ def calibrate_view_graph(
         if F is None:
             continue
 
-        # Principal points from initial intrinsics.
         K1 = initial_intrinsics[i1].K()
         K2 = initial_intrinsics[i2].K()
         pp1 = np.array([K1[0, 2], K1[1, 2]])
         pp2 = np.array([K2[0, 2], K2[1, 2]])
 
-        f1_est, f2_est = estimate_focal_from_fundamental(F, pp1, pp2)
+        edges.append((i1, i2, F, pp1, pp2))
+        cameras_in_edges.add(i1)
+        cameras_in_edges.add(i2)
 
-        if f1_est is not None and _is_reasonable_focal(f1_est, initial_intrinsics[i1]):
-            focal_estimates[i1].append(f1_est)
-        if f2_est is not None and _is_reasonable_focal(f2_est, initial_intrinsics[i2]):
-            focal_estimates[i2].append(f2_est)
+    if not edges:
+        logger.info("View graph calibration: no valid edges, skipping.")
+        return list(initial_intrinsics)
 
-    # Build refined intrinsics using median focal estimate per camera.
-    refined = list(initial_intrinsics)
-    num_refined = 0
-    for cam_idx in range(num_images):
-        estimates = focal_estimates.get(cam_idx, [])
-        if len(estimates) < 2:
-            # Not enough estimates — keep original.
-            continue
-        median_focal = float(np.median(estimates))
-        old_K = initial_intrinsics[cam_idx]
-        if isinstance(old_K, Cal3Bundler):
-            refined[cam_idx] = Cal3Bundler(
-                fx=median_focal,
-                k1=old_K.k1(),
-                k2=old_K.k2(),
-                u0=old_K.px(),
-                v0=old_K.py(),
-            )
-            num_refined += 1
+    # Step 2: Set up optimization variables.
+    sorted_cameras = sorted(cameras_in_edges)
+    cam_idx_to_var_idx = {cam: var for var, cam in enumerate(sorted_cameras)}
+    initial_focals = np.array([initial_intrinsics[cam].K()[0, 0] for cam in sorted_cameras])
 
     logger.info(
-        "View graph calibration: refined %d / %d cameras (%.1f%%). "
-        "Total focal estimates collected: %d across %d edges.",
-        num_refined,
-        num_images,
-        100.0 * num_refined / max(num_images, 1),
-        sum(len(v) for v in focal_estimates.values()),
-        len(v_corr_idxs_dict),
+        "View graph calibration (Fetzer): %d edges, %d cameras. "
+        "Initial focals: min=%.1f, med=%.1f, max=%.1f",
+        len(edges), len(sorted_cameras),
+        initial_focals.min(), np.median(initial_focals), initial_focals.max(),
+    )
+
+    # Step 3: Joint optimization with Cauchy robust loss.
+    result = least_squares(
+        _fetzer_residuals,
+        x0=initial_focals,
+        args=(edges, cam_idx_to_var_idx),
+        loss="cauchy",
+        f_scale=0.1,
+        bounds=(100.0, np.inf),
+        max_nfev=200,
+    )
+
+    optimized_focals = result.x
+
+    # Step 4: Validate and build refined intrinsics.
+    refined = list(initial_intrinsics)
+    num_refined = 0
+    num_rejected = 0
+
+    for var_idx, cam_idx in enumerate(sorted_cameras):
+        old_focal = initial_focals[var_idx]
+        new_focal = optimized_focals[var_idx]
+        ratio = new_focal / old_focal if old_focal > 0 else 0
+
+        if min_focal_ratio <= ratio <= max_focal_ratio:
+            old_K = initial_intrinsics[cam_idx]
+            if isinstance(old_K, Cal3Bundler):
+                refined[cam_idx] = Cal3Bundler(
+                    fx=float(new_focal),
+                    k1=old_K.k1(),
+                    k2=old_K.k2(),
+                    u0=old_K.px(),
+                    v0=old_K.py(),
+                )
+                num_refined += 1
+        else:
+            num_rejected += 1
+
+    logger.info(
+        "View graph calibration (Fetzer): refined %d, rejected %d / %d cameras. "
+        "Optimized focals: min=%.1f, med=%.1f, max=%.1f. "
+        "Solver: %s in %d evaluations, cost %.4f → %.4f.",
+        num_refined, num_rejected, len(sorted_cameras),
+        optimized_focals.min(), np.median(optimized_focals), optimized_focals.max(),
+        result.message, result.nfev, 0.5 * np.sum(_fetzer_residuals(initial_focals, edges, cam_idx_to_var_idx)**2),
+        result.cost,
     )
 
     return refined
-
-
-def _is_reasonable_focal(focal: float, intrinsics: gtsfm_types.CALIBRATION_TYPE) -> bool:
-    """Check if estimated focal length is within a reasonable range.
-
-    Rejects estimates that are wildly different from the initial value —
-    likely degenerate configurations.
-    """
-    initial_focal = intrinsics.K()[0, 0]
-    if initial_focal <= 0:
-        return focal > 0
-    ratio = focal / initial_focal
-    # Accept if within [0.1x, 10x] of initial estimate.
-    return 0.1 < ratio < 10.0
