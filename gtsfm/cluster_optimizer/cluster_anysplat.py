@@ -17,8 +17,9 @@ from dask.delayed import Delayed
 
 import gtsfm.frontend.anysplat as anysplat_utils
 import gtsfm.utils.torch as torch_utils
-from gtsfm.bundle.bundle_adjustment import BundleAdjustmentOptimizer
 from gtsfm.cluster_optimizer.cluster_optimizer_base import ClusterComputationGraph, ClusterContext, ClusterOptimizerBase
+from gtsfm.bundle.bundle_adjustment import BundleAdjustmentOptions
+from gtsfm.cluster_optimizer.cluster_vggt import _run_cluster_ba
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.common.image import Image
 from gtsfm.evaluation.metrics import GtsfmMetric, GtsfmMetricsGroup
@@ -378,33 +379,27 @@ class ClusterAnySplat(ClusterOptimizerBase):
             gtsfm_data.log_scene_reprojection_error_stats()
 
         if self.run_bundle_adjustment_on_leaf:
-            if gtsfm_data.number_tracks() == 0:
-                logger.warning("Skipping bundle adjustment because VGGT produced no valid tracks.")
-            else:
-                try:
-                    # TODO(akshay-krishnan): Configure this to be same as VGGT's bundle adjustment optimizer.
-                    post_ba_gtsfm_data, _ = BundleAdjustmentOptimizer().run_simple_ba(gtsfm_data)
-                    for idx in post_ba_gtsfm_data.get_valid_camera_indices():
-                        info = gtsfm_data.get_image_info(idx)
-                        post_ba_gtsfm_data.set_image_info(idx, name=info.name, shape=info.shape)
-                    postba_S_preba = align_utils.sim3_from_Pose3_maps(post_ba_gtsfm_data.poses(), gtsfm_data.poses())
-                    post_ba_gaussians = transform_gaussian_splats(
-                        gtsfm_data.get_gaussian_splats(), postba_S_preba  # type: ignore
-                    )
-                    post_ba_gtsfm_data.set_gaussian_splats(post_ba_gaussians)
+            post_ba_gtsfm_data, _ = _run_cluster_ba(gtsfm_data, ba_options=BundleAdjustmentOptions())
+            if post_ba_gtsfm_data is not gtsfm_data:
+                for idx in post_ba_gtsfm_data.get_valid_camera_indices():
+                    info = gtsfm_data.get_image_info(idx)
+                    post_ba_gtsfm_data.set_image_info(idx, name=info.name, shape=info.shape)
+                postba_S_preba = align_utils.sim3_from_Pose3_maps(post_ba_gtsfm_data.poses(), gtsfm_data.poses())
+                post_ba_gaussians = transform_gaussian_splats(
+                    gtsfm_data.get_gaussian_splats(), postba_S_preba  # type: ignore
+                )
+                post_ba_gtsfm_data.set_gaussian_splats(post_ba_gaussians)
 
-                    logger.info("📏 Reprojection error stats after running BA on individual node")
-                    post_ba_gtsfm_data.log_scene_reprojection_error_stats()
-                    return AnySplatReconstructionResult(
-                        post_ba_gtsfm_data,
-                        splats,
-                        pred_context_pose,
-                        height,
-                        width,
-                        decoder,
-                    )
-                except Exception as exc:
-                    logger.warning("⚠️ Failed to run bundle adjustment: %s", exc)
+                logger.info("📏 Reprojection error stats after running BA on individual node")
+                post_ba_gtsfm_data.log_scene_reprojection_error_stats()
+                return AnySplatReconstructionResult(
+                    post_ba_gtsfm_data,
+                    splats,
+                    pred_context_pose,
+                    height,
+                    width,
+                    decoder,
+                )
 
         return AnySplatReconstructionResult(
             gtsfm_data,

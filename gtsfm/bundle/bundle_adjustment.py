@@ -5,9 +5,10 @@ Authors: Xiaolong Wu, John Lambert, Ayush Baid
 
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import dask
 import gtsam  # type: ignore
@@ -49,6 +50,57 @@ class RobustBAMode(Enum):
     HUBER = "HUBER"
     GMC = "GMC"
     TLS = "TLS"
+
+
+@dataclass
+class BundleAdjustmentOptions:
+    """Shared configuration for bundle adjustment across leaf BA, merging BA, etc.
+
+    This dataclass captures the commonly-configured subset of BA parameters
+    that vary between call sites (leaf vs. merging). Parameters with fixed
+    defaults (e.g. ordering_type, allow_indeterminate_linear_system) are left
+    to the ``BundleAdjustmentOptimizer`` constructor.
+    """
+
+    robust_ba_mode: Union[RobustBAMode, str] = RobustBAMode.GMC
+    shared_calib: bool = False
+    use_calibration_prior: bool = False
+    use_pose_prior_all_cameras: bool = False
+    use_pose_prior_first_camera: bool = False
+    use_gnc: bool = False
+    gnc_loss: Union[RobustBAMode, str] = RobustBAMode.GMC
+    factor_weight_outlier_threshold: float = 0.0
+    min_track_length: int = 2
+    calibration_prior_focal_sigma: float = 20.0
+    calibration_prior_dist_sigma: float | Sequence[float] = 0.1
+    calibration_prior_pp_sigma: float = 1e-5
+    robust_noise_basin: float = 1.345
+
+    def to_optimizer(self, **overrides) -> "BundleAdjustmentOptimizer":
+        """Construct a :class:`BundleAdjustmentOptimizer` from these options.
+
+        Args:
+            **overrides: Keyword arguments that override dataclass fields or add
+                extra constructor params (e.g. ``min_track_length``,
+                ``reproj_error_thresholds``).
+        """
+        kwargs = dict(
+            robust_ba_mode=self.robust_ba_mode,
+            shared_calib=self.shared_calib,
+            use_calibration_prior=self.use_calibration_prior,
+            use_pose_prior_all_cameras=self.use_pose_prior_all_cameras,
+            use_pose_prior_first_camera=self.use_pose_prior_first_camera,
+            use_gnc=self.use_gnc,
+            gnc_loss=self.gnc_loss,
+            factor_weight_outlier_threshold=self.factor_weight_outlier_threshold,
+            min_track_length=self.min_track_length,
+            calibration_prior_focal_sigma=self.calibration_prior_focal_sigma,
+            calibration_prior_dist_sigma=self.calibration_prior_dist_sigma,
+            calibration_prior_pp_sigma=self.calibration_prior_pp_sigma,
+            robust_noise_basin=self.robust_noise_basin,
+        )
+        kwargs.update(overrides)
+        return BundleAdjustmentOptimizer(**kwargs)
 
 
 class BundleAdjustmentOptimizer:
