@@ -280,6 +280,71 @@ class ClusterMVO(ClusterOptimizerBase):
 
         # Downstream retrieval diagnostics are handled centrally after cluster execution.
 
+    def _build_frontend_output_graphs(
+        self,
+        context: ClusterContext,
+        frontend_graphs: FrontendGraphs,
+        view_graph_two_view_reports: Optional[Delayed] = None,
+    ) -> tuple[list[Delayed], list[Delayed]]:
+        """Build I/O and metrics delayed tasks for the frontend pipeline.
+
+        Args:
+            view_graph_two_view_reports: View-graph-filtered two-view reports from the MVO. When
+                ``None`` (e.g. no MVO is run), the post-ISP reports are reused for this tag.
+
+        Returns:
+            Tuple of (io_tasks, metrics_tasks).
+        """
+        delayed_io_tasks: list[Delayed] = []
+        metrics_graph_list: list[Delayed] = [frontend_graphs.runtime_metrics]  # type: ignore[list-item]
+
+        post_isp_reports_graph = delayed(ClusterMVO._collect_post_isp_reports)(frontend_graphs.two_view_results)
+        if view_graph_two_view_reports is None:
+            view_graph_two_view_reports = post_isp_reports_graph
+
+        def _enqueue_report(report_graph: Delayed, tag: str) -> None:
+            with self._output_annotation():
+                delayed_io_tasks.append(
+                    delayed(self.save_full_frontend_metrics)(
+                        report_graph,
+                        context.one_view_data_dict,
+                        filename=f"two_view_report_{tag}.json",
+                        metrics_path=context.output_paths.metrics,
+                        plot_base_path=context.output_paths.plots,
+                    )
+                )
+
+        _enqueue_report(post_isp_reports_graph, two_view_estimator.POST_ISP_REPORT_TAG)
+        _enqueue_report(view_graph_two_view_reports, two_view_estimator.VIEWGRAPH_REPORT_TAG)
+
+        if self._save_two_view_viz:
+            d_cluster_images = context.get_delayed_image_map()
+            with self._output_annotation():
+                delayed_io_tasks.append(
+                    delayed(ClusterMVO._save_two_view_visualizations)(
+                        d_cluster_images,
+                        frontend_graphs.two_view_results,
+                        frontend_graphs.padded_keypoints,
+                        context.output_paths.plots,
+                    )
+                )
+
+        metrics_graph_list.append(
+            delayed(two_view_estimator.aggregate_frontend_metrics)(
+                post_isp_reports_graph,
+                self._pose_angular_error_thresh,
+                metric_group_name=f"verifier_summary_{two_view_estimator.POST_ISP_REPORT_TAG}",
+            )
+        )
+        metrics_graph_list.append(
+            delayed(two_view_estimator.aggregate_frontend_metrics)(
+                view_graph_two_view_reports,
+                self._pose_angular_error_thresh,
+                metric_group_name=f"verifier_summary_{two_view_estimator.VIEWGRAPH_REPORT_TAG}",
+            )
+        )
+        return delayed_io_tasks, metrics_graph_list
+
     def create_computation_graph(self, context: ClusterContext) -> ClusterComputationGraph | None:
         """Create Dask graphs for multi-view optimization and downstream products for a single cluster.
 
@@ -309,55 +374,12 @@ class ClusterMVO(ClusterOptimizerBase):
             output_root=context.output_paths.plots,
         )
 
-        delayed_io_tasks: list[Delayed] = []
-        metrics_graph_list: list[Delayed] = [frontend_graphs.runtime_metrics]  # type: ignore
+        delayed_io_tasks, metrics_graph_list = self._build_frontend_output_graphs(
+            context, frontend_graphs, view_graph_two_view_reports=view_graph_two_view_reports
+        )
 
         if optimizer_metrics_graph is not None:
             metrics_graph_list.extend(optimizer_metrics_graph)
-
-        def enqueue_frontend_report(report_graph: Delayed, tag: str) -> None:
-            with self._output_annotation():
-                delayed_io_tasks.append(
-                    delayed(self.save_full_frontend_metrics)(
-                        report_graph,
-                        context.one_view_data_dict,
-                        filename=f"two_view_report_{tag}.json",
-                        metrics_path=context.output_paths.metrics,
-                        plot_base_path=context.output_paths.plots,
-                    )
-                )
-
-        post_isp_reports_graph = delayed(ClusterMVO._collect_post_isp_reports)(frontend_graphs.two_view_results)
-        enqueue_frontend_report(post_isp_reports_graph, two_view_estimator.POST_ISP_REPORT_TAG)
-
-        enqueue_frontend_report(view_graph_two_view_reports, two_view_estimator.VIEWGRAPH_REPORT_TAG)
-
-        if self._save_two_view_viz:
-            with self._output_annotation():
-                delayed_io_tasks.append(
-                    delayed(ClusterMVO._save_two_view_visualizations)(
-                        d_cluster_images,
-                        frontend_graphs.two_view_results,
-                        frontend_graphs.padded_keypoints,
-                        context.output_paths.plots,
-                    )
-                )
-
-        # Persist all front-end metrics and their summaries.
-        metrics_graph_list.append(
-            delayed(two_view_estimator.aggregate_frontend_metrics)(
-                post_isp_reports_graph,
-                self._pose_angular_error_thresh,
-                metric_group_name=f"verifier_summary_{two_view_estimator.POST_ISP_REPORT_TAG}",
-            )
-        )
-        metrics_graph_list.append(
-            delayed(two_view_estimator.aggregate_frontend_metrics)(
-                view_graph_two_view_reports,
-                self._pose_angular_error_thresh,
-                metric_group_name=f"verifier_summary_{two_view_estimator.VIEWGRAPH_REPORT_TAG}",
-            )
-        )
 
         # Modify BA input, BA output, and GT poses to have point clouds and frustums aligned with x,y,z axes.
         gt_wTi_list = [context.one_view_data_dict[idx].pose_gt for idx in range(context.num_images)]
