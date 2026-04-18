@@ -6,7 +6,7 @@ PoseLib's estimate_relative_pose provides:
 - Local bundle adjustment within RANSAC loop
 - Integrated pose estimation (no separate F→E→pose decomposition chain)
 
-This matches GLOMAP's two-view geometry estimation pipeline.
+Inlier re-scoring is done separately in the multi-view optimizer (GLOMAP style).
 
 Reference: PoseLib (https://github.com/PoseLib/PoseLib)
 """
@@ -26,15 +26,17 @@ logger = logger_utils.get_logger()
 
 
 class PoseLibVerifier(VerifierBase):
-    """Verifier using PoseLib's estimate_relative_pose with 5-point solver + LO-RANSAC + local BA."""
+    """Verifier using PoseLib's estimate_relative_pose with 5-point solver + LO-RANSAC + local BA.
+
+    Returns PoseLib's raw inliers. GLOMAP-style re-scoring happens downstream.
+    """
 
     def __init__(
         self,
-        estimation_threshold_px: float = 4.0,
+        estimation_threshold_px: float = 2.0,
         max_iterations: int = 100000,
         confidence: float = 0.999999,
     ) -> None:
-        # PoseLib always uses intrinsics internally (5-point E-matrix solver).
         super().__init__(use_intrinsics_in_verification=True, estimation_threshold_px=estimation_threshold_px)
         self._max_iterations = max_iterations
         self._confidence = confidence
@@ -52,7 +54,6 @@ class PoseLibVerifier(VerifierBase):
             else:
                 return poselib.Camera("SIMPLE_RADIAL", [fx, cx, cy, k1], width, height)
         else:
-            # Fallback: extract from K matrix.
             K_mat = K.K()
             fx = K_mat[0, 0]
             cx = K_mat[0, 2]
@@ -67,30 +68,13 @@ class PoseLibVerifier(VerifierBase):
         camera_intrinsics_i1: CALIBRATION_TYPE,
         camera_intrinsics_i2: CALIBRATION_TYPE,
     ) -> Tuple[Optional[Rot3], Optional[Unit3], np.ndarray, float]:
-        """Estimate relative pose using PoseLib's 5-point solver with LO-RANSAC.
-
-        Args:
-            keypoints_i1: Detected features in image #i1.
-            keypoints_i2: Detected features in image #i2.
-            match_indices: Match indices, shape (N, 2).
-            camera_intrinsics_i1: Intrinsics for image #i1.
-            camera_intrinsics_i2: Intrinsics for image #i2.
-
-        Returns:
-            Estimated rotation i2Ri1, or None.
-            Estimated unit translation i2Ui1, or None.
-            Verified correspondence indices, shape (M, 2).
-            Inlier ratio.
-        """
+        """Estimate relative pose using PoseLib's 5-point solver with LO-RANSAC."""
         if match_indices.shape[0] < self._min_matches:
             return self._failure_result
 
-        # Extract matched pixel coordinates.
         pts1 = keypoints_i1.coordinates[match_indices[:, 0]]
         pts2 = keypoints_i2.coordinates[match_indices[:, 1]]
 
-        # Build PoseLib cameras.
-        # Estimate image dimensions from keypoint range + principal point.
         K1 = camera_intrinsics_i1.K()
         K2 = camera_intrinsics_i2.K()
         w1 = int(2 * K1[0, 2])
@@ -101,16 +85,13 @@ class PoseLibVerifier(VerifierBase):
         cam1 = self._cal3bundler_to_poselib_camera(camera_intrinsics_i1, w1, h1)
         cam2 = self._cal3bundler_to_poselib_camera(camera_intrinsics_i2, w2, h2)
 
-        # RANSAC and bundle adjustment options.
         ransac_opt = {
             "max_reproj_error": self._estimation_threshold_px,
             "max_iterations": self._max_iterations,
             "min_iterations": 100,
             "success_prob": self._confidence,
         }
-        bundle_opt = {
-            "max_iterations": 25,
-        }
+        bundle_opt = {"max_iterations": 25}
 
         try:
             pose, info = poselib.estimate_relative_pose(
@@ -122,22 +103,19 @@ class PoseLibVerifier(VerifierBase):
             logger.debug("PoseLib estimate_relative_pose failed: %s", e)
             return self._failure_result
 
-        # Extract inlier mask from info dict.
         inlier_mask = np.array(info.get("inliers", []), dtype=bool)
         if len(inlier_mask) == 0 or inlier_mask.sum() < self._min_matches:
             return self._failure_result
 
-        # Convert PoseLib pose to GTSAM Rot3/Unit3.
-        # PoseLib quaternion is [w, x, y, z], rotation matrix is cam2_from_cam1.
         R = np.array(pose.R)
         t = np.array(pose.t)
 
-        i2Ri1 = Rot3(R)
         if np.linalg.norm(t) < 1e-12:
             return self._failure_result
+
+        i2Ri1 = Rot3(R)
         i2Ui1 = Unit3(t)
 
-        # Build verified correspondence indices.
         inlier_idxs = np.where(inlier_mask)[0]
         v_corr_idxs = match_indices[inlier_idxs]
         inlier_ratio = float(inlier_mask.sum()) / len(inlier_mask)

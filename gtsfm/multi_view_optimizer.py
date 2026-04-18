@@ -204,27 +204,10 @@ class MultiViewOptimizer:
             viewgraph_i2Ri1_graph, viewgraph_i2Ui1_graph, pose_priors_graph
         )
 
-        # --- GLOMAP Stage 3: Double rotation averaging ---
-        # Pass 1: estimate rotations for edge filtering.
-        delayed_wRi_pass1, _ = self.rot_avg_module.create_computation_graph(
-            num_images,
-            pruned_i2Ri1_graph,
-            i1Ti2_priors=pose_priors_graph,
-            gt_wTi_list=gt_wTi_list,
-            v_corr_idxs=viewgraph_v_corr_idxs_graph,
-        )
-        # Filter edges by rotation consistency, then prune to connected component.
-        filtered_i2Ri1_graph, filtered_i2Ui1_graph = delayed(filter_edges_by_rotation, nout=2)(
-            delayed_wRi_pass1, pruned_i2Ri1_graph, pruned_i2Ui1_graph,
-        )
-        filtered_i2Ri1_graph, filtered_i2Ui1_graph = delayed(
-            graph_utils.prune_to_largest_connected_component, nout=2
-        )(filtered_i2Ri1_graph, filtered_i2Ui1_graph, pose_priors_graph)
-
-        # Pass 2: final rotation estimation on cleaned graph.
+        # Single rotation averaging pass.
         delayed_wRi, rot_avg_metrics = self.rot_avg_module.create_computation_graph(
             num_images,
-            filtered_i2Ri1_graph,
+            pruned_i2Ri1_graph,
             i1Ti2_priors=pose_priors_graph,
             gt_wTi_list=gt_wTi_list,
             v_corr_idxs=viewgraph_v_corr_idxs_graph,
@@ -359,6 +342,143 @@ def filter_edges_by_rotation(
     return filtered_R, filtered_U
 
 
+def rescore_inliers_fundamental(
+    i2Ri1_dict: Dict[Tuple[int, int], Rot3],
+    i2Ui1_dict: Dict[Tuple[int, int], Unit3],
+    v_corr_idxs_dict: AnnotatedGraph[np.ndarray],
+    keypoints_list: List[Keypoints],
+    intrinsics: List[gtsfm_types.CALIBRATION_TYPE],
+    max_sampson_error_px: float = 4.0,
+    min_inlier_count: int = 0,
+    min_inlier_ratio: float = 0.0,
+) -> Tuple[AnnotatedGraph[np.ndarray], Dict[Tuple[int, int], Rot3], Dict[Tuple[int, int], Unit3]]:
+    """Re-score inliers using F-matrix Sampson error + orientation signum cheirality (GLOMAP ScoreErrorFundamental).
+
+    Also filters weak pairs by minimum inlier count and ratio (GLOMAP FilterInlierNum/FilterInlierRatio).
+
+    Args:
+        i2Ri1_dict: Relative rotations per edge.
+        i2Ui1_dict: Relative translation directions per edge.
+        v_corr_idxs_dict: Verified correspondence indices per edge.
+        keypoints_list: Keypoints for all images.
+        intrinsics: Camera intrinsics (used to compute F from E).
+        max_sampson_error_px: Maximum Sampson error in pixels.
+        min_inlier_count: Minimum re-scored inliers to keep a pair.
+        min_inlier_ratio: Minimum ratio of re-scored inliers to total matches.
+
+    Returns:
+        Re-scored correspondence indices per edge.
+        Filtered relative rotations (weak pairs removed).
+        Filtered relative translations (weak pairs removed).
+    """
+    import cv2
+    from gtsam import EssentialMatrix
+
+    max_sampson_sq = max_sampson_error_px * max_sampson_error_px
+    rescored = {}
+    total_before = 0
+    total_after = 0
+
+    for (i1, i2), v_corr_idxs in v_corr_idxs_dict.items():
+        if v_corr_idxs.shape[0] == 0:
+            rescored[(i1, i2)] = v_corr_idxs
+            continue
+
+        i2Ri1 = i2Ri1_dict.get((i1, i2))
+        i2Ui1 = i2Ui1_dict.get((i1, i2))
+        if i2Ri1 is None or i2Ui1 is None:
+            rescored[(i1, i2)] = v_corr_idxs
+            continue
+
+        # Compute F-matrix from relative pose and intrinsics: F = K2^{-T} [t]_x R K1^{-1}
+        K1 = intrinsics[i1].K()
+        K2 = intrinsics[i2].K()
+        E = EssentialMatrix(i2Ri1, i2Ui1).matrix()
+        K2_inv_T = np.linalg.inv(K2).T
+        K1_inv = np.linalg.inv(K1)
+        F = K2_inv_T @ E @ K1_inv
+
+        # Compute epipole for orientation signum cheirality.
+        epipole = np.cross(F[0], F[2])
+        if np.linalg.norm(epipole) < 1e-12:
+            epipole = np.cross(F[1], F[2])
+
+        coords_i1 = keypoints_list[i1].coordinates[v_corr_idxs[:, 0]]
+        coords_i2 = keypoints_list[i2].coordinates[v_corr_idxs[:, 1]]
+
+        # Compute Sampson error + orientation signum for all matches.
+        keep_mask = np.zeros(len(v_corr_idxs), dtype=bool)
+        signums = []
+        inlier_indices = []
+        inlier_errors = []
+
+        for k in range(len(v_corr_idxs)):
+            pt1 = coords_i1[k]
+            pt2 = coords_i2[k]
+            pt1_h = np.array([pt1[0], pt1[1], 1.0])
+            pt2_h = np.array([pt2[0], pt2[1], 1.0])
+
+            # Sampson error in pixel space.
+            Fx1 = F @ pt1_h
+            Ftx2 = F.T @ pt2_h
+            x2Fx1 = pt2_h @ Fx1
+            sampson_sq = (x2Fx1 ** 2) / (Fx1[0]**2 + Fx1[1]**2 + Ftx2[0]**2 + Ftx2[1]**2 + 1e-12)
+
+            if sampson_sq < max_sampson_sq:
+                # Orientation signum cheirality (from GC-RANSAC / GLOMAP).
+                signum1 = F[0, 0] * pt2[0] + F[1, 0] * pt2[1] + F[2, 0]
+                signum2 = epipole[1] - epipole[2] * pt1[1]
+                signums.append(signum1 * signum2)
+                inlier_indices.append(k)
+                inlier_errors.append(sampson_sq)
+
+        if not signums:
+            rescored[(i1, i2)] = np.array([], dtype=np.int32).reshape(0, 2)
+            total_before += len(v_corr_idxs)
+            continue
+
+        # Determine dominant signum direction.
+        positive_count = sum(1 for s in signums if s > 0)
+        negative_count = len(signums) - positive_count
+        is_positive = positive_count > negative_count
+
+        # Keep only matches with consistent cheirality.
+        for idx, signum in zip(inlier_indices, signums):
+            if (signum > 0) == is_positive:
+                keep_mask[idx] = True
+
+        total_before += len(v_corr_idxs)
+        total_after += keep_mask.sum()
+        rescored[(i1, i2)] = v_corr_idxs[keep_mask]
+
+    # Filter weak pairs by inlier count and ratio (GLOMAP FilterInlierNum + FilterInlierRatio).
+    filtered_corr = {}
+    filtered_R = {}
+    filtered_U = {}
+    num_pairs_removed = 0
+    for (i1, i2), corr in rescored.items():
+        original_count = len(v_corr_idxs_dict.get((i1, i2), []))
+        rescored_count = len(corr)
+        ratio = rescored_count / max(original_count, 1)
+        if rescored_count >= min_inlier_count and ratio >= min_inlier_ratio:
+            filtered_corr[(i1, i2)] = corr
+            if (i1, i2) in i2Ri1_dict:
+                filtered_R[(i1, i2)] = i2Ri1_dict[(i1, i2)]
+            if (i1, i2) in i2Ui1_dict:
+                filtered_U[(i1, i2)] = i2Ui1_dict[(i1, i2)]
+        else:
+            num_pairs_removed += 1
+
+    logger.info(
+        "F-matrix inlier re-scoring: %d → %d correspondences across %d edges (%.1f%% kept). "
+        "Removed %d weak pairs (<%d inliers or <%.0f%% ratio), %d pairs remain.",
+        total_before, total_after, len(v_corr_idxs_dict),
+        100.0 * total_after / max(total_before, 1),
+        num_pairs_removed, min_inlier_count, min_inlier_ratio * 100, len(filtered_corr),
+    )
+    return filtered_corr, filtered_R, filtered_U
+
+
 def _filter_edges(
     i2Ri1_dict: Dict[Tuple[int, int], Rot3],
     i2Ui1_dict: Dict[Tuple[int, int], Unit3],
@@ -386,7 +506,6 @@ def reestimate_relative_poses(
 
     After view graph calibration improves focal lengths, re-compute E-matrices
     and decompose into relative rotation/translation using the updated intrinsics.
-    This ensures rotation averaging receives poses consistent with the refined calibration.
 
     Args:
         i2Ri1_dict: Current relative rotations.
@@ -407,7 +526,6 @@ def reestimate_relative_poses(
 
     for (i1, i2) in i2Ri1_dict:
         if (i1, i2) not in v_corr_idxs_dict:
-            # Keep original if no correspondences available.
             updated_i2Ri1[(i1, i2)] = i2Ri1_dict[(i1, i2)]
             updated_i2Ui1[(i1, i2)] = i2Ui1_dict[(i1, i2)]
             continue
