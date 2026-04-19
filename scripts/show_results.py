@@ -43,11 +43,13 @@ def load_metrics(base_path):
                 'trans': get_val(md, 'translation_angle_error_deg'),
                 'auc1': md.get('pose_auc_@1.0_deg'),
                 'auc25': md.get('pose_auc_@2.5_deg'),
+                'auc3': md.get('pose_auc_@3.0_deg'),
                 'auc5': md.get('pose_auc_@5.0_deg'),
                 'auc10': md.get('pose_auc_@10.0_deg'),
                 'auc20': md.get('pose_auc_@20.0_deg'),
                 'co_auc1': md.get('pose_auc_constructed_only_@1.0_deg'),
                 'co_auc25': md.get('pose_auc_constructed_only_@2.5_deg'),
+                'co_auc3': md.get('pose_auc_constructed_only_@3.0_deg'),
                 'co_auc5': md.get('pose_auc_constructed_only_@5.0_deg'),
                 'co_auc10': md.get('pose_auc_constructed_only_@10.0_deg'),
                 'source': 'merged',
@@ -58,6 +60,7 @@ def load_metrics(base_path):
                     bd = json.load(f).get('bundle_adjustment_metrics', {})
                 result['co_auc1'] = bd.get('pose_auc_constructed_only_@1.0_deg')
                 result['co_auc25'] = bd.get('pose_auc_constructed_only_@2.5_deg')
+                result['co_auc3'] = bd.get('pose_auc_constructed_only_@3.0_deg')
                 result['co_auc5'] = bd.get('pose_auc_constructed_only_@5.0_deg')
                 result['co_auc10'] = bd.get('pose_auc_constructed_only_@10.0_deg')
             return result
@@ -77,6 +80,7 @@ def load_metrics(base_path):
             'auc20': get_val(bd, 'pose_auc_@20.0_deg'),
             'co_auc1': bd.get('pose_auc_constructed_only_@1.0_deg'),
             'co_auc25': bd.get('pose_auc_constructed_only_@2.5_deg'),
+                'co_auc3': bd.get('pose_auc_constructed_only_@3.0_deg'),
             'co_auc5': bd.get('pose_auc_constructed_only_@5.0_deg'),
             'co_auc10': bd.get('pose_auc_constructed_only_@10.0_deg'),
             'source': 'ba',
@@ -110,12 +114,12 @@ for ds in datasets:
     if not has_data:
         continue
     print(f'\n=== {ds} ===')
-    print(f'{"Config":<22} {"Cams":>5} {"Tracks":>7} {"Reproj":>8} {"Rot":>7} {"Trans":>7} {"AUC@1":>7} {"AUC@2.5":>8} {"AUC@5":>7} {"AUC@10":>7} {"CO@1":>7} {"CO@2.5":>8} {"CO@5":>7} {"CO@10":>7} {"Total(s)":>9} {"Src":>6}')
-    print('-' * 147)
+    print(f'{"Config":<22} {"Cams":>5} {"Tracks":>7} {"Reproj":>8} {"Rot":>7} {"Trans":>7} {"AUC@3":>7} {"AUC@5":>7} {"AUC@10":>7} {"CO@3":>7} {"CO@5":>7} {"CO@10":>7} {"Total(s)":>9} {"Src":>6}')
+    print('-' * 120)
     for cfg_dir, label in configs:
         base = f'benchmark_results/{cfg_dir}/{ds}/results/metrics'
         m = load_metrics(base)
         total = get_total_time(base)
         if m is None:
             continue
-        print(f'{label:<22} {fmti(m["cams"],5)} {fmti(m["tracks"],7)} {fmt(m["reproj"],8,4)} {fmt(m["rot"])} {fmt(m["trans"])} {fmt(m["auc1"])} {fmt(m["auc25"],8)} {fmt(m["auc5"])} {fmt(m["auc10"])} {fmt(m.get("co_auc1"))} {fmt(m.get("co_auc25"),8)} {fmt(m.get("co_auc5"))} {fmt(m.get("co_auc10"))} {fmt(total,9,1)} {m["source"]:>6}')
+        print(f'{label:<22} {fmti(m["cams"],5)} {fmti(m["tracks"],7)} {fmt(m["reproj"],8,4)} {fmt(m["rot"])} {fmt(m["trans"])} {fmt(m.get("auc3"))} {fmt(m["auc5"])} {fmt(m["auc10"])} {fmt(m.get("co_auc3"))} {fmt(m.get("co_auc5"))} {fmt(m.get("co_auc10"))} {fmt(total,9,1)} {m["source"]:>6}')

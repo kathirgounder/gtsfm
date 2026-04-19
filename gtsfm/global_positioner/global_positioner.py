@@ -197,6 +197,12 @@ def build_and_solve_with_trace(
         error_trace.append(error)
         if iteration <= 5 or iteration % 5 == 0:
             logger.info("  iter %3d: error=%.2f  (%.2fs)", iteration, error, dt)
+        # Early stopping on convergence.
+        if len(error_trace) >= 2:
+            relative_change = abs(error_trace[-2] - error) / max(error_trace[-2], 1e-12)
+            if relative_change < 1e-5:
+                logger.info("  Converged at iteration %d (relative change %.2e)", iteration, relative_change)
+                break
 
     result = optimizer.values()
     cam_indices = {gtsam.Symbol(k).index() for k in camera_keys}

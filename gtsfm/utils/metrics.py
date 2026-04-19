@@ -412,7 +412,7 @@ def compute_translation_angle_metric(
 def compute_pose_auc_metric(
     rotation_angular_errors: Union[Sequence[float], np.ndarray],
     translation_angular_errors: Union[Sequence[float], np.ndarray],
-    thresholds_deg: Sequence[float] = (1.0, 2.5, 5.0, 10.0, 20.0),
+    thresholds_deg: Sequence[float] = (1.0, 2.5, 3.0, 5.0, 10.0, 20.0),
     save_dir: Optional[str] = None,
     metric_name_prefix: str = "pose_auc",
 ) -> List[GtsfmMetric]:
