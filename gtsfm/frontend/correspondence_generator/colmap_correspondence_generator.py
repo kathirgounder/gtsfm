@@ -34,6 +34,7 @@ class ColmapCorrespondenceGenerator(CorrespondenceGeneratorBase):
         Args:
             database_path: path of the Colmap DB.
         """
+        self._database_path = database_path
         self._pycolmap_db = pycolmap.Database(database_path)
         # Note(Ayush): using SQLite3 to load keypoints because PyColmap does not expose bindings.
         raw_db = sqlite3.connect(database_path)
@@ -49,6 +50,28 @@ class ColmapCorrespondenceGenerator(CorrespondenceGeneratorBase):
             self._pycolmap_db.num_keypoints,
             self._pycolmap_db.num_verified_image_pairs,
         )
+
+    def __getstate__(self):
+        """Drop unpickleable DB handle and large keypoint dict — worker reloads from disk."""
+        state = self.__dict__.copy()
+        state["_pycolmap_db"] = None
+        state["_keypoints_dict"] = None
+        return state
+
+    def __setstate__(self, state):
+        """Re-open the DB and rebuild the keypoint cache on the worker side."""
+        self.__dict__.update(state)
+        if self._pycolmap_db is None and self._database_path is not None:
+            self._pycolmap_db = pycolmap.Database(self._database_path)
+        if self._keypoints_dict is None and self._database_path is not None:
+            raw_db = sqlite3.connect(self._database_path)
+            self._keypoints_dict = {
+                image_id: np.frombuffer(data, dtype=np.float32).reshape(rows, -1)
+                for image_id, rows, data in raw_db.execute(
+                    "SELECT image_id, rows, data FROM keypoints"
+                )
+            }
+            raw_db.close()
 
     def _read_keypoints(self, image: Image) -> Keypoints:
         """
@@ -113,13 +136,14 @@ class ColmapCorrespondenceGenerator(CorrespondenceGeneratorBase):
             colmap_i2 = gtsfm_id_to_pycolmap_id[i2]
 
             two_view_geometry = self._pycolmap_db.read_two_view_geometry(colmap_i1, colmap_i2)
-
-            # Only read matches if we have an essential or a fundamental matrix
-            if two_view_geometry.config != 2 and two_view_geometry.config != 3:
+            inliers = two_view_geometry.inlier_matches
+            if inliers is None or len(inliers) == 0:
                 continue
-
-            # Note(Ayush): the matches we are loading are actually post verification
-            corr_idxs[(i1, i2)] = np.array(two_view_geometry.inlier_matches, dtype=np.int32)
+            # Include all configs (CALIBRATED, UNCALIBRATED, PLANAR_OR_PANORAMIC, etc.) —
+            # downstream PoseLib verifier re-estimates relative pose from scratch,
+            # matching GLOMAP's behavior of ingesting all verified pairs regardless of
+            # COLMAP's geometry classification.
+            corr_idxs[(i1, i2)] = np.array(inliers, dtype=np.int32)
 
         return corr_idxs
 

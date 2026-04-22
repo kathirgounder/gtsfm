@@ -273,15 +273,15 @@ class SceneOptimizer:
 
             cameras_gt = self.loader.get_gt_cameras()
 
-                def merge_fn(
-                    reconstruction: object, child_results: tuple[cluster_merging.MergedNodeResult, ...]
-                ) -> cluster_merging.MergedNodeResult:
-                    return cluster_merging.combine_results(
-                        cast(Optional[GtsfmData], reconstruction),
-                        child_results,
-                        cameras_gt=cameras_gt,
-                        options=self._merging_options,
-                    )
+            def merge_fn(
+                reconstruction: object, child_results: tuple[cluster_merging.MergedNodeResult, ...]
+            ) -> cluster_merging.MergedNodeResult:
+                return cluster_merging.combine_results(
+                    cast(Optional[GtsfmData], reconstruction),
+                    child_results,
+                    cameras_gt=cameras_gt,
+                    options=self._merging_options,
+                )
 
             merged_future_tree = submit_tree_map_with_children(client, reconstruction_tree, merge_fn)
             export_tree = cluster_merging.schedule_exports(client, handles_tree, merged_future_tree)

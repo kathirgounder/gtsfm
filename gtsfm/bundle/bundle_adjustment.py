@@ -871,10 +871,10 @@ class BundleAdjustmentOptimizer:
                     )
                 )
 
-            # After the first BA stage, filter outlier cameras via covisibility clustering.
-            if step == 0 and num_ba_steps > 1:
-                filtered_result = filter_outlier_cameras(filtered_result)
-                initial_data = filtered_result
+            # Optional: filter outlier cameras via covisibility clustering after first BA stage.
+            # Disabled by default — clustering can cut valid cameras in scenes with natural
+            # view graph partitions (e.g. Brussels plaza with distinct viewpoints).
+            pass
 
         total_time = time.time() - start_time
 

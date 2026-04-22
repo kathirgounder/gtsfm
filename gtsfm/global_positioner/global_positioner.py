@@ -177,9 +177,9 @@ def build_and_solve_with_trace(
     lm_params.setVerbosityLM("SILENT")
 
     gp = gtsam.GlobalPositioner(lm_params)
-    graph = gp.buildGraph(measurements)
-    gp.addPrior(anchor_key, graph)
-    initial = gp.initializeRandomly(camera_keys, landmark_keys, len(observations))
+    graph = gp.buildGraph(measurements, True)
+    gp.addAnchorPrior(anchor_key, graph)
+    initial = gp.initializeRandomly(camera_keys, landmark_keys, measurements)
 
     initial_error = graph.error(initial)
     logger.info("GlobalPositioner (trace): initial error = %.2f", initial_error)

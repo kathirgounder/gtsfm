@@ -16,9 +16,11 @@ configs = [
     ('H-megaloc_sift_gp_metis_pt', 'GP+METIS(PT)'),
     ('I-megaloc_splg_baseline_single_pt', 'Baseline+Single(SP)'),
     ('J-megaloc_splg_gp_single_pt', 'GP+Single(SP)'),
+    ('K-megaloc_sift_gp_single_pt_shared_db', 'GP+SharedDB(PT)'),
 ]
 
-datasets = ['gerrard-100', 'south-128', 'palace-281', 'british_museum', 'brussels']
+datasets = ['gerrard-100', 'south-128', 'palace-281', 'british_museum', 'brussels',
+            'pantheon_exterior', 'sacre_coeur', 'taj_mahal']
 
 
 def get_val(data, key):

@@ -1,5 +1,14 @@
-# MegaLoc + SIFT + Global Positioner with Single partition.
-# Based on unified_megaloc.yaml with SIFT detector/matcher swap + GP.
+# GTSFM fed from a shared COLMAP SQLite DB (keypoints + verified matches).
+# Same as megaloc_sift_gp_single_pt.yaml except the frontend is replaced with
+# ColmapCorrespondenceGenerator, so GTSFM and GLOMAP consume identical features + matches.
+#
+# Usage:
+#   1. Build the shared DB: python scripts/build_colmap_db_british_museum.py
+#   2. Run GTSFM with this config pointing at the DB:
+#        python gtsfm/runner.py --config_name=megaloc_sift_gp_single_pt_shared_db ...
+#
+# If end-to-end metrics still trail GLOMAP's despite identical two-view input,
+# the divergence is in RA/GP/BA — not the frontend.
 
 # @package _global_
 _target_: gtsfm.scene_optimizer.SceneOptimizer
@@ -26,19 +35,8 @@ cluster_optimizer:
   _target_: gtsfm.cluster_optimizer.Multiview
 
   correspondence_generator:
-    _target_: gtsfm.frontend.correspondence_generator.det_desc_correspondence_generator.DetDescCorrespondenceGenerator
-
-    detector_descriptor:
-      _target_: gtsfm.frontend.cacher.detector_descriptor_cacher.DetectorDescriptorCacher
-      detector_descriptor_obj:
-        _target_: gtsfm.frontend.detector_descriptor.colmap_sift.ColmapSIFTDetectorDescriptor
-        max_keypoints: 8192
-
-    matcher:
-      _target_: gtsfm.frontend.cacher.matcher_cacher.MatcherCacher
-      matcher_obj:
-        _target_: gtsfm.frontend.matcher.twoway_matcher.TwoWayMatcher
-        ratio_test_threshold: 0.8
+    _target_: gtsfm.frontend.correspondence_generator.colmap_correspondence_generator.ColmapCorrespondenceGenerator
+    database_path: /Users/kathir/Desktop/gtsfm/benchmarks/british_museum/colmap_shared.db
 
   two_view_estimator:
     _target_: gtsfm.two_view_estimator_cacher.TwoViewEstimatorCacher
@@ -123,4 +121,3 @@ cluster_optimizer:
 
   dense_multiview_optimizer: null
   gaussian_splatting_optimizer: null
-

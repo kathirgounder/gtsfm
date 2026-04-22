@@ -144,6 +144,18 @@ run_all_configs_pt() {
         run_one "J" "GP + Single (SP)" "megaloc_splg_gp_single_pt" \
                 "$dataset_name" "$loader" "$dataset_dir" "$images_dir" "$max_res" "false"
     fi
+
+    # K: GP + SharedDB (PT) — reads keypoints+matches from a precomputed COLMAP SQLite DB.
+    # Only runs when the per-dataset DB exists at benchmarks/<dataset>/colmap_shared.db.
+    if [ -z "$FILTER_CONFIG" ] || [ "$FILTER_CONFIG" = "K" ]; then
+        local shared_db_path="benchmarks/$dataset_name/colmap_shared.db"
+        if [ -f "$shared_db_path" ]; then
+            run_one "K" "GP + SharedDB (PT)" "megaloc_sift_gp_single_pt_shared_db" \
+                    "$dataset_name" "$loader" "$dataset_dir" "$images_dir" "$max_res" "false"
+        else
+            echo "  -> Skipping K for $dataset_name: no $shared_db_path. Build with scripts/build_colmap_db_british_museum.py"
+        fi
+    fi
 }
 
 # Dataset: gerrard-100
@@ -168,7 +180,22 @@ fi
 
 # Dataset: brussels (phototourism, 236 images)
 if [ -z "$FILTER_DATASET" ] || [ "$FILTER_DATASET" = "brussels" ]; then
-    run_all_configs_pt "brussels" "colmap" "benchmarks/grand_place_brussels/sfm" "benchmarks/grand_place_brussels/images"
+    run_all_configs_pt "brussels" "colmap" "benchmarks/grand_place_brussels/sfm_updated" "benchmarks/grand_place_brussels/images"
+fi
+
+# Dataset: pantheon_exterior (phototourism, 321 images)
+if [ -z "$FILTER_DATASET" ] || [ "$FILTER_DATASET" = "pantheon_exterior" ]; then
+    run_all_configs_pt "pantheon_exterior" "colmap" "benchmarks/pantheon_exterior/sfm_updated" "benchmarks/pantheon_exterior/images"
+fi
+
+# Dataset: sacre_coeur (phototourism)
+if [ -z "$FILTER_DATASET" ] || [ "$FILTER_DATASET" = "sacre_coeur" ]; then
+    run_all_configs_pt "sacre_coeur" "colmap" "benchmarks/sacre_coeur/sfm_updated" "benchmarks/sacre_coeur/images"
+fi
+
+# Dataset: taj_mahal (phototourism, 399 images)
+if [ -z "$FILTER_DATASET" ] || [ "$FILTER_DATASET" = "taj_mahal" ]; then
+    run_all_configs_pt "taj_mahal" "colmap" "benchmarks/taj_mahal/sfm_updated" "benchmarks/taj_mahal/images"
 fi
 
 echo ""

@@ -4,6 +4,8 @@ Authors: Ayush Baid, John Lambert
 """
 
 import logging
+
+import gtsfm.utils.logger as logger_utils
 import os
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Tuple
@@ -39,7 +41,7 @@ from gtsfm.utils import verification as verification_utils
 from gtsfm.view_graph_estimator.view_graph_calibration import calibrate_view_graph
 from gtsfm.view_graph_estimator.view_graph_estimator_base import ViewGraphEstimatorBase
 
-logger = logging.getLogger(__name__)
+logger = logger_utils.get_logger()
 
 
 class MultiViewOptimizer:
@@ -182,6 +184,18 @@ class MultiViewOptimizer:
             viewgraph_two_view_reports_graph = two_view_reports
             viewgraph_estimation_metrics = delayed(GtsfmMetricsGroup("view_graph_estimation_metrics", []))
 
+        # GLOMAP Stage 2: Re-score inliers using F-matrix Sampson error + orientation signum cheirality.
+        # Pixel-space filter, intrinsic-independent. Filters correspondences that passed PoseLib
+        # RANSAC but fail the tighter epipolar test.
+        viewgraph_v_corr_idxs_graph, viewgraph_i2Ri1_graph, viewgraph_i2Ui1_graph = delayed(
+            rescore_inliers_fundamental, nout=3
+        )(
+            viewgraph_i2Ri1_graph, viewgraph_i2Ui1_graph,
+            viewgraph_v_corr_idxs_graph, keypoints_graph, all_intrinsics,
+            min_inlier_count=30,
+            min_inlier_ratio=0.25,
+        )
+
         # View graph calibration: refine focal lengths from F-matrices before global positioning.
         if self._run_view_graph_calibration:
             all_intrinsics, edges_to_remove = delayed(calibrate_view_graph, nout=2)(
@@ -212,10 +226,10 @@ class MultiViewOptimizer:
             gt_wTi_list=gt_wTi_list,
             v_corr_idxs=viewgraph_v_corr_idxs_graph,
         )
-        # Prune cameras with inconsistent rotations after averaging.
+        # Optional: prune cameras with globally inconsistent rotations (off by default).
         if self._rotation_outlier_threshold_deg > 0:
             delayed_wRi = delayed(prune_rotation_outliers)(
-                delayed_wRi, filtered_i2Ri1_graph, self._rotation_outlier_threshold_deg
+                delayed_wRi, pruned_i2Ri1_graph, self._rotation_outlier_threshold_deg
             )
         tracks2d_graph = delayed(get_2d_tracks)(viewgraph_v_corr_idxs_graph, keypoints_graph)
 
@@ -340,6 +354,81 @@ def filter_edges_by_rotation(
         num_removed, len(i2Ri1_dict), max_rotation_error_deg, len(filtered_R),
     )
     return filtered_R, filtered_U
+
+
+def _filter_by_reprojection_logged(
+    gtsfm_data: GtsfmData, reproj_err_thresh: float, min_track_length: int
+) -> GtsfmData:
+    """Wrap GtsfmData.filter_landmark_measurements with entry/exit logs."""
+    logger.info(
+        "FilterTracksByReprojection: running on %d tracks (threshold=%.1f px, min_track_len=%d).",
+        gtsfm_data.number_tracks(), reproj_err_thresh, min_track_length,
+    )
+    filtered = gtsfm_data.filter_landmark_measurements(
+        reproj_err_thresh=reproj_err_thresh, min_track_length=min_track_length
+    )
+    logger.info(
+        "FilterTracksByReprojection: DONE — %d → %d tracks (%d dropped).",
+        gtsfm_data.number_tracks(), filtered.number_tracks(),
+        gtsfm_data.number_tracks() - filtered.number_tracks(),
+    )
+    return filtered
+
+
+def filter_tracks_by_triangulation_angle(
+    gtsfm_data: GtsfmData,
+    min_angle_deg: float = 1.0,
+) -> GtsfmData:
+    """GLOMAP FilterTrackTriangulationAngle: drop tracks with no sufficiently parallaxed observation pair."""
+    logger.info(
+        "FilterTrackTriangulationAngle: running on %d tracks (threshold=%.2f deg).",
+        gtsfm_data.number_tracks(), min_angle_deg,
+    )
+    cos_min = np.cos(np.radians(min_angle_deg))
+    filtered = GtsfmData(gtsfm_data.number_images())
+    for cam_idx, camera in gtsfm_data.cameras().items():
+        filtered.add_camera(cam_idx, camera)
+
+    num_before = gtsfm_data.number_tracks()
+    num_dropped = 0
+    num_too_short = 0
+    for j in range(num_before):
+        track = gtsfm_data.get_track(j)
+        point3 = track.point3()
+        n_meas = track.numberMeasurements()
+        if n_meas < 2:
+            num_dropped += 1
+            num_too_short += 1
+            continue
+        dirs = []
+        for i in range(n_meas):
+            cam_idx, _ = track.measurement(i)
+            camera = gtsfm_data.get_camera(cam_idx)
+            if camera is None:
+                continue
+            v = point3 - camera.pose().translation()
+            n = float(np.linalg.norm(v))
+            if n < 1e-12:
+                continue
+            dirs.append(v / n)
+        found = False
+        for i in range(len(dirs)):
+            for k in range(i + 1, len(dirs)):
+                if float(dirs[i] @ dirs[k]) < cos_min:
+                    found = True
+                    break
+            if found:
+                break
+        if found:
+            filtered.add_track(track)
+        else:
+            num_dropped += 1
+
+    logger.info(
+        "FilterTrackTriangulationAngle: DONE — dropped %d / %d tracks (%d too-short, %d low-parallax), %d remain.",
+        num_dropped, num_before, num_too_short, num_dropped - num_too_short, num_before - num_dropped,
+    )
+    return filtered
 
 
 def rescore_inliers_fundamental(
