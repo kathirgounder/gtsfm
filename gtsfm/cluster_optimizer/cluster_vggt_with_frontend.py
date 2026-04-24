@@ -30,6 +30,8 @@ from gtsfm.multi_view_optimizer import get_2d_tracks
 from gtsfm.products.visibility_graph import visibility_graph_keys
 from gtsfm.two_view_estimator import TwoViewEstimator
 from gtsfm.ui.gtsfm_process import UiMetadata
+import gtsam
+
 from gtsfm.utils import torch as torch_utils
 from gtsfm.utils.logger import get_logger
 
@@ -104,6 +106,25 @@ def _run_vggt_geometry(
     return result
 
 
+def _scale_camera_intrinsics(
+    camera: gtsfm_types.CAMERA_TYPE, scale: float
+) -> gtsfm_types.CAMERA_TYPE:
+    """Return a copy of camera with intrinsics uniformly scaled, pose unchanged."""
+    pose = camera.pose()
+    cal = camera.calibration()
+    if isinstance(cal, gtsam.Cal3Bundler):
+        return gtsam.PinholeCameraCal3Bundler(
+            pose,
+            gtsam.Cal3Bundler(cal.fx() * scale, cal.k1(), cal.k2(), cal.px() * scale, cal.py() * scale),
+        )
+    if isinstance(cal, gtsam.Cal3_S2):
+        return gtsam.PinholeCameraCal3_S2(
+            pose,
+            gtsam.Cal3_S2(cal.fx() * scale, cal.fy() * scale, 0.0, cal.px() * scale, cal.py() * scale),
+        )
+    raise ValueError(f"Unsupported calibration type: {type(cal)}")
+
+
 def _build_gtsfm_data_from_vggt_depth(
     vggt_result: VggtGeometryResult,
     tracks_2d: list[SfmTrack2d],
@@ -112,14 +133,11 @@ def _build_gtsfm_data_from_vggt_depth(
     num_images: int,
     min_track_length: int = 2,
 ) -> GtsfmData:
-    """Build GtsfmData using VGGT cameras and depth-lifted frontend 2D tracks.
+    """Build GtsfmData using VGGT cameras (rescaled to original resolution) and frontend 2D tracks.
 
-    For each frontend 2D track, each observation (u_orig, v_orig) is mapped to VGGT
-    pixel coordinates to look up the pre-computed world-space 3D point from the VGGT
-    dense depth map. The averaged 3D point becomes the track landmark.
-
-    The 2D measurements stored in the GtsfmData are also in VGGT pixel coordinates so
-    they are consistent with the VGGT camera models for bundle adjustment.
+    VGGT camera intrinsics are scaled from VGGT pixel space to original image resolution so
+    that the frontend keypoints (in original coords) can be used directly as BA measurements.
+    VGGT pixel coordinates are used only to look up per-pixel depth values for 3D initialisation.
 
     Args:
         vggt_result: Cameras, dense 3D points, and crop metadata from VGGT.
@@ -130,7 +148,8 @@ def _build_gtsfm_data_from_vggt_depth(
         min_track_length: Minimum observations per track; shorter tracks are dropped.
 
     Returns:
-        GtsfmData with VGGT cameras and depth-initialised tracks.
+        GtsfmData with intrinsics-rescaled VGGT cameras and depth-initialised tracks whose
+        2D measurements are in the original keypoint coordinate system.
     """
     cameras = vggt_result.cameras
     dense_points = vggt_result.dense_points        # (N, H_vggt, W_vggt, 3)
@@ -140,8 +159,12 @@ def _build_gtsfm_data_from_vggt_depth(
     _, H_vggt, W_vggt = dense_points.shape[:3]
     global_to_local = {gidx: lidx for lidx, gidx in enumerate(image_indices)}
 
+    # Register cameras with intrinsics rescaled to original image resolution.
     gtsfm_data = GtsfmData(number_images=num_images)
     for global_idx, camera in cameras.items():
+        if global_idx in image_shapes:
+            _, orig_W = image_shapes[global_idx]
+            camera = _scale_camera_intrinsics(camera, scale=orig_W / W_vggt)
         gtsfm_data.add_camera(global_idx, camera)
 
     for track_2d in tracks_2d:
@@ -150,8 +173,7 @@ def _build_gtsfm_data_from_vggt_depth(
 
         points_3d: list[np.ndarray] = []
         confidences: list[float] = []
-        # Measurements re-expressed in VGGT pixel coords for use in BA.
-        vggt_measurements: list[tuple[int, np.ndarray]] = []
+        valid_measurements: list[tuple[int, np.ndarray]] = []
 
         for m in track_2d.measurements:
             global_idx = m.i
@@ -159,23 +181,19 @@ def _build_gtsfm_data_from_vggt_depth(
                 continue
 
             local_idx = global_to_local[global_idx]
-            orig_H, orig_W = image_shapes[global_idx]
+            _, orig_W = image_shapes[global_idx]
 
-            # Map (u_orig, v_orig) → VGGT crop pixel coords.
-            # VGGT resizes by width: scale = W_vggt / orig_W.
-            # Crop offset [left, top] is stored in original_coords.
-            scale = W_vggt / orig_W
-            u_vggt = m.uv[0] * scale - original_coords[local_idx, 0]
-            v_vggt = m.uv[1] * scale - original_coords[local_idx, 1]
-            u_c = int(np.clip(round(u_vggt), 0, W_vggt - 1))
-            v_c = int(np.clip(round(v_vggt), 0, H_vggt - 1))
+            # VGGT coords for depth lookup only — not stored as measurements.
+            vggt_scale = W_vggt / orig_W
+            u_c = int(np.clip(round(m.uv[0] * vggt_scale - original_coords[local_idx, 0]), 0, W_vggt - 1))
+            v_c = int(np.clip(round(m.uv[1] * vggt_scale - original_coords[local_idx, 1]), 0, H_vggt - 1))
 
             pt3d = dense_points[local_idx, v_c, u_c]
             conf = float(depth_confidence[local_idx, v_c, u_c])
             if np.isfinite(pt3d).all() and conf > 0.0:
                 points_3d.append(pt3d)
                 confidences.append(conf)
-                vggt_measurements.append((global_idx, np.array([u_vggt, v_vggt])))
+                valid_measurements.append((global_idx, m.uv))  # original keypoint coords
 
         if len(points_3d) < min_track_length:
             continue
@@ -184,7 +202,7 @@ def _build_gtsfm_data_from_vggt_depth(
         weights /= weights.sum()
         point_3d_mean = np.average(points_3d, axis=0, weights=weights)
         sfm_track = SfmTrack(Point3(*point_3d_mean.astype(float)))
-        for gidx, uv in vggt_measurements:
+        for gidx, uv in valid_measurements:
             if gidx in cameras:
                 sfm_track.addMeasurement(gidx, Point2(*uv.astype(float)))
 
