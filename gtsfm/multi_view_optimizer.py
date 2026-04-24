@@ -29,7 +29,6 @@ from gtsfm.data_association.cpp_dsf_tracks_estimator import CppDsfTracksEstimato
 from gtsfm.data_association.data_assoc import DataAssociation
 from gtsfm.evaluation.metrics import GtsfmMetricsGroup
 from gtsfm.global_positioner.global_positioner import GlobalPositioner
-from gtsfm.global_positioner.mixed_global_positioner import MixedGlobalPositioner
 from gtsfm.products.one_view_data import OneViewData
 from gtsfm.products.two_view_result import TwoViewResult
 from gtsfm.products.visibility_graph import AnnotatedGraph
@@ -94,9 +93,6 @@ class MultiViewOptimizer:
         self._run_view_graph_calibration = run_view_graph_calibration
         self._rotation_outlier_threshold_deg = rotation_outlier_threshold_deg
 
-        self.view_graph_estimator_v2 = CycleConsistentRotationViewGraphEstimator(
-            edge_error_aggregation_criterion=EdgeErrorAggregationCriterion.MEDIAN_EDGE_ERROR
-        )
 
     def __repr__(self) -> str:
         return f"""
@@ -159,24 +155,8 @@ class MultiViewOptimizer:
                 debug_output_dir,
             )
 
-            # Second view graph estimator expects the same TwoViewResult format
-            # Since ViewGraphEstimatorBase now uses the new signature, we pass two_view_results directly
-            second_debug_output_dir = debug_output_dir / "2" if debug_output_dir else None
-            (
-                viewgraph_i2Ri1_graph,
-                viewgraph_i2Ui1_graph,
-                viewgraph_v_corr_idxs_graph,
-                viewgraph_two_view_reports_graph,
-                viewgraph_estimation_metrics,
-            ) = self.view_graph_estimator_v2.create_computation_graph(
-                viewgraph_i2Ri1_graph,
-                viewgraph_i2Ui1_graph,
-                all_intrinsics,
-                viewgraph_v_corr_idxs_graph,
-                keypoints_graph,
-                viewgraph_two_view_reports_graph,
-                second_debug_output_dir,
-            )
+            # (v2 cycle-consistency pass removed — empirically worse than no-v2 on Brussels
+            # across all thresholds. GLOMAP-style post-RA iterative filter replaces it below.)
         else:
             viewgraph_i2Ri1_graph = i2Ri1_dict
             viewgraph_i2Ui1_graph = i2Ui1_dict
@@ -238,15 +218,10 @@ class MultiViewOptimizer:
 
         if self.global_positioner is not None:
             # Path B: Global positioner replaces trans_avg + data_assoc.
-            if isinstance(self.global_positioner, MixedGlobalPositioner):
-                # Mixed GP needs relative translations for camera-camera edges.
-                ba_input_graph, gp_metrics = delayed(self.global_positioner.run, nout=2)(
-                    num_images, delayed_wRi, tracks2d_graph, all_intrinsics, pruned_i2Ui1_graph,
-                )
-            else:
-                ba_input_graph, gp_metrics = delayed(self.global_positioner.run, nout=2)(
-                    num_images, delayed_wRi, tracks2d_graph, all_intrinsics,
-                )
+            ba_input_graph, gp_metrics = delayed(self.global_positioner.run, nout=2)(
+                num_images, delayed_wRi, tracks2d_graph, all_intrinsics,
+                output_root=output_root,
+            )
             ta_metrics = gp_metrics
             data_assoc_metrics_graph = delayed(GtsfmMetricsGroup)("data_association_metrics", [])
         else:

@@ -26,7 +26,8 @@ Authors: Kathir Gounder
 import os
 import pickle
 import time
-from typing import List, Optional, Set, Tuple
+from pathlib import Path
+from typing import List, Optional, Set, Tuple, Union
 
 import gtsam
 import numpy as np
@@ -334,6 +335,7 @@ class GlobalPositioner:
         wRi_list: List[Optional[Rot3]],
         tracks_2d: List[SfmTrack2d],
         intrinsics: List[Optional[gtsfm_types.CALIBRATION_TYPE]],
+        output_root: Optional[Union[str, Path]] = None,
     ) -> Tuple[GtsfmData, GtsfmMetricsGroup]:
         """Run global positioning and produce GtsfmData for BA."""
         start_time = time.time()
@@ -392,7 +394,12 @@ class GlobalPositioner:
                 if wRi is not None:
                     wRi_matrices[ci] = wRi.matrix()
 
-            trace_path = "results/gp_convergence_trace.pkl"
+            # Save trace under the dataset-specific output root so multiple
+            # runs don't clobber each other's traces.
+            if output_root is not None:
+                trace_path = str(Path(output_root) / "results" / "gp_convergence_trace.pkl")
+            else:
+                trace_path = "results/gp_convergence_trace.pkl"
             os.makedirs(os.path.dirname(trace_path), exist_ok=True)
             with open(trace_path, "wb") as f:
                 pickle.dump({
@@ -401,7 +408,7 @@ class GlobalPositioner:
                     "wRi_matrices": wRi_matrices,
                     "filtered_tracks": filtered_tracks,
                 }, f)
-            logger.info("GlobalPositioner: saved trace (%d frames)", len(positions_trace))
+            logger.info("GlobalPositioner: saved trace (%d frames) to %s", len(positions_trace), trace_path)
         else:
             result_values, cam_indices, track_indices = build_and_solve(
                 observations, self._noise_sigma, self._huber_loss_scale, self._max_iterations,

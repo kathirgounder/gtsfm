@@ -47,6 +47,8 @@ def save_retrieval_two_view_metrics(output_paths: OutputPaths) -> None:
         U_error = entry["translation_angular_error"]
         if R_error is None or U_error is None:
             continue
+        if i1 >= sim.shape[0] or i2 >= sim.shape[1]:
+            continue
         sim_score = sim[i1, i2]
 
         sim_scores.append(float(sim_score))

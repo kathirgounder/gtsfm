@@ -59,7 +59,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import gtsfm.common.types as gtsfm_types
 import gtsfm.utils.io as io_utils
 from gtsfm.common.sfm_track import SfmTrack2d
-from gtsfm.global_positioner.global_positioner import compute_world_bearings, filter_tracks
+from gtsfm.global_positioner.global_positioner import compute_world_directions, filter_tracks
 
 
 def load_rotations_and_tracks_from_colmap(
@@ -176,7 +176,7 @@ def build_graph_and_iterate(
     """Build the global positioner graph and capture values at each iteration."""
     valid_cameras = {i for i, wRi in enumerate(wRi_list) if wRi is not None}
     filtered_tracks = filter_tracks(tracks_2d, valid_cameras, min_track_measurements)
-    observations = compute_world_bearings(filtered_tracks, intrinsics, wRi_list, valid_cameras)
+    observations = compute_world_directions(filtered_tracks, intrinsics, wRi_list, valid_cameras)
 
     print(f"Building graph: {len(observations)} observations, {len(valid_cameras)} cameras, {len(filtered_tracks)} tracks")
 
@@ -239,29 +239,147 @@ def build_graph_and_iterate(
     return values_trace, error_trace, camera_indices, track_indices
 
 
-def compute_auto_view_angle(cam_positions: np.ndarray) -> Tuple[float, float]:
-    """Compute elev/azim that looks along the normal to the camera plane.
+def compute_up_alignment(
+    cam_positions: np.ndarray,
+    landmarks: Optional[np.ndarray] = None,
+    cam_rotations: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Compute a rotation matrix that aligns the scene's up-axis with +Z.
 
-    Uses PCA to find the plane that best fits the camera positions.
-    The view direction is set along the least-variance axis (normal to the
-    camera arrangement), giving a natural front-on or overhead view depending
-    on the scene geometry.
+    After applying this rotation to all points, matplotlib's azimuth parameter
+    will orbit around the scene's true up axis — no more "going under" the
+    reconstruction during orbit.
+
+    Strategy:
+    1. Primary: average the world-space "up" direction of every camera
+       (negative Y in camera frame, since image Y points down). For upright
+       tourist cameras this gives the scene's true up axis directly.
+    2. Fallback: PCA least-variance axis when rotations are unavailable or
+       the averaged camera-up is inconsistent (|sum| small).
+
+    Always oriented so that landmarks (when available) sit above cameras.
     """
-    centered = cam_positions - cam_positions.mean(axis=0)
-    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+    scene_up = None
 
-    # 3rd principal component = normal to camera plane (least variance direction)
-    normal = Vt[2]
+    chosen_source = None
 
-    # Ensure we look from the "positive" side (arbitrary but consistent)
-    if normal[2] < 0:
-        normal = -normal
+    if cam_rotations is not None and len(cam_rotations) > 0:
+        # Camera image-up in world: wRi @ [0, -1, 0] — the vector that points
+        # from the bottom of the image toward the top, expressed in world.
+        image_up = np.array([0.0, -1.0, 0.0])
+        per_cam_up = cam_rotations @ image_up  # (N, 3)
+        avg_up = per_cam_up.mean(axis=0)
+        norm = np.linalg.norm(avg_up)
+        print(f"  [up-alignment] camera image-up consistency: |avg|={norm:.3f} (1.0 = perfect agreement)")
+        # Only trust it if cameras mostly agree (avg magnitude > 0.5 = majority aligned).
+        if norm > 0.5:
+            scene_up = avg_up / norm
+            chosen_source = "camera image-up"
 
-    # Convert to matplotlib elev/azim (degrees)
-    elev = np.degrees(np.arcsin(np.clip(normal[2], -1, 1)))
-    azim = np.degrees(np.arctan2(normal[1], normal[0]))
+    if scene_up is None:
+        # Fallback: PCA least-variance axis.
+        pts = cam_positions if landmarks is None or len(landmarks) == 0 else np.vstack([cam_positions, landmarks])
+        centered = pts - pts.mean(axis=0)
+        _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+        scene_up = Vt[2]
+        chosen_source = "PCA least-variance"
+    print(f"  [up-alignment] source: {chosen_source}, scene_up={scene_up}")
 
+    # Orient: landmarks should sit above cameras (heuristic tiebreaker).
+    # Applied for both rotation-based and PCA paths — ceiling-dominated scenes
+    # like the British Museum Great Court can have cameras tilted back, so the
+    # averaged image-up vector points away from the actual scene up. The
+    # landmarks-above-cameras check catches this and flips when wrong.
+    if landmarks is not None and len(landmarks) > 0:
+        cam_center = cam_positions.mean(axis=0)
+        lmk_center = landmarks.mean(axis=0)
+        dot = np.dot(lmk_center - cam_center, scene_up)
+        print(f"  [up-alignment] landmarks-above-cameras dot={dot:.3f}")
+        if dot < 0:
+            print("  [up-alignment] flipping: landmarks were below cameras under proposed up")
+            scene_up = -scene_up
+    elif scene_up[2] < 0:
+        scene_up = -scene_up
+
+    # Build orthonormal frame: make scene_up → +Z.
+    # Use a standard basis vector as a reference to build the frame.
+    ref = np.array([1.0, 0.0, 0.0])
+    if abs(np.dot(ref, scene_up)) > 0.95:
+        ref = np.array([0.0, 1.0, 0.0])
+    x_axis = np.cross(scene_up, ref)
+    x_axis /= (np.linalg.norm(x_axis) + 1e-12)
+    y_axis = np.cross(scene_up, x_axis)
+
+    # Rotation matrix: rows are the new basis expressed in old coords.
+    # After applying R, old scene_up becomes new +Z, old x_axis becomes new +X.
+    R = np.stack([x_axis, y_axis, scene_up], axis=0)
+    return R
+
+
+def compute_auto_view_angle(
+    cam_positions: np.ndarray, landmarks: Optional[np.ndarray] = None
+) -> Tuple[float, float]:
+    """Compute elev/azim for a 3/4 view — assumes scene is already up-aligned.
+
+    Since we pre-rotate the scene so +Z is up, elevation is a straightforward
+    30° and azimuth is chosen so we look along the main horizontal spread
+    direction (giving a wide-view shot of the reconstruction).
+    """
+    pts = cam_positions if landmarks is None or len(landmarks) == 0 else np.vstack([cam_positions, landmarks])
+    centered = pts - pts.mean(axis=0)
+
+    # After up-alignment, PCA in the XY plane tells us the main horizontal
+    # direction of the scene. We want to view perpendicular to that (face-on).
+    xy = centered[:, :2]
+    _, _, Vt = np.linalg.svd(xy, full_matrices=False)
+    main_dir = Vt[0]  # main horizontal spread axis
+
+    # Look perpendicular to main_dir: azim points along the normal direction.
+    # In matplotlib, azim=0 looks along +X toward origin; azim=90 looks along +Y.
+    perp = np.array([-main_dir[1], main_dir[0]])  # 90° rotation in XY
+    azim = np.degrees(np.arctan2(perp[1], perp[0]))
+
+    elev = 30.0  # 3/4 view — cameras + structure both visible
     return elev, azim
+
+
+def _rot_to_matrix(wRi: Optional[Rot3]) -> np.ndarray:
+    """Get 3x3 world-from-camera rotation matrix, or identity if rotation is None."""
+    if wRi is None:
+        return np.eye(3)
+    try:
+        return np.array(wRi.matrix())
+    except Exception:
+        return np.eye(3)
+
+
+def extract_positions_from_dict(
+    pos_dict: dict,
+    wRi_list: List[Optional[Rot3]],
+    camera_indices: Set[int],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Extract positions from pre-extracted numpy dict format (new trace format)."""
+    cam_positions = []
+    cam_forwards = []
+    cam_rotations = []
+    for cam_idx in sorted(camera_indices):
+        pos = pos_dict["cameras"].get(cam_idx, np.zeros(3))
+        cam_positions.append(pos)
+        wRi = wRi_list[cam_idx] if cam_idx < len(wRi_list) else None
+        if wRi is not None:
+            fwd = wRi.rotate(Point3(0, 0, 1))
+            cam_forwards.append(np.array([fwd[0], fwd[1], fwd[2]]))
+        else:
+            cam_forwards.append(np.array([0, 0, 1]))
+        cam_rotations.append(_rot_to_matrix(wRi))
+
+    landmarks = list(pos_dict["landmarks"].values())
+    return (
+        np.array(cam_positions),
+        np.array(cam_forwards),
+        np.array(landmarks) if landmarks else np.empty((0, 3)),
+        np.array(cam_rotations) if cam_rotations else np.empty((0, 3, 3)),
+    )
 
 
 def extract_positions(
@@ -269,10 +387,11 @@ def extract_positions(
     wRi_list: List[Optional[Rot3]],
     camera_indices: Set[int],
     track_indices: Set[int],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Extract camera positions, forward directions, and landmark positions."""
     cam_positions = []
     cam_forwards = []
+    cam_rotations = []
     for cam_idx in sorted(camera_indices):
         pos = values.atPoint3(C(cam_idx))
         cam_positions.append(pos)
@@ -282,6 +401,7 @@ def extract_positions(
             cam_forwards.append(np.array([fwd[0], fwd[1], fwd[2]]))
         else:
             cam_forwards.append(np.array([0, 0, 1]))
+        cam_rotations.append(_rot_to_matrix(wRi))
 
     landmarks = []
     for track_idx in sorted(track_indices):
@@ -291,7 +411,12 @@ def extract_positions(
         except RuntimeError:
             continue
 
-    return np.array(cam_positions), np.array(cam_forwards), np.array(landmarks)
+    return (
+        np.array(cam_positions),
+        np.array(cam_forwards),
+        np.array(landmarks),
+        np.array(cam_rotations) if cam_rotations else np.empty((0, 3, 3)),
+    )
 
 
 def render_frame(
@@ -307,8 +432,9 @@ def render_frame(
     point_colors: Optional[np.ndarray] = None,
     elev: float = 30,
     azim: float = -60,
+    cam_rotations: Optional[np.ndarray] = None,
 ):
-    """Render a single frame with cameras (red) and points (colored or black)."""
+    """Render a single frame with cameras (red frustums) and points (colored or black)."""
     fig = plt.figure(figsize=(16, 10), facecolor='white')
     ax = fig.add_subplot(111, projection='3d', facecolor='white')
 
@@ -335,18 +461,55 @@ def render_frame(
             ax.scatter(lm_plot[:, 0], lm_plot[:, 1], lm_plot[:, 2],
                        c='black', s=0.5, alpha=0.4, depthshade=True)
 
-    # Cameras (red triangles with forward direction)
+    # Cameras as proper wireframe frustums.
     if len(cam_positions) > 0:
-        ax.scatter(cam_positions[:, 0], cam_positions[:, 1], cam_positions[:, 2],
-                   c='red', s=60, marker='^', alpha=0.9, depthshade=True,
-                   edgecolors='darkred', linewidths=0.3)
+        scale = view_range * 0.03  # size of frustum along viewing direction
+        half = scale * 0.5  # half-width of image plane
 
-        # Draw forward direction as short lines
-        scale = view_range * 0.03
-        for pos, fwd in zip(cam_positions, cam_forwards):
-            end = pos + fwd * scale
-            ax.plot([pos[0], end[0]], [pos[1], end[1]], [pos[2], end[2]],
-                    c='red', alpha=0.6, linewidth=1)
+        # Local-frame frustum corners (camera looks down +Z, X right, Y down).
+        local_corners = np.array([
+            [-half, -half, scale],
+            [ half, -half, scale],
+            [ half,  half, scale],
+            [-half,  half, scale],
+        ])
+
+        # Batched: if rotations available, use them; else use forward vectors.
+        if cam_rotations is not None and len(cam_rotations) == len(cam_positions):
+            # (N, 4, 3) world-frame corners.
+            rotated = np.einsum("nij,kj->nki", cam_rotations, local_corners)
+            world_corners = rotated + cam_positions[:, np.newaxis, :]
+        else:
+            # Fallback: align frustum Z with forward vector (less accurate, just for viz).
+            world_corners = np.zeros((len(cam_positions), 4, 3))
+            for n, (pos, fwd) in enumerate(zip(cam_positions, cam_forwards)):
+                # Build orthonormal frame: z=fwd, x=right, y=up
+                z = fwd / (np.linalg.norm(fwd) + 1e-12)
+                up = np.array([0.0, 0.0, 1.0]) if abs(z[2]) < 0.9 else np.array([0.0, 1.0, 0.0])
+                x = np.cross(up, z); x /= (np.linalg.norm(x) + 1e-12)
+                y = np.cross(z, x)
+                R = np.column_stack([x, y, z])
+                world_corners[n] = (R @ local_corners.T).T + pos
+
+        # Collect all line segments in two arrays for a single call.
+        # Each camera contributes 8 segments: 4 apex-to-corner + 4 corner-to-corner.
+        n_cams = len(cam_positions)
+        # Apex → corner lines: 4 per camera.
+        apex_lines_start = np.repeat(cam_positions[:, np.newaxis, :], 4, axis=1).reshape(-1, 3)
+        apex_lines_end = world_corners.reshape(-1, 3)
+        # Corner quad closing lines: 4 per camera.
+        quad_start = world_corners  # (N, 4, 3)
+        quad_end = world_corners[:, [1, 2, 3, 0], :]  # cyclic shift
+        quad_lines_start = quad_start.reshape(-1, 3)
+        quad_lines_end = quad_end.reshape(-1, 3)
+
+        # Draw with a single Line3DCollection for speed.
+        from mpl_toolkits.mplot3d.art3d import Line3DCollection
+        apex_segments = np.stack([apex_lines_start, apex_lines_end], axis=1)
+        quad_segments = np.stack([quad_lines_start, quad_lines_end], axis=1)
+        all_segments = np.concatenate([apex_segments, quad_segments], axis=0)
+        lc = Line3DCollection(all_segments, colors='red', linewidths=0.7, alpha=0.85)
+        ax.add_collection3d(lc)
 
     # Consistent view bounds
     ax.set_xlim(view_center[0] - view_range, view_center[0] + view_range)
@@ -386,6 +549,8 @@ def main():
     parser.add_argument("--interp_steps", type=int, default=5, help="Interpolated sub-frames between each iteration")
     parser.add_argument("--elev", type=float, default=None, help="Camera elevation angle (auto-computed if not set)")
     parser.add_argument("--azim", type=float, default=None, help="Camera azimuth angle (auto-computed if not set)")
+    parser.add_argument("--orbit_degrees", type=float, default=60.0, help="Total azimuth sweep across the animation (0 = fixed view)")
+    parser.add_argument("--flip_up", action="store_true", help="Invert the auto-detected up axis (use if render is upside down)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -398,19 +563,34 @@ def main():
         import pickle
         with open(args.trace_file, "rb") as f:
             trace_data = pickle.load(f)
-        values_trace = trace_data["values_trace"]
         error_trace = trace_data["error_trace"]
         camera_indices = trace_data["camera_indices"]
         track_indices = trace_data["track_indices"]
-        # Reconstruct wRi_list from saved data
-        wRi_list_sparse = trace_data["wRi_list"]
-        wRi_indices = trace_data["wRi_indices"]
-        wRi_list = [None] * (max(wRi_indices) + 1)
-        for idx, wRi in zip(wRi_indices, wRi_list_sparse):
-            wRi_list[idx] = wRi
         track_colors = trace_data.get("track_colors", None)
         filtered_tracks = trace_data.get("filtered_tracks", None)
-        print(f"Loaded {len(values_trace)} frames, {len(camera_indices)} cameras, {len(track_indices)} tracks")
+
+        # Support both old format (values_trace with GTSAM Values) and
+        # new format (positions_trace with pure numpy dicts)
+        if "positions_trace" in trace_data:
+            positions_trace = trace_data["positions_trace"]
+            wRi_matrices = trace_data["wRi_matrices"]
+            # Build wRi_list from rotation matrices
+            max_idx = max(camera_indices) if camera_indices else 0
+            wRi_list = [None] * (max_idx + 1)
+            for ci, mat in wRi_matrices.items():
+                wRi_list[ci] = Rot3(mat)
+            use_positions_trace = True
+        else:
+            values_trace = trace_data["values_trace"]
+            wRi_list_sparse = trace_data["wRi_list"]
+            wRi_indices = trace_data["wRi_indices"]
+            wRi_list = [None] * (max(wRi_indices) + 1)
+            for idx, wRi in zip(wRi_indices, wRi_list_sparse):
+                wRi_list[idx] = wRi
+            use_positions_trace = False
+
+        num_frames = len(positions_trace) if use_positions_trace else len(values_trace)
+        print(f"Loaded {num_frames} frames, {len(camera_indices)} cameras, {len(track_indices)} tracks")
 
         # Sample colors from images using the saved 2D tracks
         if track_colors is None and filtered_tracks is not None and args.images_dir:
@@ -485,15 +665,51 @@ def main():
             max_iterations=args.max_iterations,
             min_track_measurements=args.min_track_measurements,
         )
+        use_positions_trace = False
 
-    # Step 3: Compute view bounds from final converged result
+    # Raw position extractors (scene-frame).
+    def get_frame_positions_raw(frame_idx_local):
+        if use_positions_trace:
+            return extract_positions_from_dict(positions_trace[frame_idx_local], wRi_list, camera_indices)
+        else:
+            return extract_positions(values_trace[frame_idx_local], wRi_list, camera_indices, track_indices)
+
+    # Step 3: Compute world-up alignment — find the scene's "up" axis via PCA
+    # over the final reconstruction, then rotate so that axis aligns with
+    # matplotlib's +Z. This makes matplotlib's azimuth orbit around the scene's
+    # actual up axis (instead of the arbitrary reconstruction Z axis).
+    num_iters = len(positions_trace) if use_positions_trace else len(values_trace)
     print("\n" + "=" * 60)
-    print(f"Step 3: Rendering {len(values_trace)} frames...")
+    print(f"Step 3: Rendering {num_iters} frames...")
     print("=" * 60)
-    final_cams, _, final_lmks = extract_positions(
-        values_trace[-1], wRi_list, camera_indices, track_indices
-    )
+    final_cams_raw, _, final_lmks_raw, final_rots_raw = get_frame_positions_raw(num_iters - 1)
 
+    align_R = compute_up_alignment(final_cams_raw, final_lmks_raw, final_rots_raw)
+    if args.flip_up:
+        # Flip scene upside-down: rotate 180° around X so +Z → -Z.
+        flip = np.diag([1.0, -1.0, -1.0])
+        align_R = flip @ align_R
+        print("  [up-alignment] --flip_up applied (render was upside down)")
+
+    # Apply alignment transform to every frame.
+    def get_frame_positions(frame_idx_local):
+        cams, fwds, lmks, rots = get_frame_positions_raw(frame_idx_local)
+        if len(cams) > 0:
+            cams = cams @ align_R.T
+            fwds = fwds @ align_R.T
+            # Rotate per-camera rotation matrices: R_world_new = align_R @ R_world_old.
+            # Einsum "ij,njk->nik" computes align_R @ rots[n] for each n.
+            if len(rots) > 0:
+                rots = np.einsum("ij,njk->nik", align_R, rots)
+        if len(lmks) > 0:
+            lmks = lmks @ align_R.T
+        return cams, fwds, lmks, rots
+
+    final_cams, _, final_lmks, _ = get_frame_positions(num_iters - 1)
+
+    # Size view bounds to the final (converged) scene. Initial random points
+    # may fly off-frame during the first few iterations, which is visually
+    # dramatic and matches the original animation's feel.
     all_pts = np.vstack([final_cams, final_lmks]) if len(final_lmks) > 0 else final_cams
     view_center = np.median(all_pts, axis=0)
     dists = np.linalg.norm(all_pts - view_center, axis=1)
@@ -501,8 +717,7 @@ def main():
 
     # Auto-compute view angle from camera geometry (or use manual override)
     if args.elev is None or args.azim is None:
-        auto_elev, auto_azim = compute_auto_view_angle(final_cams)
-        # Cap elevation so it's never too top-down — keep between 20° and 45°
+        auto_elev, auto_azim = compute_auto_view_angle(final_cams, final_lmks)
         auto_elev = np.clip(auto_elev, 20.0, 45.0)
         elev = auto_elev if args.elev is None else args.elev
         azim = auto_azim if args.azim is None else args.azim
@@ -511,21 +726,18 @@ def main():
         elev, azim = args.elev, args.azim
         print(f"Manual view angle: elev={elev:.1f}°, azim={azim:.1f}°")
 
-    # Render frames with interpolation between iterations + slow orbit
+    # Render frames with interpolation between iterations (fixed view by default).
     initial_error = error_trace[0]
-    num_iters = len(values_trace)
-    interp_steps = args.interp_steps  # sub-frames between each iteration
+    interp_steps = args.interp_steps
     total_frames = (num_iters - 1) * interp_steps + 1
-    azim_sweep = 120  # total degrees to sweep
+    azim_sweep = args.orbit_degrees
 
     frame_idx = 0
     for i in range(num_iters):
-        cam_pos_i, cam_fwd_i, lmk_pos_i = extract_positions(values_trace[i], wRi_list, camera_indices, track_indices)
+        cam_pos_i, cam_fwd_i, lmk_pos_i, cam_rot_i = get_frame_positions(i)
 
         if i < num_iters - 1:
-            cam_pos_next, cam_fwd_next, lmk_pos_next = extract_positions(
-                values_trace[i + 1], wRi_list, camera_indices, track_indices
-            )
+            cam_pos_next, cam_fwd_next, lmk_pos_next, _ = get_frame_positions(i + 1)
             steps = interp_steps
         else:
             steps = 1  # last iteration, no interpolation
@@ -537,11 +749,13 @@ def main():
             lmk_pos = lmk_pos_i * (1 - t) + lmk_pos_next * t if i < num_iters - 1 else lmk_pos_i
             error = error_trace[i] * (1 - t) + error_trace[min(i + 1, num_iters - 1)] * t
 
-            frame_azim = azim + (frame_idx / max(total_frames - 1, 1)) * azim_sweep
+            # Center orbit on the auto-computed best angle (sweep from -half to +half).
+            frame_azim = azim - azim_sweep / 2 + (frame_idx / max(total_frames - 1, 1)) * azim_sweep
             frame_path = os.path.join(args.output_dir, f"frame_{frame_idx:04d}.png")
             render_frame(
                 cam_pos, cam_fwd_i, lmk_pos, i, error, initial_error,
                 frame_path, view_center, view_range, track_colors, elev, frame_azim,
+                cam_rotations=cam_rot_i,
             )
 
             if frame_idx % 20 == 0 or frame_idx == total_frames - 1:

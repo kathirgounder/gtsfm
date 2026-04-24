@@ -16,7 +16,7 @@ image_pairs_generator:
   retriever:
     _target_: gtsfm.retriever.Similarity
     num_matched: 50
-    min_score: 0.4
+    min_score: 0.25
   batch_size: 16
 
 graph_partitioner:

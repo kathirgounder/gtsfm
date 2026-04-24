@@ -799,15 +799,17 @@ class BundleAdjustmentOptimizer:
                 threshold.
         """
         num_ba_steps = len(self._reproj_error_thresholds)
+        current_data = initial_data
         for step, reproj_error_thresh in enumerate(self._reproj_error_thresholds):
-            # Use intermediate result as initial condition for next step.
+            # Use previous round's filtered result as initial condition for this step.
             (optimized_data, filtered_result, valid_mask, final_error) = self.run_ba_stage_with_filtering(
-                initial_data,
+                current_data,
                 absolute_pose_priors,
                 relative_pose_priors,
                 reproj_error_thresh,
                 verbose,
             )
+            current_data = filtered_result
             # Print intermediate results.
             if num_ba_steps > 1:
                 logger.info(
@@ -847,15 +849,17 @@ class BundleAdjustmentOptimizer:
         num_ba_steps = len(self._reproj_error_thresholds)
         assert num_ba_steps > 0, "No BA steps to perform"
 
+        current_data = initial_data
         for step, reproj_error_thresh in enumerate(self._reproj_error_thresholds):
             step_start_time = time.time()
             (optimized_data, filtered_result, valid_mask, final_error) = self.run_ba_stage_with_filtering(
-                initial_data=initial_data,
+                initial_data=current_data,
                 absolute_pose_priors=absolute_pose_priors,
                 relative_pose_priors=relative_pose_priors,
                 reproj_error_thresh=reproj_error_thresh,
                 verbose=verbose,
             )
+            current_data = filtered_result
             step_times.append(time.time() - step_start_time)
 
             # Print intermediate results.
@@ -870,11 +874,6 @@ class BundleAdjustmentOptimizer:
                         filtered_result.number_tracks(),
                     )
                 )
-
-            # Optional: filter outlier cameras via covisibility clustering after first BA stage.
-            # Disabled by default — clustering can cut valid cameras in scenes with natural
-            # view graph partitions (e.g. Brussels plaza with distinct viewpoints).
-            pass
 
         total_time = time.time() - start_time
 
