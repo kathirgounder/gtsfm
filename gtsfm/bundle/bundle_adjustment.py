@@ -75,9 +75,9 @@ class BundleAdjustmentOptions:
     calibration_prior_dist_sigma: float | Sequence[float] = 0.1
     calibration_prior_pp_sigma: float = 1e-5
     robust_noise_basin: float = 1.345
-    min_tracks_per_camera: int = 20
+    min_tracks_per_camera: int = 15
     compute_pose_covariances: bool = False
-    optimizer_relative_cost_tol: float = 1e-3
+    optimizer_relative_cost_tol: float = 1e-5
 
     def to_optimizer(self, **overrides) -> "BundleAdjustmentOptimizer":
         """Construct a :class:`BundleAdjustmentOptimizer` from these options.
@@ -144,7 +144,7 @@ class BundleAdjustmentOptimizer:
         gnc_loss: RobustBAMode | str = RobustBAMode.GMC,
         factor_weight_outlier_threshold: float = 0.0,
         min_track_length: int = 2,
-        min_tracks_per_camera: int = 20,
+        min_tracks_per_camera: int = 15,
         compute_pose_covariances: bool = False,
         optimizer_relative_cost_tol: float = 1e-5,
     ) -> None:
