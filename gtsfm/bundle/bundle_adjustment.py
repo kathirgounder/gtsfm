@@ -674,7 +674,7 @@ class BundleAdjustmentOptimizer:
         if not running_two_view_ba:
             # Add the non-BA cameras from initial_data back.
             for camera_idx in cameras_with_insufficient_tracks:
-                optimized_data.cameras_[camera_idx] = initial_data.get_camera(camera_idx)
+                optimized_data._cameras[camera_idx] = initial_data.get_camera(camera_idx)
 
         if running_two_view_ba or self._compute_pose_covariances:
             try:
