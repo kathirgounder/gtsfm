@@ -266,6 +266,10 @@ class BundleAdjustmentOptimizer:
         gnc_loss: RobustBAMode | str = RobustBAMode.GMC,
         factor_weight_outlier_threshold: float = 0.0,
         min_track_length: int = 2,
+        num_outer_ba_iterations: int = 1,
+        outer_ba_filter_scaling: bool = True,
+        outer_ba_min_track_change_frac: float = 0.001,
+        positions_only_stage1: bool = False,
     ) -> None:
         """Initializes the parameters for bundle adjustment module.
 
@@ -325,6 +329,10 @@ class BundleAdjustmentOptimizer:
             self._gnc_loss = gnc_loss
         self._factor_weight_outlier_threshold = factor_weight_outlier_threshold
         self._min_track_length = min_track_length
+        self._num_outer_ba_iterations = num_outer_ba_iterations
+        self._outer_ba_filter_scaling = outer_ba_filter_scaling
+        self._outer_ba_min_track_change_frac = outer_ba_min_track_change_frac
+        self._positions_only_stage1 = positions_only_stage1
 
     def __map_to_calibration_variable(self, camera_idx: int) -> int:
         return 0 if self._shared_calib else camera_idx
@@ -397,6 +405,26 @@ class BundleAdjustmentOptimizer:
                 )
             )
 
+        return graph
+
+    def __rotation_lock_priors(
+        self,
+        initial_data: GtsfmData,
+        cameras_to_model: List[int],
+    ) -> NonlinearFactorGraph:
+        """Tight rotation-only priors used for GLOMAP-style positions-only stage-1 BA.
+
+        Pins each camera's rotation to its current value (sigma 1e-6 on rotation tangent)
+        while leaving translation free (sigma 1e6). Calibration is locked separately via
+        the existing tight calibration prior.
+        """
+        graph = NonlinearFactorGraph()
+        sigmas = np.array([1e-6, 1e-6, 1e-6, 1e6, 1e6, 1e6], dtype=float)
+        noise_model = gtsam.noiseModel.Diagonal.Sigmas(sigmas)
+        for camera_idx in cameras_to_model:
+            camera_i = initial_data.get_camera(camera_idx)
+            assert camera_i is not None, f"Camera {camera_idx} in initial data is None"
+            graph.push_back(PriorFactorPose3(X(camera_idx), camera_i.pose(), noise_model))
         return graph
 
     def __pose_priors(
@@ -480,7 +508,11 @@ class BundleAdjustmentOptimizer:
         return graph
 
     def __construct_simple_factor_graph(
-        self, cameras_to_model: List[int], initial_data: GtsfmData, robust_noise_basin: float | None = None
+        self,
+        cameras_to_model: List[int],
+        initial_data: GtsfmData,
+        robust_noise_basin: float | None = None,
+        lock_rotations: bool = False,
     ) -> tuple[NonlinearFactorGraph, Dict[int, gtsfm_types.CAMERA_TYPE]]:
         """Construct the factor graph with just reprojection factors and calibration priors."""
 
@@ -499,6 +531,9 @@ class BundleAdjustmentOptimizer:
             self.__pose_priors(absolute_pose_priors=[], initial_data=initial_data, cameras_to_model=cameras_to_model)
         )
 
+        if lock_rotations:
+            graph.push_back(self.__rotation_lock_priors(initial_data, cameras_to_model))
+
         if self._use_first_point_prior and initial_data.number_tracks() > 0:
             graph.push_back(
                 PriorFactorPoint3(P(0), initial_data.get_track(0).point3(), Isotropic.Sigma(POINT3_DOF, 0.1))
@@ -515,11 +550,12 @@ class BundleAdjustmentOptimizer:
         absolute_pose_priors: List[Optional[PosePrior]],
         relative_pose_priors: Dict[Tuple[int, int], PosePrior],
         robust_noise_basin: float | None = None,
+        lock_rotations: bool = False,
     ) -> tuple[NonlinearFactorGraph, Dict[int, gtsfm_types.CAMERA_TYPE]]:
         """Construct the factor graph with reprojection factors, BetweenFactors, and prior factors."""
         # Create a factor graph.
         graph, cameras_without_tracks = self.__construct_simple_factor_graph(
-            cameras_to_model, initial_data, robust_noise_basin
+            cameras_to_model, initial_data, robust_noise_basin, lock_rotations=lock_rotations
         )
 
         # Add priors
@@ -713,6 +749,7 @@ class BundleAdjustmentOptimizer:
         relative_pose_priors: Dict[Tuple[int, int], PosePrior],
         reproj_error_thresh: Optional[float],
         verbose: bool = True,
+        lock_rotations: bool = False,
     ) -> Tuple[GtsfmData, GtsfmData, List[bool], float]:
         """Runs bundle adjustment and optionally filters the resulting tracks by reprojection error.
 
@@ -742,7 +779,8 @@ class BundleAdjustmentOptimizer:
 
         cameras_to_model = sorted(initial_data.get_valid_camera_indices())
         graph, cameras_without_tracks = self.__construct_factor_graph(
-            cameras_to_model, initial_data, absolute_pose_priors, relative_pose_priors
+            cameras_to_model, initial_data, absolute_pose_priors, relative_pose_priors,
+            lock_rotations=lock_rotations,
         )
         optimized_data, result_values, final_error = self.__optimize_and_recover(
             initial_data, graph, self._ordering_type if not cameras_without_tracks else "COLAMD"
@@ -846,34 +884,104 @@ class BundleAdjustmentOptimizer:
         step_times = []
         start_time = time.time()
 
-        num_ba_steps = len(self._reproj_error_thresholds)
-        assert num_ba_steps > 0, "No BA steps to perform"
+        # GLOMAP-style outer BA iteration. Mirrors global_mapper.cc:201-260 exactly:
+        #
+        #   while ite < num_outer:
+        #     run BA   (no filter)
+        #     filter_num = 0
+        #     while ite < num_outer:
+        #       scaling = max(num_outer - ite, 1)             # 3, 2, 1
+        #       filter_num += filter @ scaling * max_reproj
+        #       if filter_num > 0.1% of tracks:               # significant drop
+        #         break inner   → next outer (do BA again)
+        #       else:
+        #         ite++                                       # tighten without BA
+        #     if no significant drop ever happened: break outer (converged)
+        #     ite++
+        #
+        # This means BA count varies from 1 (early termination, tracks already settled)
+        # to num_outer (each outer iter actually needed BA after a significant filter pass).
+        # We use the LAST element of reproj_error_thresholds as the base threshold;
+        # earlier elements are ignored.
+        num_outer = max(1, self._num_outer_ba_iterations)
+        max_reproj = self._reproj_error_thresholds[-1]
+        if max_reproj is None:
+            max_reproj = 3.0  # safety: GLOMAP-default tight threshold
 
         current_data = initial_data
-        for step, reproj_error_thresh in enumerate(self._reproj_error_thresholds):
-            step_start_time = time.time()
-            (optimized_data, filtered_result, valid_mask, final_error) = self.run_ba_stage_with_filtering(
+        # Track state across iterations.
+        optimized_data = initial_data
+        filtered_result = initial_data
+        valid_mask: List[bool] = [True] * initial_data.number_tracks()
+        final_error = 0.0
+
+        ite = 0
+        while ite < num_outer:
+            # ── Stage 1: positions-only BA (rotations + intrinsics locked) ──
+            # GLOMAP-style: lets translations + landmarks settle before rotations move,
+            # which reduces BA basin variance on scenes with mirror-symmetric structure.
+            ba_start = time.time()
+            if self._positions_only_stage1:
+                logger.info("[OuterBA ite=%d] Stage 1: positions-only (rotations locked)", ite)
+                (stage1_data, _, _, _) = self.run_ba_stage_with_filtering(
+                    initial_data=current_data,
+                    absolute_pose_priors=absolute_pose_priors,
+                    relative_pose_priors=relative_pose_priors,
+                    reproj_error_thresh=None,
+                    verbose=verbose,
+                    lock_rotations=True,
+                )
+                current_data = stage1_data
+
+            # ── Stage 2: full BA (no filter — we filter ourselves below) ──
+            if self._positions_only_stage1:
+                logger.info("[OuterBA ite=%d] Stage 2: full BA", ite)
+            (optimized_data, _, _, final_error) = self.run_ba_stage_with_filtering(
                 initial_data=current_data,
                 absolute_pose_priors=absolute_pose_priors,
                 relative_pose_priors=relative_pose_priors,
-                reproj_error_thresh=reproj_error_thresh,
+                reproj_error_thresh=None,
                 verbose=verbose,
             )
-            current_data = filtered_result
-            step_times.append(time.time() - step_start_time)
+            current_data = optimized_data
+            step_times.append(time.time() - ba_start)
 
-            # Print intermediate results.
-            if num_ba_steps > 1:
+            # ── Inner filter loop: tighten scaling, only re-BA if significant filter drop ──
+            initial_tracks_for_iter = current_data.number_tracks()
+            filter_num = 0
+            status = True  # True == "no significant drop yet at any scaling"
+
+            while status and ite < num_outer:
+                scaling = max(num_outer - ite, 1)
+                thresh = scaling * max_reproj
+                before = current_data.number_tracks()
+                filtered_result, valid_mask = current_data.filter_landmarks(thresh)
+                after = filtered_result.number_tracks()
+                dropped = before - after
+                filter_num += dropped
+                current_data = filtered_result
+
                 logger.info(
-                    "[BA Stage @ thresh=%.2f px %d/%d] Error: %.2f, Number of tracks: %d"
-                    % (
-                        reproj_error_thresh if reproj_error_thresh is not None else float("nan"),
-                        step + 1,
-                        num_ba_steps,
-                        final_error,
-                        filtered_result.number_tracks(),
-                    )
+                    "[OuterBA ite=%d/%d, scaling=%dx (thresh=%.2fpx)] dropped %d (cumul %d / %.2f%%), tracks=%d",
+                    ite, num_outer, scaling, thresh, dropped, filter_num,
+                    100 * filter_num / max(initial_tracks_for_iter, 1), after,
                 )
+
+                if filter_num > self._outer_ba_min_track_change_frac * initial_tracks_for_iter:
+                    # Significant drop — re-run BA next outer iter.
+                    status = False
+                else:
+                    # Few changes — tighten scaling without re-running BA.
+                    ite += 1
+
+            if status:
+                logger.info(
+                    "[OuterBA] converged after iter ite=%d: filtered %d tracks (<%.3f%% threshold) — exit outer.",
+                    ite, filter_num, 100 * self._outer_ba_min_track_change_frac,
+                )
+                break
+
+            ite += 1  # mirrors GLOMAP's outer for-loop increment
 
         total_time = time.time() - start_time
 

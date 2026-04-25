@@ -15,8 +15,10 @@ image_pairs_generator:
       _target_: gtsfm.frontend.global_descriptor.MegaLoc
   retriever:
     _target_: gtsfm.retriever.Similarity
-    num_matched: 50
-    min_score: 0.25
+    num_matched: 100
+    min_score: 0.15
+    use_diffusion_preprocessing: false
+    use_mst_augmentation: false
   batch_size: 16
 
 graph_partitioner:
@@ -113,13 +115,27 @@ cluster_optimizer:
 
     bundle_adjustment_module:
       _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptimizer
-      reproj_error_thresholds: [10, 5, 3]
+      # We use the LAST element as base; earlier elements ignored under the
+      # GLOMAP outer-loop scheme. Filter threshold = scaling * last value.
+      reproj_error_thresholds: [3]
       robust_ba_mode: "HUBER"
       shared_calib: False
       cam_pose3_prior_noise_sigma: 0.1
       calibration_prior_focal_sigma: 200.0
       measurement_noise_sigma: 1.0
       use_calibration_prior: true
+      # GLOMAP-style outer iteration (global_mapper.cc:201-260):
+      # Outer iter: run BA → filter @ scaling * 3px (scaling=3,2,1).
+      # If filter dropped >0.1% tracks → re-BA next iter at tighter scaling.
+      # If filter dropped <0.1% → tighten scaling without re-running BA.
+      # Exit when no significant filter ever happens.
+      num_outer_ba_iterations: 3
+      outer_ba_min_track_change_frac: 0.001
+      # Positions-only stage 1 BA is implemented but disabled by default:
+      # tested on Brussels and slightly hurt — locking rotations to a
+      # suboptimal RA basin prevents BA from escaping it. The single-stage
+      # outer loop's bigger BA step is doing the real work on Brussels.
+      positions_only_stage1: false
 
   dense_multiview_optimizer: null
   gaussian_splatting_optimizer: null

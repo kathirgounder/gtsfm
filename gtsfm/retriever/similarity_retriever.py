@@ -23,6 +23,140 @@ logger = logger_utils.get_logger()
 MAX_NUM_IMAGES = 10000
 
 
+class _UnionFind:
+    """Disjoint-set with path compression + union by rank, for Kruskal's MST."""
+    def __init__(self, n: int) -> None:
+        self.parent = list(range(n))
+        self.rank = [0] * n
+
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, x: int, y: int) -> bool:
+        rx, ry = self.find(x), self.find(y)
+        if rx == ry:
+            return False
+        if self.rank[rx] < self.rank[ry]:
+            rx, ry = ry, rx
+        self.parent[ry] = rx
+        if self.rank[rx] == self.rank[ry]:
+            self.rank[rx] += 1
+        return True
+
+
+def build_mst_augment_edges(
+    W: np.ndarray, mst_min_score: float = 0.20, num_msts: int = 2
+) -> set:
+    """Build k minimum spanning forests over edges with similarity >= mst_min_score,
+    returning the union of edges. Use as a connectivity-augmenting overlay on kNN
+    pairs — guarantees the chosen subgraph spans all nodes (modulo the floor).
+
+    Edge weight = 1 - similarity, so MST picks highest-similarity bridges.
+    Each subsequent MST excludes prior-tree edges → k structurally-distinct trees.
+
+    Input:
+      W: (N, N) similarity matrix (asymmetric or symmetric; symmetrized internally).
+      mst_min_score: weak floor for MST candidate edges.
+      num_msts: number of trees (k=2 for redundancy; k=1 for minimal sparsity).
+
+    Returns:
+      Set of (i, j) edges (i < j), unionized across the k MSTs.
+    """
+    W = np.asarray(W, dtype=np.float64)
+    W = np.maximum(W, W.T)
+    np.fill_diagonal(W, -np.inf)
+    N = W.shape[0]
+
+    candidates = []
+    sims = []
+    for i in range(N):
+        for j in range(i + 1, N):
+            s = W[i, j]
+            if not np.isinf(s) and s >= mst_min_score:
+                candidates.append((i, j))
+                sims.append(s)
+    if not candidates:
+        return set()
+    weights = 1.0 - np.array(sims, dtype=np.float64)
+    order = np.argsort(weights, kind="stable")
+
+    selected = set()
+    for _ in range(num_msts):
+        uf = _UnionFind(N)
+        this_tree = []
+        for idx in order:
+            e = candidates[idx]
+            if e in selected:
+                continue
+            if uf.union(e[0], e[1]):
+                this_tree.append(e)
+                if len(this_tree) == N - 1:
+                    break
+        if not this_tree:
+            break
+        for e in this_tree:
+            selected.add(e)
+    return selected
+
+
+def diffuse_view_graph(W: np.ndarray, beta: float = 0.4, num_hops: int = 3) -> np.ndarray:
+    """Reinforce a view-graph similarity matrix using Katz-style polynomial diffusion.
+
+    Boosts the score of edges (i, j) that participate in many high-confidence
+    triangles / 3-hop paths, and damps edges with no such support. Lets the
+    downstream top-K + min_score filter pick a cleaner subgraph.
+
+    Input:
+      W:  (N, N) numpy array of pairwise similarity scores, e.g. cosine on L2-
+          normalized MegaLoc descriptors. Can be asymmetric, upper-triangular,
+          or symmetric — we symmetrize internally. Diagonal is ignored.
+      beta: decay factor for longer paths (0.2-0.6 recommended).
+            Lower = trust direct similarities more (less smoothing).
+            Higher = trust multi-hop paths more (more smoothing).
+      num_hops: how many path lengths to sum (3 = direct + 2-hop + 3-hop).
+
+    Output:
+      W_reinforced: (N, N) symmetric matrix of reinforced similarities,
+                    rescaled so its max equals max(W). Drop-in replacement for
+                    the input — existing min_score thresholds remain meaningful.
+    """
+    W = np.asarray(W, dtype=np.float64)
+    N = W.shape[0]
+
+    # 1. Symmetrize and zero diagonal.
+    W = np.maximum(W, W.T)
+    np.fill_diagonal(W, 0.0)
+
+    # 2. Row-normalize to a row-stochastic transition matrix P.
+    #    Keeps matrix powers bounded; gives the polynomial a random-walk
+    #    interpretation: P^k[i, j] = probability of reaching j from i in k hops.
+    row_sums = W.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0
+    P = W / row_sums
+
+    # 3. Decaying polynomial: W_acc = sum_{k=1..num_hops} beta^(k-1) * P^k
+    W_acc = np.zeros((N, N), dtype=np.float64)
+    P_power = np.eye(N)
+    decay = 1.0
+    for _ in range(num_hops):
+        P_power = P_power @ P
+        W_acc += decay * P_power
+        decay *= beta
+
+    # 4. Symmetrize the accumulator (P^k is asymmetric).
+    W_acc = 0.5 * (W_acc + W_acc.T)
+
+    # 5. Rescale to match the input's range so existing thresholds still apply.
+    np.fill_diagonal(W_acc, 0.0)
+    if W_acc.max() > 0 and W.max() > 0:
+        W_acc = W_acc * (W.max() / W_acc.max())
+
+    return W_acc
+
+
 @dataclass
 class SubBlockSimilarityResult:
     i_start: int
@@ -33,16 +167,42 @@ class SubBlockSimilarityResult:
 
 
 class SimilarityRetriever(RetrieverBase):
-    def __init__(self, num_matched: int, min_score: float = 0.1, blocksize: int = 50) -> None:
+    def __init__(
+        self,
+        num_matched: int,
+        min_score: float = 0.1,
+        blocksize: int = 50,
+        use_diffusion_preprocessing: bool = False,
+        diffusion_beta: float = 0.4,
+        diffusion_num_hops: int = 3,
+        use_mst_augmentation: bool = False,
+        mst_min_score: float = 0.20,
+        num_msts: int = 2,
+    ) -> None:
         """
         Args:
-            num_matched: Number of K potential matches to provide per query. These are the top "K" matches per query.
-            min_score: Minimum allowed similarity score to accept a match.
-            blocksize: Size of matching sub-blocks when creating similarity matrix.
+            num_matched: Top-K matches per query for kNN pair selection.
+            min_score: Minimum allowed similarity score for kNN pairs.
+            blocksize: Block size for similarity matrix sub-block computation.
+            use_diffusion_preprocessing: Apply Katz polynomial diffusion to W before
+                top-K + min_score selection. Reinforces edges with triangle support.
+            diffusion_beta / diffusion_num_hops: see diffuse_view_graph().
+            use_mst_augmentation: Add union of k minimum spanning trees on top of the
+                kNN pair set. Guarantees graph connectivity via highest-similarity
+                bridges, even if some bridge edges score below `min_score`. Independent
+                of diffusion — both can be combined.
+            mst_min_score: Weak floor for MST candidate edges.
+            num_msts: Number of trees (k=2 typical).
         """
         self._num_matched = num_matched
         self._blocksize = blocksize
         self._min_score = min_score
+        self._use_diffusion_preprocessing = use_diffusion_preprocessing
+        self._diffusion_beta = diffusion_beta
+        self._diffusion_num_hops = diffusion_num_hops
+        self._use_mst_augmentation = use_mst_augmentation
+        self._mst_min_score = mst_min_score
+        self._num_msts = num_msts
         self._latest_similarity_matrix: Optional[torch.Tensor] = None
 
     def __repr__(self) -> str:
@@ -51,6 +211,7 @@ class SimilarityRetriever(RetrieverBase):
             Num. frames matched: {self._num_matched}
             Block size: {self._blocksize}
             Minimum score: {self._min_score}
+            Diffusion: enabled={self._use_diffusion_preprocessing} beta={self._diffusion_beta} hops={self._diffusion_num_hops}
         """
 
     def set_num_matched(self, n) -> None:
@@ -175,10 +336,59 @@ class SimilarityRetriever(RetrieverBase):
         # Avoid self-matching and disallow lower triangular portion
         is_invalid_mat = ~np.triu(np.ones((num_images, num_images), dtype=bool))
         np.fill_diagonal(a=is_invalid_mat, val=True)
+
+        # Optional diffusion preprocessing: reinforce edges with multi-hop path
+        # support before applying top-K + min_score. Raw `sim` is preserved for
+        # diagnostic export via save_diagnostics().
+        if self._use_diffusion_preprocessing:
+            sim_np = sim.detach().cpu().numpy()
+            sim_reinforced = diffuse_view_graph(
+                sim_np, beta=self._diffusion_beta, num_hops=self._diffusion_num_hops
+            )
+            if plots_output_dir is not None:
+                os.makedirs(plots_output_dir, exist_ok=True)
+                np.savetxt(
+                    fname=str(plots_output_dir / "similarity_matrix_reinforced.txt"),
+                    X=sim_reinforced, fmt="%.4f", delimiter=",",
+                )
+            logger.info(
+                "Diffusion preprocessing applied: beta=%.2f, hops=%d. raw max=%.3f, "
+                "reinforced max=%.3f, mean lift=%.3f",
+                self._diffusion_beta, self._diffusion_num_hops,
+                float(sim_np.max()), float(sim_reinforced.max()),
+                float((sim_reinforced - np.maximum(sim_np, sim_np.T)).mean()),
+            )
+            sim_for_selection = torch.from_numpy(sim_reinforced).to(sim.device).type_as(sim)
+        else:
+            sim_for_selection = sim
+
         pairs = pairs_from_score_matrix(
-            sim, invalid=is_invalid_mat, num_select=self._num_matched, min_score=self._min_score
+            sim_for_selection, invalid=is_invalid_mat,
+            num_select=self._num_matched, min_score=self._min_score,
         )
-        logger.info("Found %d pairs from the Similarity Retriever.", len(pairs))
+        n_knn = len(pairs)
+
+        # Optional MST augmentation: union the kNN pair set with edges from k MSTs
+        # over the raw similarity matrix (with mst_min_score floor). MSTs guarantee
+        # global connectivity via highest-similarity bridges, even if those bridge
+        # edges scored below `min_score` and were rejected by kNN.
+        if self._use_mst_augmentation:
+            mst_edges = build_mst_augment_edges(
+                sim.detach().cpu().numpy(),
+                mst_min_score=self._mst_min_score,
+                num_msts=self._num_msts,
+            )
+            knn_set = set((min(i, j), max(i, j)) for (i, j) in pairs)
+            mst_only = mst_edges - knn_set
+            pairs = sorted(knn_set | mst_edges)
+            logger.info(
+                "MST augmentation: kNN=%d pairs + MST adds %d new pairs (%d total). "
+                "mst_min_score=%.2f, num_msts=%d",
+                n_knn, len(mst_only), len(pairs),
+                self._mst_min_score, self._num_msts,
+            )
+        else:
+            logger.info("Found %d pairs from the Similarity Retriever.", n_knn)
         return pairs
 
     def save_diagnostics(
