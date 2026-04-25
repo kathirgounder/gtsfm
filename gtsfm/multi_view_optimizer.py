@@ -194,6 +194,7 @@ class MultiViewOptimizer:
             # Path B: Global positioner replaces trans_avg + data_assoc.
             ba_input_graph, gp_metrics = delayed(self.global_positioner.run, nout=2)(
                 num_images, delayed_wRi, tracks2d_graph, all_intrinsics,
+                output_root=output_root,
             )
             ta_metrics = gp_metrics
             data_assoc_metrics_graph = delayed(GtsfmMetricsGroup)("data_association_metrics", [])
