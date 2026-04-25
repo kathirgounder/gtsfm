@@ -779,16 +779,16 @@ wheels = [
 
 [[package]]
 name = "gtsam-develop"
-version = "4.3a1.dev202603090403"
+version = "4.3a1.dev202604240153"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "pytest" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/17/6d/2b643109654d967bdfff721b4d68d4dd606050ad8b0986ba9733bb80c712/gtsam_develop-4.3a1.dev202603090403-cp312-cp312-macosx_10_15_universal2.whl", hash = "sha256:796db0c4e43532555471ed942d3bc2a086d796203c9ddc3265ee0952053b97f2", size = 40361647, upload-time = "2026-03-09T04:46:49.76Z" },
-    { url = "https://files.pythonhosted.org/packages/95/57/e23378236435385a749f7929a9ed43a14bf848a13a479f3525be55401891/gtsam_develop-4.3a1.dev202603090403-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:54cb9fac1d794ec65e19763895704fa74dfd992c06f65d068ae1b06f799578c5", size = 28581917, upload-time = "2026-03-09T04:46:52.522Z" },
-    { url = "https://files.pythonhosted.org/packages/8d/77/5cff4bca2c936bedc8bc576db0b5dce2750b4e7831257beb32909eea5ef1/gtsam_develop-4.3a1.dev202603090403-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:79bcbc23889b7dc289b62938bb96da8d6d93728824b9a83636bc993d4bec131d", size = 29907408, upload-time = "2026-03-09T04:46:55.76Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/f0/ef174952c8ee654536b7e03d82196a8b35f2ffc00755e125a2b1fbe113c7/gtsam_develop-4.3a1.dev202604240153-cp312-cp312-macosx_10_15_universal2.whl", hash = "sha256:2f79d4fdf7acbbaf47cccb15bdc5a8a6d0cc42e3d9372999e0b8dd8f35039f1a", size = 41381638, upload-time = "2026-04-24T02:54:29.027Z" },
+    { url = "https://files.pythonhosted.org/packages/4a/85/afafe81e8fb0ab6ae204c97960f6a6df5476edc4ce20f171d88c6e3070cf/gtsam_develop-4.3a1.dev202604240153-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:f1625828122764ecf02f9337c97f31ca5193700262414bb9a42ea2244d03606f", size = 29265671, upload-time = "2026-04-24T02:54:35.989Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/e7/902fe4fb7d8f97801047298eec75c3f65900c288462d06398358b3799b3a/gtsam_develop-4.3a1.dev202604240153-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:79e6bc7581f24f35a9cf1f7ea44cfa8931fca03b609e5c2441db164ed2b9be4e", size = 30660189, upload-time = "2026-04-24T02:54:38.773Z" },
 ]
 
 [[package]]
@@ -905,7 +905,7 @@ requires-dist = [
     { name = "etils", specifier = "==1.7.0" },
     { name = "flask", specifier = ">=3.0,<4.0" },
     { name = "gsplat", specifier = "==1.5.3" },
-    { name = "gtsam-develop", specifier = "==4.3a1.dev202603090403" },
+    { name = "gtsam-develop", specifier = "==4.3a1.dev202604240153" },
     { name = "h5py" },
     { name = "huggingface-hub", extras = ["torch"], specifier = "==0.34.4" },
     { name = "hydra-core" },
@@ -2803,8 +2803,8 @@ dependencies = [
     { name = "typing-extensions", marker = "sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:6bba7dca5d9a729f1e8e9befb98055498e551efaf5ed034824c168b560afc1ac" },
-    { url = "https://download.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:7c0f08d1c44a02abad389373dddfce75904b969a410be2f4e5109483dd3dc0ce" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:6bba7dca5d9a729f1e8e9befb98055498e551efaf5ed034824c168b560afc1ac", upload-time = "2025-05-14T03:37:30Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.7.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:7c0f08d1c44a02abad389373dddfce75904b969a410be2f4e5109483dd3dc0ce", upload-time = "2025-04-22T18:20:33Z" },
 ]
 
 [[package]]
@@ -2824,7 +2824,7 @@ dependencies = [
     { name = "typing-extensions", marker = "sys_platform == 'darwin'" },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cpu/torch-2.7.1-cp312-none-macosx_11_0_arm64.whl", hash = "sha256:7b4f8b2b83bd08f7d399025a9a7b323bdbb53d20566f1e0d584689bb92d82f9a" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.7.1-cp312-none-macosx_11_0_arm64.whl", hash = "sha256:7b4f8b2b83bd08f7d399025a9a7b323bdbb53d20566f1e0d584689bb92d82f9a", upload-time = "2025-06-03T18:28:06Z" },
 ]
 
 [[package]]
@@ -2877,7 +2877,7 @@ dependencies = [
     { name = "torch", version = "2.7.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cu128/torchvision-0.22.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:6e9752b48c1cdd7f6428bcd30c3d198b30ecea348d16afb651f95035e5252506" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.22.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:6e9752b48c1cdd7f6428bcd30c3d198b30ecea348d16afb651f95035e5252506", upload-time = "2025-04-22T18:30:21Z" },
 ]
 
 [[package]]
@@ -2893,7 +2893,7 @@ dependencies = [
     { name = "torch", version = "2.7.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (platform_python_implementation != 'CPython' and sys_platform == 'linux')" },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cu128/torchvision-0.22.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:06c101f40e1ff94869be14487c91fd5352e376f202fdeafb8f53c58cee2fbeb5" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.22.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:06c101f40e1ff94869be14487c91fd5352e376f202fdeafb8f53c58cee2fbeb5", upload-time = "2025-04-22T18:30:20Z" },
 ]
 
 [[package]]
@@ -2909,7 +2909,7 @@ dependencies = [
     { name = "torch", version = "2.7.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cpu/torchvision-0.22.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:153f1790e505bd6da123e21eee6e83e2e155df05c0fe7d56347303067d8543c5" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.22.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:153f1790e505bd6da123e21eee6e83e2e155df05c0fe7d56347303067d8543c5", upload-time = "2025-06-03T18:37:22Z" },
 ]
 
 [[package]]

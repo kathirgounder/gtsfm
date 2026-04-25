@@ -50,6 +50,7 @@ import gtsfm.utils.logger as logger_utils
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.common.sfm_track import SfmTrack2d
 from gtsfm.evaluation.metrics import GtsfmMetric, GtsfmMetricsGroup
+from gtsfm.utils.tracks import compute_world_directions, filter_tracks_by_measurements
 
 logger = logger_utils.get_logger()
 
@@ -59,54 +60,6 @@ DEFAULT_DIRECTION_NOISE_SIGMA = 0.01
 DEFAULT_MAX_ITERATIONS = 100
 DEFAULT_MAX_REPROJ_ERROR = 5.0
 DEFAULT_MAX_TRACKS = 0
-
-
-def compute_world_directions(
-    tracks_2d: List[SfmTrack2d],
-    intrinsics: List[Optional[gtsfm_types.CALIBRATION_TYPE]],
-    wRi_list: List[Optional[Rot3]],
-    valid_cameras: Set[int],
-) -> List[Tuple[int, int, np.ndarray]]:
-    """Compute world-frame unit directions from each camera to each observed track point."""
-    observations = []
-    for track_idx, track in enumerate(tracks_2d):
-        for m_idx in range(track.number_measurements()):
-            m = track.measurement(m_idx)
-            cam_idx, uv = m.i, m.uv
-            if cam_idx not in valid_cameras:
-                continue
-            wRi, Ki = wRi_list[cam_idx], intrinsics[cam_idx]
-            if wRi is None or Ki is None:
-                continue
-            try:
-                normalized_pt = Ki.calibrate(uv)
-            except RuntimeError:
-                continue
-            camera_ray = np.array([normalized_pt[0], normalized_pt[1], 1.0])
-            camera_ray /= np.linalg.norm(camera_ray)
-            world_dir = wRi.rotate(Point3(*camera_ray))
-            wd = np.array([world_dir[0], world_dir[1], world_dir[2]])
-            norm = np.linalg.norm(wd)
-            if norm < 1e-12:
-                continue
-            observations.append((track_idx, cam_idx, wd / norm))
-    return observations
-
-
-def filter_tracks(tracks_2d, valid_cameras, min_measurements=MIN_TRACK_MEASUREMENTS, max_tracks=DEFAULT_MAX_TRACKS):
-    """Keep tracks with >= min_measurements valid observations, preferring longer tracks."""
-    scored = []
-    for track in tracks_2d:
-        valid_count = sum(
-            1 for m_idx in range(track.number_measurements())
-            if track.measurement(m_idx).i in valid_cameras
-        )
-        if valid_count >= min_measurements:
-            scored.append((valid_count, track))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    if max_tracks > 0 and len(scored) > max_tracks:
-        scored = scored[:max_tracks]
-    return [track for _, track in scored]
 
 
 def _build_inputs(
@@ -354,7 +307,9 @@ class GlobalPositioner:
 
         logger.info("GlobalPositioner: %d valid cameras, %d input tracks.", len(valid_cameras), len(tracks_2d))
 
-        filtered_tracks = filter_tracks(tracks_2d, valid_cameras, self._min_track_measurements, self._max_tracks)
+        filtered_tracks = filter_tracks_by_measurements(
+            tracks_2d, valid_cameras, self._min_track_measurements, self._max_tracks,
+        )
         logger.info("GlobalPositioner: %d tracks after filtering.", len(filtered_tracks))
         if not filtered_tracks:
             logger.error("GlobalPositioner: no tracks survived filtering.")
