@@ -7,7 +7,7 @@ import itertools
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
-from gtsam import PinholeCameraCal3Bundler, Point3, Rot3, SfmTrack, Unit3  # type: ignore
+from gtsam import PinholeCameraCal3Bundler, Point3, Rot3, SfmTrack  # type: ignore
 
 import gtsfm.common.types as gtsfm_types
 from gtsfm.common.sfm_track import SfmMeasurement, SfmTrack2d

@@ -394,8 +394,10 @@ class GlobalPositioner:
             GtsfmMetric("total_duration_sec", total_duration),
         ])
 
-        logger.info("GlobalPositioner: done in %.2fs — %d cameras, %d tracks.",
-                     total_duration,
-                     len(gtsfm_data.get_valid_camera_indices()) if gtsfm_data else 0,
-                     gtsfm_data.number_tracks() if gtsfm_data else 0)
+        logger.info(
+            "GlobalPositioner: done in %.2fs — %d cameras, %d tracks.",
+            total_duration,
+            len(gtsfm_data.get_valid_camera_indices()) if gtsfm_data else 0,
+            gtsfm_data.number_tracks() if gtsfm_data else 0,
+        )
         return gtsfm_data, metrics
