@@ -10,6 +10,9 @@ import timeit
 from pathlib import Path
 from typing import List, Optional, Sequence, Set, Tuple, Union
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns  # type: ignore
