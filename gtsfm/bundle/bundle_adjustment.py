@@ -33,6 +33,7 @@ from gtsfm.data_association.point3d_initializer import (
     TriangulationOptions,
     TriangulationSamplingMode,
 )
+from gtsfm.data_association.recursive_triangulator import triangulate_track_recursive
 from gtsfm.evaluation.metrics import GtsfmMetric, GtsfmMetricsGroup
 
 METRICS_GROUP = "bundle_adjustment_metrics"
@@ -242,6 +243,8 @@ def multi_view_retriangulate_from_2d_tracks(
     tracks_2d: List["SfmTrack2d"],
     triangulation_options: Optional[TriangulationOptions] = None,
     min_track_length: int = 3,
+    use_recursive_splitter: bool = False,
+    recursive_max_depth: int = 5,
 ) -> GtsfmData:
     """GLOMAP-style multi-view retriangulation.
 
@@ -261,6 +264,12 @@ def multi_view_retriangulate_from_2d_tracks(
         min_track_length: Drop tracks with fewer measurements than this (input + output).
             5e1183e1 found 3 best for British Museum — pure 2-view tracks flood BA with
             weak constraints. Brussels' bimodal scene may benefit from 2 (Phase 2 sweep).
+        use_recursive_splitter: When True, use COLMAP-paper Section 4.3 recursive
+            triangulation. Each input track may produce *multiple* output 3D points if it
+            was a faulty union-find merge. Targets repetitive-feature scenes (Brussels'
+            bimodal plaza, BM's colonnade, Pantheon's columns).
+        recursive_max_depth: Max recursive splits per input track (only used when
+            use_recursive_splitter=True). Default 5.
 
     Returns:
         New GtsfmData with same cameras and an augmented track set.
@@ -285,6 +294,7 @@ def multi_view_retriangulate_from_2d_tracks(
     n_no_cams = 0
     n_short_output = 0
     n_triangulation_failed = 0
+    n_split_into_multiple = 0  # how many input tracks produced > 1 output (recursive only)
     for track_2d in tracks_2d:
         if track_2d.number_measurements() < min_track_length:
             n_short_input += 1
@@ -294,22 +304,49 @@ def multi_view_retriangulate_from_2d_tracks(
             n_no_cams += 1
             continue
         track_2d_filtered = SfmTrack2d(measurements=valid_measurements)
-        new_track, _, _ = initializer.triangulate(track_2d_filtered)
-        if new_track is None:
-            n_triangulation_failed += 1
-            continue
-        if new_track.numberMeasurements() < min_track_length:
-            n_short_output += 1
-            continue
-        out.add_track(new_track)
-        n_kept += 1
 
-    logger.info(
-        "Multi-view retriangulation: %d kept / %d input (min_len=%d): "
-        "%d short_in, %d no_cams, %d tri_failed, %d short_out.",
-        n_kept, n_in, min_track_length, n_short_input, n_no_cams,
-        n_triangulation_failed, n_short_output,
-    )
+        if use_recursive_splitter:
+            new_tracks = triangulate_track_recursive(
+                track_2d_filtered, initializer,
+                min_consensus_size=min_track_length,
+                max_recursion_depth=recursive_max_depth,
+            )
+            if not new_tracks:
+                n_triangulation_failed += 1
+                continue
+            if len(new_tracks) > 1:
+                n_split_into_multiple += 1
+            for new_track in new_tracks:
+                if new_track.numberMeasurements() < min_track_length:
+                    n_short_output += 1
+                    continue
+                out.add_track(new_track)
+                n_kept += 1
+        else:
+            new_track, _, _ = initializer.triangulate(track_2d_filtered)
+            if new_track is None:
+                n_triangulation_failed += 1
+                continue
+            if new_track.numberMeasurements() < min_track_length:
+                n_short_output += 1
+                continue
+            out.add_track(new_track)
+            n_kept += 1
+
+    if use_recursive_splitter:
+        logger.info(
+            "Multi-view retriangulation (recursive): %d kept / %d input (min_len=%d): "
+            "%d short_in, %d no_cams, %d tri_failed, %d short_out, %d input tracks split into >1 output.",
+            n_kept, n_in, min_track_length, n_short_input, n_no_cams,
+            n_triangulation_failed, n_short_output, n_split_into_multiple,
+        )
+    else:
+        logger.info(
+            "Multi-view retriangulation: %d kept / %d input (min_len=%d): "
+            "%d short_in, %d no_cams, %d tri_failed, %d short_out.",
+            n_kept, n_in, min_track_length, n_short_input, n_no_cams,
+            n_triangulation_failed, n_short_output,
+        )
     return out
 
 
@@ -355,6 +392,8 @@ class BundleAdjustmentOptimizer:
         use_multi_view_retriangulation: bool = False,
         mv_retri_min_track_length: int = 3,
         mv_retri_reproj_error_thresh: float = 10.0,
+        mv_retri_use_recursive_splitter: bool = False,
+        mv_retri_recursive_max_depth: int = 5,
     ) -> None:
         """Initializes the parameters for bundle adjustment module.
 
@@ -423,6 +462,12 @@ class BundleAdjustmentOptimizer:
         self._use_multi_view_retriangulation = use_multi_view_retriangulation
         self._mv_retri_min_track_length = mv_retri_min_track_length
         self._mv_retri_reproj_error_thresh = mv_retri_reproj_error_thresh
+        # Phase 2: COLMAP paper §4.3 recursive triangulation splitter. When True, each
+        # input 2D track may produce multiple 3D points if it was a faulty union-find
+        # merge. Targets repetitive-feature scenes (Brussels bimodal, BM colonnade,
+        # Pantheon columns). See gtsfm/data_association/recursive_triangulator.py.
+        self._mv_retri_use_recursive_splitter = mv_retri_use_recursive_splitter
+        self._mv_retri_recursive_max_depth = mv_retri_recursive_max_depth
 
     def __map_to_calibration_variable(self, camera_idx: int) -> int:
         return 0 if self._shared_calib else camera_idx
@@ -1102,6 +1147,8 @@ class BundleAdjustmentOptimizer:
                     tracks_2d=tracks_2d,
                     triangulation_options=retri_options,
                     min_track_length=self._mv_retri_min_track_length,
+                    use_recursive_splitter=self._mv_retri_use_recursive_splitter,
+                    recursive_max_depth=self._mv_retri_recursive_max_depth,
                 )
                 logger.info(
                     "[Retri] %d → %d tracks (%.1f%%) after retriangulation, took %.1fs",

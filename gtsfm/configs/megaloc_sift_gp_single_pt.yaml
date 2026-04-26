@@ -148,6 +148,12 @@ cluster_optimizer:
       use_multi_view_retriangulation: true
       mv_retri_min_track_length: 3
       mv_retri_reproj_error_thresh: 10.0
+      # Phase 2: COLMAP §4.3 recursive triangulation splitter. Each input 2D track
+      # may produce multiple 3D points if union-find falsely merged independent
+      # observations. Targets repetitive-feature scenes (Brussels bimodal, BM
+      # colonnade, Pantheon columns). Default false — flip to true to test.
+      mv_retri_use_recursive_splitter: false
+      mv_retri_recursive_max_depth: 5
 
   dense_multiview_optimizer: null
   gaussian_splatting_optimizer: null
