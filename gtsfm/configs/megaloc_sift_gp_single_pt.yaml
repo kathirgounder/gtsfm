@@ -15,8 +15,8 @@ image_pairs_generator:
       _target_: gtsfm.frontend.global_descriptor.MegaLoc
   retriever:
     _target_: gtsfm.retriever.Similarity
-    num_matched: 100
-    min_score: 0.15
+    num_matched: 15
+    min_score: 0.45
     use_diffusion_preprocessing: false
     use_mst_augmentation: false
   batch_size: 16
@@ -80,6 +80,11 @@ cluster_optimizer:
     rot_avg_module:
       _target_: gtsfm.averaging.rotation.shonan.ShonanRotationAveraging
       weight_by_inliers: True
+      # Set to true ONLY when Shonan hangs (e.g., Pantheon's repetitive colonnade
+      # causes rank escalation). Skips Shonan's SDP iteration; uses chordal init
+      # + Geman-McClure LM refinement (GLOMAP-style: weight_type=GEMAN_MCCLURE,
+      # irls_loss_parameter_sigma=5°, max_num_irls_iterations=100).
+      chordal_only: true
 
     trans_avg_module:
       _target_: gtsfm.averaging.translation.averaging_1dsfm.TranslationAveraging1DSFM
