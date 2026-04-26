@@ -252,12 +252,17 @@ class MultiViewOptimizer:
                 images,
             )
 
+        # Use the full union-find 2D track set for retri (recovers tracks dropped by GP/BA).
+        # Path A (trans_avg): use the trans-avg-inlier-filtered subset since that's what BA saw.
+        # Path B (global_positioner): use the unfiltered viewgraph track set.
+        retri_tracks_2d_graph = tracks2d_graph if self.global_positioner is not None else ta_inlier_tracks_2d_graph
         ba_result_graph, ba_metrics_graph = self.ba_optimizer.create_computation_graph(
             ba_input_graph,
             absolute_pose_priors,
             pose_priors_graph,
             cameras_gt,
             save_dir=str(output_root) if output_root else None,
+            tracks_2d=retri_tracks_2d_graph,  # Full 2D track set — used if multi-view retri is enabled.
         )
 
         multiview_optimizer_metrics_graph = [

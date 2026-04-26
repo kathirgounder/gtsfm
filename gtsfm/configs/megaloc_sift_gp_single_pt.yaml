@@ -136,6 +136,13 @@ cluster_optimizer:
       # suboptimal RA basin prevents BA from escaping it. The single-stage
       # outer loop's bigger BA step is doing the real work on Brussels.
       positions_only_stage1: false
+      # GLOMAP-style multi-view retriangulation: after the outer BA loop converges,
+      # re-triangulate the full 2D track set from union-find with post-BA cameras,
+      # then run a final BA on the augmented set. Recovers tracks that were dropped
+      # between union-find (~46K) and BA's filter passes (~14K). See plan Phase 1.
+      use_multi_view_retriangulation: true
+      mv_retri_min_track_length: 3
+      mv_retri_reproj_error_thresh: 10.0
 
   dense_multiview_optimizer: null
   gaussian_splatting_optimizer: null

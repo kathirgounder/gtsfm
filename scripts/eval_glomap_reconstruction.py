@@ -40,22 +40,43 @@ def _img_to_pose(img) -> Pose3:
 
 
 def _match_recons(
-    gt: pycolmap.Reconstruction, comp: pycolmap.Reconstruction
-) -> tuple[Dict[int, Pose3], Dict[int, Pose3], list[str]]:
-    """Match registered images between two reconstructions, tolerant of naming schemes.
+    gt: pycolmap.Reconstruction,
+    comp: pycolmap.Reconstruction,
+    benchmark_image_names: set[str] | None = None,
+) -> tuple[Dict[int, Pose3], Dict[int, Pose3 | None], list[str]]:
+    """Match images between two reconstructions, tolerant of naming schemes.
 
-    Tries two strategies in order:
-    1. Match by image name (GLOMAP vs GT — both use real filenames)
-    2. Match by image_id (GTSFM's ba_input uses synthetic 'image_000001.jpg' names
-       but preserves image_id from the COLMAP loader's ordering)
+    If `benchmark_image_names` is provided, evaluation is anchored on that name set
+    (GT must contain all of them; computed entries that are missing are returned
+    as None so AUC penalizes dropped cameras). This is the *honest* mode used for
+    sparse-viewgraph stress tests where GLOMAP may fail to register many cams.
+
+    If `benchmark_image_names` is None, falls back to the legacy "intersection only"
+    behavior — useful when both recons are expected to register the same set.
+
+    Tries two strategies in order: by image name, then by image_id.
     """
     gt_by_name = {gt.image(i).name: _img_to_pose(gt.image(i)) for i in gt.reg_image_ids()}
     comp_by_name = {comp.image(i).name: _img_to_pose(comp.image(i)) for i in comp.reg_image_ids()}
+
+    if benchmark_image_names is not None:
+        # Honest mode: evaluate over the full benchmark image set.
+        gt_full_by_name = {gt.image(i).name: _img_to_pose(gt.image(i)) for i in gt.reg_image_ids()}
+        ordered_names = sorted(benchmark_image_names & set(gt_full_by_name))
+        if len(ordered_names) < 3:
+            raise RuntimeError(
+                f"Too few benchmark images present in GT: {len(ordered_names)} of "
+                f"{len(benchmark_image_names)} requested ({len(gt_full_by_name)} GT total)."
+            )
+        gt_wTi = {i: gt_full_by_name[n] for i, n in enumerate(ordered_names)}
+        comp_wTi: Dict[int, Pose3 | None] = {i: comp_by_name.get(n) for i, n in enumerate(ordered_names)}
+        return gt_wTi, comp_wTi, ordered_names
+
     common_names = sorted(set(gt_by_name) & set(comp_by_name))
     if len(common_names) >= 3:
         gt_wTi = {i: gt_by_name[n] for i, n in enumerate(common_names)}
-        comp_wTi = {i: comp_by_name[n] for i, n in enumerate(common_names)}
-        return gt_wTi, comp_wTi, common_names
+        comp_wTi_no_none: Dict[int, Pose3 | None] = {i: comp_by_name[n] for i, n in enumerate(common_names)}
+        return gt_wTi, comp_wTi_no_none, common_names
 
     # Fall back to image_id match.
     gt_by_id = {i: _img_to_pose(gt.image(i)) for i in gt.reg_image_ids()}
@@ -63,9 +84,9 @@ def _match_recons(
     common_ids = sorted(set(gt_by_id) & set(comp_by_id))
     if len(common_ids) >= 3:
         gt_wTi = {i: gt_by_id[i] for i in common_ids}
-        comp_wTi = {i: comp_by_id[i] for i in common_ids}
+        comp_wTi_no_none = {i: comp_by_id[i] for i in common_ids}
         ordered_labels = [f"image_id={i}" for i in common_ids]
-        return gt_wTi, comp_wTi, ordered_labels
+        return gt_wTi, comp_wTi_no_none, ordered_labels
 
     raise RuntimeError(
         f"Too few matched poses: by name {len(common_names)}, by image_id {len(common_ids)}. "
@@ -91,24 +112,30 @@ def _resolve_recon_dir(recon_dir: Path) -> Path:
     return candidates[0]
 
 
-def evaluate(recon_dir: Path, gt_dir: Path) -> dict:
+def evaluate(recon_dir: Path, gt_dir: Path, benchmark_image_dir: Path | None = None) -> dict:
     recon_dir = _resolve_recon_dir(recon_dir)
     gt_dir = _resolve_recon_dir(gt_dir)
 
     gt_recon = pycolmap.Reconstruction(str(gt_dir))
     computed_recon = pycolmap.Reconstruction(str(recon_dir))
 
-    gt_wTi, comp_wTi, names = _match_recons(gt_recon, computed_recon)
+    benchmark_names = None
+    if benchmark_image_dir is not None:
+        benchmark_names = {p.name for p in benchmark_image_dir.iterdir()
+                           if p.suffix.lower() in {".jpg", ".jpeg", ".png"}}
 
-    # Sim(3) alignment: aTi (target=GT) and bTi (input=computed) -> aSb takes computed to GT frame.
-    aSb = sim3_from_Pose3_maps_robust(gt_wTi, comp_wTi)
-    aligned_comp: Dict[int, Pose3] = {i: aSb.transformFrom(comp_wTi[i]) for i in comp_wTi}
+    gt_wTi, comp_wTi, names = _match_recons(gt_recon, computed_recon, benchmark_names)
 
-    # Include missing cameras as None in computed so AUC integrates over all GT cams.
-    computed_for_metrics: Dict[int, Pose3] = {i: aligned_comp.get(i) for i in gt_wTi}
+    # Sim(3) alignment uses only the registered subset (None entries are skipped).
+    registered_comp: Dict[int, Pose3] = {i: p for i, p in comp_wTi.items() if p is not None}
+    registered_gt = {i: gt_wTi[i] for i in registered_comp}
+    aSb = sim3_from_Pose3_maps_robust(registered_gt, registered_comp)
+    aligned_comp: Dict[int, Pose3 | None] = {
+        i: (aSb.transformFrom(p) if p is not None else None) for i, p in comp_wTi.items()
+    }
     metrics_group = compute_ba_pose_metrics(
         gt_wTi=gt_wTi,
-        computed_wTi=computed_for_metrics,
+        computed_wTi=aligned_comp,
         metric_constructed_only=True,
     )
 
@@ -136,6 +163,12 @@ def main() -> None:
     parser.add_argument("--recon", type=Path, required=True, help="GLOMAP output dir (cameras/images/points3D.bin)")
     parser.add_argument("--gt", type=Path, required=True, help="GT COLMAP model dir")
     parser.add_argument("--output", type=Path, required=True, help="JSON output path")
+    parser.add_argument(
+        "--benchmark-image-dir", type=Path, default=None,
+        help="Optional dir of benchmark images (e.g. benchmarks/<ds>/images). "
+             "When provided, AUC is computed over the full set with missing cameras "
+             "penalized — not just the intersection. Required for honest sparse-viewgraph evals.",
+    )
     args = parser.parse_args()
 
     if not args.recon.exists():
@@ -143,7 +176,7 @@ def main() -> None:
     if not args.gt.exists():
         raise FileNotFoundError(f"GT dir not found: {args.gt}")
 
-    result = evaluate(args.recon, args.gt)
+    result = evaluate(args.recon, args.gt, args.benchmark_image_dir)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w") as f:

@@ -3,9 +3,13 @@
 # Usage: ./run [arguments...]
 # Example: ./run --config_name sift_front_end.yaml --loader olsson --dataset_dir /path/to/data
 
-# Detect if uv is available, use it; otherwise fall back to python
-if command -v uv &> /dev/null; then
-  PYTHON_CMD=(uv run python)  
+# Prefer an active conda/venv environment over uv. uv run otherwise creates its
+# own .venv from pyproject.toml, which can be missing pip-installed extras
+# (e.g. poselib) that exist in the active conda env.
+if [ -n "$CONDA_DEFAULT_ENV" ] || [ -n "$VIRTUAL_ENV" ]; then
+  PYTHON_CMD=(python)
+elif command -v uv &> /dev/null; then
+  PYTHON_CMD=(uv run python)
 else
   PYTHON_CMD=(python)
 fi

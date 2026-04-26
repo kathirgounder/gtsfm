@@ -262,6 +262,11 @@ def fmt_row(row: dict, suffix: str = "") -> str:
         if v is None:
             return " " * (w - 1) + "-"
         return f"{v:>{w}.{d}f}"
+    def _fp(v, w, d):
+        # AUC/CO as a percent (×100): 0.730 → 73.0
+        if v is None:
+            return " " * (w - 1) + "-"
+        return f"{v * 100:>{w}.{d}f}"
     def _fi(v, w):
         if v is None:
             return " " * (w - 1) + "-"
@@ -273,12 +278,12 @@ def fmt_row(row: dict, suffix: str = "") -> str:
         f"{_fi(row['cams'], 5)}  "
         f"{_f(row['rot'], 5, 2)}  "
         f"{_f(row['trans'], 7, 2)}  "
-        f"{_f(row['auc3'], 6, 3)}  "
-        f"{_f(row['auc5'], 6, 3)}  "
-        f"{_f(row['auc10'], 6, 3)}  "
-        f"{_f(row.get('co3'), 6, 3)}  "
-        f"{_f(row.get('co5'), 6, 3)}  "
-        f"{_f(row.get('co10'), 6, 3)}"
+        f"{_fp(row['auc3'], 6, 1)}  "
+        f"{_fp(row['auc5'], 6, 1)}  "
+        f"{_fp(row['auc10'], 6, 1)}  "
+        f"{_fp(row.get('co3'), 6, 1)}  "
+        f"{_fp(row.get('co5'), 6, 1)}  "
+        f"{_fp(row.get('co10'), 6, 1)}"
         f"{suffix}"
     )
 
