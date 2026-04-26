@@ -241,7 +241,7 @@ class SceneOptimizer:
 
         logger.info("🔥 GTSFM: Scheduling cluster optimizations...")
         one_view_data_dict = self.loader.get_one_view_data_dict()
-        merged_scene: Optional[GtsfmData] = None
+        merged_scene: Optional[cluster_merging.MergedNodeSummary] = None
 
         with performance_report(filename="dask_reports/scene-optimizer.html"):
             if cluster_tree is None:
@@ -286,40 +286,40 @@ class SceneOptimizer:
 
                 merged_future_tree = submit_tree_map_with_children(client, reconstruction_tree, merge_fn)
                 export_tree = cluster_merging.schedule_exports(client, handles_tree, merged_future_tree)
-                root_merge_future: Optional[Future] = merged_future_tree.value
-                for handle_node, merged_node, export_node in zip(
+                summary_tree = cluster_merging.schedule_summaries(client, merged_future_tree)
+                root_merge_summary: Optional[cluster_merging.MergedNodeSummary] = None
+                for handle_node, summary_node, export_node in zip(
                     PreOrderIter(handles_tree),
-                    PreOrderIter(merged_future_tree),
+                    PreOrderIter(summary_tree),
                     PreOrderIter(export_tree),
                 ):
                     handle = handle_node.value
-                    merge_future = merged_node.value
+                    summary_future = summary_node.value
                     export_future = export_node.value
 
                     metrics_groups = list(handle.metrics.result())
                     handle.io_barrier.result()
                     export_future.result()
                     if handle.cluster_path == ():
-                        merged_result = merge_future.result()
+                        merged_summary = summary_future.result()
                         base_metrics_groups.extend(metrics_groups)
-                        base_metrics_groups.append(merged_result.metrics)
-                        base_metrics_groups.append(merged_result.pre_ba_metrics)
-                        root_merge_future = merge_future
+                        base_metrics_groups.append(merged_summary.metrics)
+                        base_metrics_groups.append(merged_summary.pre_ba_metrics)
+                        root_merge_summary = merged_summary
                     else:
-                        merged_result = merge_future.result()
-                        metrics_groups.append(merged_result.metrics)
-                        metrics_groups.append(merged_result.pre_ba_metrics)
+                        merged_summary = summary_future.result()
+                        metrics_groups.append(merged_summary.metrics)
+                        metrics_groups.append(merged_summary.pre_ba_metrics)
                         save_metrics_reports(metrics_groups, str(handle.output_paths.metrics))
-                if root_merge_future is not None:
+                if root_merge_summary is not None:
                     logger.info("🔥 GTSFM: Running cluster optimization and merging...")
-                    root_merge_result = root_merge_future.result()
-                    merged_scene = root_merge_result.scene
+                    merged_scene = root_merge_summary
 
-        if merged_scene is not None:
+        if merged_scene is not None and merged_scene.merge_success:
             logger.info(
                 "Merged scene contains %d images and %d tracks.",
-                merged_scene.number_images(),
-                merged_scene.number_tracks(),
+                merged_scene.num_images,
+                merged_scene.num_tracks,
             )
         else:
             logger.warning("Merging failed, no final merged scene found.")

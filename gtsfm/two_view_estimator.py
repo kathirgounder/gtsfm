@@ -20,8 +20,8 @@ import gtsfm.common.types as gtsfm_types
 import gtsfm.utils.geometry_comparisons as comp_utils
 import gtsfm.utils.logger as logger_utils
 import gtsfm.utils.metrics as metric_utils
-from gtsfm.bundle.two_view_ba import TwoViewBundleAdjustment
 from gtsfm.bundle.bundle_adjustment import RobustBAMode
+from gtsfm.bundle.two_view_ba import TwoViewBundleAdjustment
 from gtsfm.common.dask_db_module_base import DaskDBModuleBase
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.common.keypoints import Keypoints
@@ -93,8 +93,8 @@ class TwoViewEstimator(DaskDBModuleBase):
             robust_noise_basin=1.345,
             use_karcher_mean_factor=False,
             use_pose_prior_first_camera=True,
-            calibration_prior_focal_sigma=1e-5,
-            calibration_prior_dist_sigma=1e-5,
+            calibration_prior_focal_sigma=20.0,
+            calibration_prior_dist_sigma=0.1,
             cam_pose3_prior_noise_sigma=0.1,
             measurement_noise_sigma=1.0,
         )

@@ -3,7 +3,6 @@
 Authors: Ayush Baid, John Lambert
 """
 
-import copy
 from typing import Optional, Sequence
 
 import gtsam  # type: ignore
@@ -160,8 +159,8 @@ def sim3_from_Pose3s_exhaustive(aTi_list: list[Pose3], bTi_list: list[Pose3]) ->
 
     for i1 in range(n_to_align):
         for i2 in range(i1 + 1, n_to_align):
-            aTi_sample = copy.deepcopy([aTi_list[i1], aTi_list[i2]])
-            bTi_sample = copy.deepcopy([bTi_list[i1], bTi_list[i2]])
+            aTi_sample = [aTi_list[i1], aTi_list[i2]]
+            bTi_sample = [bTi_list[i1], bTi_list[i2]]
 
             aSb_candidate = sim3_from_Pose3s(aTi_sample, bTi_sample)
 
@@ -229,8 +228,8 @@ def sim3_from_Pose3s_robust(
     ).reshape(-1, 2)
 
     for i1, i2 in sample_pose_pairs:
-        aTi_sample = copy.deepcopy([aTi_list[i1], aTi_list[i2]])
-        bTi_sample = copy.deepcopy([bTi_list[i1], bTi_list[i2]])
+        aTi_sample = [aTi_list[i1], aTi_list[i2]]
+        bTi_sample = [bTi_list[i1], bTi_list[i2]]
 
         aSb_candidate = sim3_from_Pose3s(aTi_sample, bTi_sample)
 

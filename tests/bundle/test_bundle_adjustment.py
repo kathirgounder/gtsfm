@@ -4,6 +4,7 @@ Authors: Ayush Baid
 """
 
 import unittest
+from unittest.mock import MagicMock, patch
 
 import dask
 import gtsam  # type: ignore
@@ -121,6 +122,46 @@ class TestBundleAdjustmentOptimizer(unittest.TestCase):
 
         self.assertEqual(computed_result.number_images(), self.test_data.number_images())
         self.assertAlmostEqual(error, 0.3675, places=2)
+
+    def test_multistage_ba_uses_previous_filtered_result(self):
+        """Ensure each BA stage consumes the previous stage's filtered output."""
+        ba = BundleAdjustmentOptimizer(reproj_error_thresholds=[10.0, 5.0, 3.0])
+
+        input_data = MagicMock(spec=GtsfmData)
+        input_data.number_tracks.return_value = 3
+
+        stage1_filtered = MagicMock(spec=GtsfmData)
+        stage1_filtered.number_tracks.return_value = 2
+
+        stage2_filtered = MagicMock(spec=GtsfmData)
+        stage2_filtered.number_tracks.return_value = 1
+
+        stage3_filtered = MagicMock(spec=GtsfmData)
+        stage3_filtered.number_tracks.return_value = 1
+
+        stage_outputs = [
+            (MagicMock(spec=GtsfmData), stage1_filtered, [True, False, True], 1.0),
+            (MagicMock(spec=GtsfmData), stage2_filtered, [False, True], 0.5),
+            (MagicMock(spec=GtsfmData), stage3_filtered, [True], 0.1),
+        ]
+
+        call_inputs = []
+
+        def capture_stage_input(stage_input, *args, **kwargs):
+            call_inputs.append(stage_input)
+            return stage_outputs[len(call_inputs) - 1]
+
+        with patch.object(ba, "run_ba_stage_with_filtering", side_effect=capture_stage_input):
+            _, final_filtered, valid_mask = ba.run_ba(
+                input_data,
+                absolute_pose_priors=[],
+                relative_pose_priors={},
+                verbose=False,
+            )
+
+        self.assertEqual(call_inputs, [input_data, stage1_filtered, stage2_filtered])
+        self.assertIs(final_filtered, stage3_filtered)
+        self.assertEqual(valid_mask, [False, False, True])
 
 
 if __name__ == "__main__":

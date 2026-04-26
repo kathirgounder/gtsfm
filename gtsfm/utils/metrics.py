@@ -412,7 +412,7 @@ def compute_translation_angle_metric(
 def compute_pose_auc_metric(
     rotation_angular_errors: Union[Sequence[float], np.ndarray],
     translation_angular_errors: Union[Sequence[float], np.ndarray],
-    thresholds_deg: Sequence[float] = (1.0, 2.5, 5.0, 10.0, 20.0),
+    thresholds_deg: Sequence[float] = (1.0, 2.5, 3.0, 5.0, 10.0, 20.0),
     save_dir: Optional[str] = None,
     metric_name_prefix: str = "pose_auc",
 ) -> List[GtsfmMetric]:
@@ -562,21 +562,19 @@ def compute_intrinsics_metrics(
 
     metrics = [
         GtsfmMetric(
-            "focal_length_error_px", np.array(focal_abs_errors, dtype=np.float32),
+            "focal_length_error_px",
+            np.array(focal_abs_errors, dtype=np.float32),
             store_full_data=store_full_data,
         ),
         GtsfmMetric(
-            "focal_length_error_pct", np.array(focal_pct_errors, dtype=np.float32),
+            "focal_length_error_pct",
+            np.array(focal_pct_errors, dtype=np.float32),
             store_full_data=store_full_data,
         ),
     ]
     if len(k1_errors) > 0:
-        metrics.append(
-            GtsfmMetric("k1_error", np.array(k1_errors, dtype=np.float32), store_full_data=store_full_data)
-        )
-        metrics.append(
-            GtsfmMetric("k2_error", np.array(k2_errors, dtype=np.float32), store_full_data=store_full_data)
-        )
+        metrics.append(GtsfmMetric("k1_error", np.array(k1_errors, dtype=np.float32), store_full_data=store_full_data))
+        metrics.append(GtsfmMetric("k2_error", np.array(k2_errors, dtype=np.float32), store_full_data=store_full_data))
     return GtsfmMetricsGroup(name="intrinsics_metrics", metrics=metrics)
 
 
