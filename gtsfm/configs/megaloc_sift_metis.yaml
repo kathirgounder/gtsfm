@@ -44,7 +44,9 @@ cluster_optimizer:
       eval_threshold_px: 4
       ba_reproj_error_thresholds: [0.5]
       bundle_adjust_2view_maxiters: 100
-      
+      ba_focal_length_prior_sigma: 20.0
+      ba_dist_prior_sigma: 0.1
+
       verifier:
         _target_: gtsfm.frontend.verifier.poselib_verifier.PoseLibVerifier
         estimation_threshold_px: 2
