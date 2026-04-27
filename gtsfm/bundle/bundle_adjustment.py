@@ -601,11 +601,11 @@ class BundleAdjustmentOptimizer:
             cameras_with_insufficient_tracks,
         )
         graph = self.__construct_simple_factor_graph(cameras_to_model, initial_data, robust_noise_basin)
-        if len(cameras_without_tracks) == len(initial_data.cameras()):
+        if len(cameras_with_insufficient_tracks) == len(initial_data.cameras()):
             logger.warning("Skipping bundle adjustment because all cameras are without tracks.")
             return initial_data, 0.0
         optimized_data, result_values, final_error, _ = self.__optimize_and_recover(
-            initial_data, graph, self._ordering_type if not cameras_without_tracks else "COLAMD"
+            initial_data, graph, self._ordering_type if not cameras_with_insufficient_tracks else "COLAMD"
         )
         if self._compute_pose_covariances:
             try:
