@@ -58,6 +58,7 @@ class TwoViewEstimator(DaskDBModuleBase):
         ba_reproj_error_thresholds: List[Optional[float]] = [0.5],
         allow_indeterminate_linear_system: bool = False,
         postgres_params=None,
+        ba_focal_length_prior_sigma=1e-5,
     ) -> None:
         """Initializes the two-view estimator from verifier.
 
@@ -93,7 +94,7 @@ class TwoViewEstimator(DaskDBModuleBase):
             robust_noise_basin=1.345,
             use_karcher_mean_factor=False,
             use_pose_prior_first_camera=True,
-            calibration_prior_focal_sigma=20.0,
+            calibration_prior_focal_sigma=ba_focal_length_prior_sigma,
             calibration_prior_dist_sigma=0.1,
             cam_pose3_prior_noise_sigma=0.1,
             measurement_noise_sigma=1.0,
@@ -269,7 +270,7 @@ class TwoViewEstimator(DaskDBModuleBase):
         relative_pose_prior_for_ba = {(0, 1): i2Ti1_prior} if i2Ti1_prior is not None else {}
 
         # Optimize!
-        _, ba_output, valid_mask = self._ba_optimizer.run_ba(
+        _, ba_output, valid_mask, _ = self._ba_optimizer.run_ba(
             ba_input, absolute_pose_priors=[], relative_pose_priors=relative_pose_prior_for_ba, verbose=False
         )
         if ba_output is None:

@@ -660,7 +660,7 @@ class BundleAdjustmentOptimizer:
             valid_mask[track_idx] = is_valid
         return optimized_data, filtered_result, valid_mask, final_error
 
-    def _run_ba_stages(
+    def run_ba(
         self,
         initial_data: GtsfmData,
         absolute_pose_priors: List[Optional[PosePrior]],
@@ -716,35 +716,6 @@ class BundleAdjustmentOptimizer:
                 )
 
         return optimized_data, filtered_result, cumulative_valid_mask, step_times  # type: ignore
-
-    def run_ba(
-        self,
-        initial_data: GtsfmData,
-        absolute_pose_priors: List[Optional[PosePrior]],
-        relative_pose_priors: Dict[Tuple[int, int], PosePrior],
-        verbose: bool = True,
-    ) -> Tuple[GtsfmData, GtsfmData, List[bool]]:
-        """Runs bundle adjustment by forming a factor graph and optimizing it using Levenberg–Marquardt optimization.
-
-        Args:
-            initial_data: Initialized cameras, tracks w/ their 3d landmark from triangulation.
-            absolute_pose_priors: Priors to be used on cameras.
-            relative_pose_priors: Priors on the pose between two cameras.
-            verbose: Boolean flag to print out additional info for debugging.
-
-        Results:
-            Optimized camera poses, 3D point w/ tracks, and error metrics, aligned to GT (if provided).
-            Optimized camera poses after filtering landmarks (and cameras with no remaining landmarks).
-            Valid mask as a list of booleans, indicating for each input track whether it was below the re-projection
-                threshold.
-        """
-        optimized_data, filtered_result, valid_mask, _ = self._run_ba_stages(
-            initial_data=initial_data,
-            absolute_pose_priors=absolute_pose_priors,
-            relative_pose_priors=relative_pose_priors,
-            verbose=verbose,
-        )
-        return optimized_data, filtered_result, valid_mask
 
     def _run_ba_and_evaluate(
         self,

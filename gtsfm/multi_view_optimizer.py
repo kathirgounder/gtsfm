@@ -37,7 +37,7 @@ from gtsfm.view_graph_estimator.cycle_consistent_rotation_estimator import (
     CycleConsistentRotationViewGraphEstimator,
     EdgeErrorAggregationCriterion,
 )
-from gtsfm.view_graph_estimator.view_graph_calibration import calibrate_view_graph
+from gtsfm.view_graph_estimator import view_graph_calibration
 from gtsfm.view_graph_estimator.view_graph_estimator_base import ViewGraphEstimatorBase
 
 logger = logging.getLogger(__name__)
@@ -183,7 +183,7 @@ class MultiViewOptimizer:
 
         # View graph calibration: refine focal lengths from F-matrices
         if self._run_view_graph_calibration:
-            all_intrinsics, edges_to_remove = delayed(calibrate_view_graph, nout=2)(
+            all_intrinsics, edges_to_remove = delayed(view_graph_calibration.calibrate_view_graph, nout=2)(
                 viewgraph_v_corr_idxs_graph, keypoints_graph, all_intrinsics, num_images
             )
             # Remove edges with high calibration error

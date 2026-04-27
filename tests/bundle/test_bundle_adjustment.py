@@ -64,7 +64,7 @@ class TestBundleAdjustmentOptimizer(unittest.TestCase):
         absolute_pose_priors = [None] * EXAMPLE_DATA.number_images()
         relative_pose_priors = {}
 
-        expected_result, _, _ = self.ba.run_ba(
+        expected_result, _, _, _ = self.ba.run_ba(
             self.test_data, absolute_pose_priors=absolute_pose_priors, relative_pose_priors=relative_pose_priors
         )
 
@@ -152,7 +152,7 @@ class TestBundleAdjustmentOptimizer(unittest.TestCase):
             return stage_outputs[len(call_inputs) - 1]
 
         with patch.object(ba, "run_ba_stage_with_filtering", side_effect=capture_stage_input):
-            _, final_filtered, valid_mask = ba.run_ba(
+            _, final_filtered, valid_mask, _ = ba.run_ba(
                 input_data,
                 absolute_pose_priors=[],
                 relative_pose_priors={},
