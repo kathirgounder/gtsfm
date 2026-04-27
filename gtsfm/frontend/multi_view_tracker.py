@@ -68,7 +68,7 @@ class TrackingConfig:
     vggt_max_reproj_error: float = 14.0
     min_triangulation_angle: float = 10.0
     min_track_length: int = 2
-    ba_track_patch_grid_size: int = 8
+    ba_track_patch_size: int = 8
     enable_ba_track_patching: bool = False
     ba_use_undistorted_camera_model: bool = False
     colmaptracker_config_path: str = str(_DEFAULT_VGGT_COLMAPTRACKER_CONFIG_PATH)
@@ -120,13 +120,14 @@ def _compute_image_patch(
     v: float,
     image_width: float,
     image_height: float,
-    patch_grid_size: int,
+    patch_size: int,
 ) -> tuple[int, int]:
     """Map a 2D pixel measurement to an image patch in an ``NxN`` grid."""
-    if patch_grid_size <= 1:
+    if patch_size <= 0:
         return (0, 0)
-    col = int(np.floor(np.clip(u, 0.0, image_width - 1e-6) / image_width * patch_grid_size))
-    row = int(np.floor(np.clip(v, 0.0, image_height - 1e-6) / image_height * patch_grid_size))
+
+    col = int(np.clip(u, 0.0, image_width) // patch_size)
+    row = int(np.clip(v, 0.0, image_height) // patch_size)
     return (row, col)
 
 
@@ -598,7 +599,7 @@ class MultiViewTracker:
                     v=v,
                     image_width=original_coords_np[local_id, 4],
                     image_height=original_coords_np[local_id, 5],
-                    patch_grid_size=config.ba_track_patch_grid_size,
+                    patch_size=config.ba_track_patch_size,
                 )
 
             if len(per_track_measurements) < config.min_track_length:

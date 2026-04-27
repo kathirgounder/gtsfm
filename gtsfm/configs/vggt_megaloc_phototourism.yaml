@@ -56,7 +56,7 @@ cluster_optimizer:
         vggt_max_reproj_error: 14.0
         min_triangulation_angle: 2.0
         min_track_length: 3
-        ba_track_patch_grid_size: 14
+        ba_track_patch_size: 14
         enable_ba_track_patching: true
         ba_use_undistorted_camera_model: false
 
