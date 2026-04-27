@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from gtsam import Cal3Bundler
+from gtsam import Cal3Bundler, Cal3_S2, Cal3DS2
 from scipy.optimize import least_squares
 
 import gtsfm.common.types as gtsfm_types
@@ -223,6 +223,7 @@ def calibrate_view_graph(
 
         if min_focal_ratio <= ratio <= max_focal_ratio:
             old_K = initial_intrinsics[cam_idx]
+            # We assume fx == fy here.
             if isinstance(old_K, Cal3Bundler):
                 refined[cam_idx] = Cal3Bundler(
                     fx=float(new_focal),
@@ -230,6 +231,28 @@ def calibrate_view_graph(
                     k2=old_K.k2(),
                     u0=old_K.px(),
                     v0=old_K.py(),
+                )
+                num_refined += 1
+            elif isinstance(old_K, Cal3_S2):
+                refined[cam_idx] = Cal3_S2(
+                    fx=float(new_focal),
+                    fy=float(new_focal),
+                    s=old_K.skew(),
+                    u0=old_K.px(),
+                    v0=old_K.py(),
+                )
+                num_refined += 1
+            elif isinstance(old_K, Cal3DS2):
+                refined[cam_idx] = Cal3DS2(
+                    fx=float(new_focal),
+                    fy=float(new_focal),
+                    s=old_K.skew(),
+                    u0=old_K.px(),
+                    v0=old_K.py(),
+                    k1=old_K.k1(),
+                    k2=old_K.k2(),
+                    p1=old_K.p1(),
+                    p2=old_K.p2(),
                 )
                 num_refined += 1
         else:
