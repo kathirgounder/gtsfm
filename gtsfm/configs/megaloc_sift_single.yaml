@@ -57,10 +57,9 @@ cluster_optimizer:
       
       inlier_support_processor:
         _target_: gtsfm.two_view_estimator.InlierSupportProcessor
-        # min_num_inliers_est_model: 15
-        # min_inlier_ratio_est_model: 0.1
         min_num_inliers_est_model: 30
         min_inlier_ratio_est_model: 0.15
+
   save_gtsfm_data: True
   save_3d_viz: False
   save_two_view_viz: False
