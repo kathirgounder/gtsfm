@@ -163,6 +163,39 @@ class TestBundleAdjustmentOptimizer(unittest.TestCase):
         self.assertIs(final_filtered, stage3_filtered)
         self.assertEqual(valid_mask, [False, False, True])
 
+    def test_stage_mask_maps_gnc_filtered_tracks_to_input_tracks(self):
+        """Ensure GNC-pruned tracks are represented in the stage validity mask."""
+        ba = BundleAdjustmentOptimizer(reproj_error_thresholds=[5.0])
+
+        initial_data = MagicMock(spec=GtsfmData)
+        initial_data.number_tracks.return_value = 4
+        initial_data.get_valid_camera_indices.return_value = [0, 1, 2]
+
+        optimized_data = MagicMock(spec=GtsfmData)
+        optimized_data.number_tracks.return_value = 3
+
+        filtered_result = MagicMock(spec=GtsfmData)
+        optimized_data.filter_landmarks.return_value = (filtered_result, [True, False, True])
+
+        with patch.object(
+            ba,
+            "_BundleAdjustmentOptimizer__construct_factor_graph",
+            return_value=(MagicMock(), {}),
+        ), patch.object(
+            ba,
+            "_BundleAdjustmentOptimizer__optimize_and_recover",
+            return_value=(optimized_data, MagicMock(), 1.0, [True, False, True, True]),
+        ):
+            _, _, valid_mask, _ = ba.run_ba_stage_with_filtering(
+                initial_data,
+                absolute_pose_priors=[],
+                relative_pose_priors={},
+                reproj_error_thresh=5.0,
+                verbose=False,
+            )
+
+        self.assertEqual(valid_mask, [True, False, False, True])
+
 
 if __name__ == "__main__":
     unittest.main()

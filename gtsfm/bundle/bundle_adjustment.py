@@ -477,23 +477,25 @@ class BundleAdjustmentOptimizer:
 
     def __optimize_and_recover(
         self, initial_data: GtsfmData, graph: NonlinearFactorGraph, ordering_type: str
-    ) -> Tuple[GtsfmData, Values, float]:
+    ) -> Tuple[GtsfmData, Values, float, List[bool]]:
         """Optimize the graph, report errors, and convert `Values` back to `GtsfmData`."""
         initial_values = initial_data.to_values(shared_calib=self._shared_calib)
         result_values, _, weights = self.__optimize_factor_graph(graph, initial_values, ordering_type)
         final_error = graph.error(result_values)
         optimized_data = GtsfmData.from_values(result_values, initial_data, self._shared_calib)
+        gnc_valid_mask = [True] * initial_data.number_tracks()
         if self._use_gnc and weights is not None and self._factor_weight_outlier_threshold > 0:
-            optimized_data = self.__filter_tracks_by_factor_weights(graph, optimized_data, weights)
-        return optimized_data, result_values, final_error
+            optimized_data, gnc_valid_mask = self.__filter_tracks_by_factor_weights(graph, optimized_data, weights)
+        return optimized_data, result_values, final_error, gnc_valid_mask
 
     def __filter_tracks_by_factor_weights(
         self, graph: NonlinearFactorGraph, optimized_data: GtsfmData, weights: NDArray[np.float64]
-    ) -> GtsfmData:
+    ) -> Tuple[GtsfmData, List[bool]]:
         """Filter tracks based on the weights of the reprojection factors, if GNC optimization is used."""
+        gnc_valid_mask = [True] * optimized_data.number_tracks()
         if weights is None:
             logger.error("Weights array is None, cannot filter tracks by factor weights.")
-            return optimized_data
+            return optimized_data, gnc_valid_mask
         cameras_to_model = sorted(optimized_data.get_valid_camera_indices())
         first_camera = optimized_data.get_camera(cameras_to_model[0])
         assert first_camera is not None, "First camera in optimized factor graph is None"
@@ -510,7 +512,7 @@ class BundleAdjustmentOptimizer:
                 cams_to_remove_per_track[track_id].add(camera_id)
 
         if not cams_to_remove_per_track:
-            return optimized_data
+            return optimized_data, gnc_valid_mask
 
         for track_id, camera_ids in cams_to_remove_per_track.items():
             track = optimized_data.get_track(track_id)
@@ -521,12 +523,16 @@ class BundleAdjustmentOptimizer:
                     new_measurements.append(track.measurement(m_idx))
             track.measurements = new_measurements
 
-        length_filtered_tracks = [
-            track for track in optimized_data.get_tracks() if track.numberMeasurements() >= self._min_track_length
-        ]
+        length_filtered_tracks = []
+        for track_idx, track in enumerate(optimized_data.get_tracks()):
+            if track.numberMeasurements() >= self._min_track_length:
+                length_filtered_tracks.append(track)
+            else:
+                gnc_valid_mask[track_idx] = False
+
         if len(length_filtered_tracks) == optimized_data.number_tracks():
             optimized_data._camera_to_measurement_map = None
-            return optimized_data
+            return optimized_data, gnc_valid_mask
 
         image_info = {
             image_id: optimized_data.get_image_info(image_id) for image_id in optimized_data.get_all_image_ids()
@@ -540,7 +546,7 @@ class BundleAdjustmentOptimizer:
             gaussian_splats=optimized_data.get_gaussian_splats(),
         )
 
-        return filtered_data
+        return filtered_data, gnc_valid_mask
 
     def run_simple_ba(
         self, initial_data: GtsfmData, robust_noise_basin: float | None = None
@@ -563,7 +569,7 @@ class BundleAdjustmentOptimizer:
         if len(cameras_without_tracks) == len(initial_data.cameras()):
             logger.warning("Skipping bundle adjustment because all cameras are without tracks.")
             return initial_data, 0.0
-        optimized_data, _, final_error = self.__optimize_and_recover(
+        optimized_data, _, final_error, _ = self.__optimize_and_recover(
             initial_data, graph, self._ordering_type if not cameras_without_tracks else "COLAMD"
         )
         return optimized_data, final_error
@@ -616,7 +622,7 @@ class BundleAdjustmentOptimizer:
         graph, cameras_without_tracks = self.__construct_factor_graph(
             cameras_to_model, initial_data, absolute_pose_priors, relative_pose_priors
         )
-        optimized_data, result_values, final_error = self.__optimize_and_recover(
+        optimized_data, result_values, final_error, gnc_valid_mask = self.__optimize_and_recover(
             initial_data, graph, self._ordering_type if not cameras_without_tracks else "COLAMD"
         )
 
@@ -640,13 +646,18 @@ class BundleAdjustmentOptimizer:
         if reproj_error_thresh is not None:
             if verbose:
                 logger.info("[Result] Number of tracks before filtering: %d", optimized_data.number_tracks())
-            filtered_result, valid_mask = optimized_data.filter_landmarks(reproj_error_thresh)
+            filtered_result, postfilter_valid_mask = optimized_data.filter_landmarks(reproj_error_thresh)
             if verbose:
                 logger.info("[Result] Number of tracks after filtering: %d", filtered_result.number_tracks())
 
         else:
-            valid_mask = [True] * optimized_data.number_tracks()
+            postfilter_valid_mask = [True] * optimized_data.number_tracks()
             filtered_result = optimized_data
+
+        valid_mask = [False] * initial_data.number_tracks()
+        kept_track_indices = [track_idx for track_idx, is_valid in enumerate(gnc_valid_mask) if is_valid]
+        for track_idx, is_valid in zip(kept_track_indices, postfilter_valid_mask):
+            valid_mask[track_idx] = is_valid
         return optimized_data, filtered_result, valid_mask, final_error
 
     def _run_ba_stages(
