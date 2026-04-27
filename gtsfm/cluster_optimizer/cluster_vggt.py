@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Hashable, Optional, Union
+from typing import Any, Hashable, Optional
 
 import numpy as np
 import torch
@@ -12,20 +12,99 @@ from gtsam import Pose3
 from PIL import Image as PILImage
 
 import gtsfm.common.types as gtsfm_types
-import gtsfm.frontend.vggt as vggt
 import gtsfm.utils.metrics as metrics_utils
+from gtsfm.bundle.bundle_adjustment import BundleAdjustmentOptions
 from gtsfm.cluster_optimizer.cluster_optimizer_base import ClusterComputationGraph, ClusterContext, ClusterOptimizerBase
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.evaluation.metrics import GtsfmMetric, GtsfmMetricsGroup
-from gtsfm.frontend.vggt import VggtConfiguration, VggtReconstruction
+from gtsfm.frontend.multi_view_tracker import MultiViewTracker
+from gtsfm.frontend.vggt_geometry_transformer import (
+    VggtGeometryTransformer,
+    high_confidence_pointcloud,
+    load_image_batch_vggt_loader,
+    load_model,
+    offload_vggt_model,
+)
 from gtsfm.products.visibility_graph import visibility_graph_keys
 from gtsfm.ui.gtsfm_process import UiMetadata
+from gtsfm.utils import data_utils
 from gtsfm.utils.logger import get_logger
 
 logger = get_logger()
 
 # Module-level cache to avoid reloading VGGT weights per cluster.
 _VGGT_MODEL_CACHE: dict[Hashable, Any] = {}
+
+
+# ---------------------------------------------------------------------------
+# Cluster-level BA runner
+# ---------------------------------------------------------------------------
+
+
+def _run_cluster_ba(
+    gtsfm_data: GtsfmData,
+    *,
+    ba_options: BundleAdjustmentOptions,
+    pre_ba_max_reproj_error: float = 0.0,
+    post_ba_max_reproj_error: float = 3.0,
+    drop_camera_with_no_track: bool = False,
+    min_track_length: int = 2,
+    cluster_label: Optional[str] = None,
+) -> tuple[GtsfmData, GtsfmData]:
+    """Run cluster-level BA on a GtsfmData result.
+
+    This is a module-level function so it can be used with ``dask.delayed``.
+
+    Returns:
+        Tuple of (post_ba_result, pre_ba_result).
+    """
+    pre_ba_data = gtsfm_data
+
+    if gtsfm_data.number_tracks() == 0:
+        logger.warning("Skipping bundle adjustment because no valid tracks were produced.")
+        return gtsfm_data, pre_ba_data
+
+    if pre_ba_max_reproj_error > 0.0:
+        num_tracks_before = gtsfm_data.number_tracks()
+        gtsfm_data = gtsfm_data.filter_landmark_measurements(
+            pre_ba_max_reproj_error, min_track_length
+        )
+        cluster_prefix = f"[{cluster_label}] " if cluster_label else ""
+        logger.info(
+            "%s🔍 #valid tracks after pre-BA reproj error filtering: %d out of %d",
+            cluster_prefix,
+            gtsfm_data.number_tracks(),
+            num_tracks_before,
+        )
+
+    if drop_camera_with_no_track:
+        gtsfm_data, should_run_ba = data_utils.remove_cameras_with_no_tracks(gtsfm_data, "cluster-level BA")
+        if not should_run_ba:
+            return gtsfm_data, pre_ba_data
+
+    try:
+        optimizer = ba_options.to_optimizer(min_track_length=min_track_length)
+        gtsfm_data_with_ba, _ = optimizer.run_simple_ba(gtsfm_data)
+
+        gtsfm_data_with_ba = gtsfm_data_with_ba.filter_landmark_measurements(
+            post_ba_max_reproj_error
+        )
+
+        logger.info(
+            "%s🔍 #valid tracks after BA: %d out of %d",
+            f"[{cluster_label}] " if cluster_label else "",
+            gtsfm_data_with_ba.number_tracks(),
+            gtsfm_data.number_tracks(),
+        )
+        return gtsfm_data_with_ba, pre_ba_data
+    except Exception as exc:
+        logger.warning("⚠️ Failed to run bundle adjustment: %s", exc)
+        return gtsfm_data, pre_ba_data
+
+
+# ---------------------------------------------------------------------------
+# Dask helper functions
+# ---------------------------------------------------------------------------
 
 
 def _load_vggt_inputs(
@@ -38,7 +117,7 @@ def _load_vggt_inputs(
     image_names: Optional[tuple[str, ...]] = None,
 ):
     """Load and preprocess a batch of images for VGGT."""
-    image_batch, original_coords = vggt.load_image_batch_vggt_loader(loader, indices, mode=mode)
+    image_batch, original_coords = load_image_batch_vggt_loader(loader, indices, mode=mode)
     if not save_processed_image or output_root is None or image_names is None:
         return image_batch, original_coords
     if len(image_names) != image_batch.shape[0]:
@@ -48,18 +127,11 @@ def _load_vggt_inputs(
             image_batch.shape[0],
         )
         return image_batch, original_coords
-    
+
     target_root = Path(output_root) / "processed_images"
     target_root.mkdir(parents=True, exist_ok=True)
     batch_uint8 = (
-        image_batch.detach()
-        .clamp(0.0, 1.0)
-        .mul(255.0)
-        .add(0.5)
-        .to(torch.uint8)
-        .permute(0, 2, 3, 1)
-        .cpu()
-        .numpy()
+        image_batch.detach().clamp(0.0, 1.0).mul(255.0).add(0.5).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
     )
     for i, image_name in enumerate(image_names):
         relpath = Path(image_name)
@@ -88,16 +160,13 @@ def _load_vggt_inputs(
 
 def _resolve_vggt_model(cache_key: Hashable | None, loader_kwargs: dict[str, Any] | None) -> Any | None:
     """Fetch (or lazily load) a VGGT model for the current worker."""
-
     if cache_key is None:
         return None
-
     if cache_key in _VGGT_MODEL_CACHE:
         return _VGGT_MODEL_CACHE[cache_key]
-
     logger.info("⏳ Loading VGGT model weights...")
     loader_kwargs = loader_kwargs or {}
-    model = vggt.load_model(**loader_kwargs)
+    model = load_model(**loader_kwargs)
     _VGGT_MODEL_CACHE[cache_key] = model
     logger.info("✅ VGGT model weights loaded successfully.")
     return model
@@ -105,32 +174,77 @@ def _resolve_vggt_model(cache_key: Hashable | None, loader_kwargs: dict[str, Any
 
 def _run_vggt_pipeline(
     image_batch: torch.Tensor,
-    seed: int,
+    original_coords: torch.Tensor,
     *,
+    transformer: VggtGeometryTransformer,
+    tracker: MultiViewTracker,
+    image_indices: tuple[int, ...],
+    image_names: tuple[str, ...] | None = None,
+    dataset_dir: str | None = None,
+    seed: int = 42,
     model_cache_key: Hashable | None = None,
     loader_kwargs: dict[str, Any] | None = None,
-    **kwargs,
-) -> VggtReconstruction:
+    weights_path: Any = None,
+    cluster_label: Optional[str] = None,
+) -> GtsfmData:
+    """Run VGGT geometry prediction + tracking -> GtsfmData (no BA).
+
+    This is a module-level function for use with ``dask.delayed``.
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-    cluster_label = kwargs.pop("cluster_label", None)
-    partition_indices = kwargs.get("image_indices")
     if cluster_label is not None:
         logger.info("🔵 Running VGGT on %s with %d images.", str(cluster_label).lower(), image_batch.shape[0])
-    elif partition_indices:
-        logger.info("🔵 Running VGGT on %d images for partition %s.", image_batch.shape[0], partition_indices)
+    elif image_indices:
+        logger.info("🔵 Running VGGT on %d images for partition %s.", image_batch.shape[0], image_indices)
     else:
         logger.info("🔵 Running VGGT on %d images.", image_batch.shape[0])
+
     cached_model = _resolve_vggt_model(model_cache_key, loader_kwargs)
-    if cached_model is not None:
-        kwargs = {**kwargs, "model": cached_model}
-    if cluster_label is not None:
-        kwargs["cluster_label"] = cluster_label
-    return vggt.run_reconstruction(image_batch, **kwargs)
+
+    # Step 1: Geometry prediction.
+    geo_output = transformer.predict(image_batch, model=cached_model, weights_path=weights_path)
+
+    # Step 2: Optional tracking.
+    tracking_result = None
+    if tracker.config.tracking:
+        tracking_result = tracker.run_tracking(
+            geo_output,
+            model=cached_model,
+            image_names=image_names,
+            dataset_dir=dataset_dir,
+        )
+        if geo_output.device.type == "cuda":
+            offload_vggt_model(cached_model)
+
+    # Step 3: Extract point cloud.
+    points_3d, points_rgb = high_confidence_pointcloud(
+        geo_output,
+        confidence_threshold=transformer.config.confidence_threshold,
+        max_num_points=transformer.config.max_num_points,
+    )
+
+    # Step 4: Assemble GtsfmData.
+    gtsfm_data = tracker.build_gtsfm_data(
+        geo_output,
+        original_coords,
+        image_indices=image_indices,
+        image_names=image_names,
+        tracking_result=tracking_result,
+        points_3d=points_3d,
+        points_rgb=points_rgb,
+        cluster_label=cluster_label,
+    )
+
+    if geo_output.device.type == "cuda":
+        del geo_output
+        torch.cuda.empty_cache()
+
+    return gtsfm_data
 
 
 def _save_reconstruction_as_text(
@@ -145,11 +259,9 @@ def _save_reconstruction_as_text(
 
 
 def _save_pre_ba_reconstruction_as_text(
-    pre_ba_result: Optional[GtsfmData],
+    pre_ba_result: GtsfmData,
     results_path: Path,
 ) -> None:
-    if pre_ba_result is None:
-        return
     _save_reconstruction_as_text(pre_ba_result, results_path, subdir="vggt_pre_ba")
 
 
@@ -157,6 +269,7 @@ def _get_pose_metrics(
     result_data: GtsfmData,
     cameras_gt: list[Optional[gtsfm_types.CAMERA_TYPE]],
     save_dir: Optional[str] = None,
+    metric_constructed_only: bool = False,
 ) -> GtsfmMetricsGroup:
     """Compute pose metrics for a VGGT result after aligning with ground truth."""
     image_idxs = list(result_data._image_info.keys())
@@ -176,6 +289,7 @@ def _get_pose_metrics(
         computed_wTi=computed_wTi,
         save_dir=save_dir,
         store_full_data=True,
+        metric_constructed_only=metric_constructed_only,
     )
 
 
@@ -210,7 +324,9 @@ def _aggregate_vggt_metrics(
     pre_ba_result: Optional[GtsfmData] = None,
     *,
     save_dir: Optional[str] = None,
+    metric_constructed_only: bool = False,
 ) -> list[GtsfmMetricsGroup]:
+    """Aggregate VGGT metrics into groups for both pre- and post-BA results."""
     def _build_metrics_group(scene: GtsfmData, name: str) -> GtsfmMetricsGroup:
         metrics_group = GtsfmMetricsGroup(
             name,
@@ -220,7 +336,9 @@ def _aggregate_vggt_metrics(
             ],
         )
         if cameras_gt is not None:
-            metrics_group.extend(_get_pose_metrics(scene, cameras_gt, save_dir=save_dir))
+            metrics_group.extend(
+                _get_pose_metrics(scene, cameras_gt, save_dir=save_dir, metric_constructed_only=metric_constructed_only)
+            )
             metrics_group.extend(_get_intrinsics_metrics(scene, cameras_gt))
         return metrics_group
 
@@ -230,145 +348,74 @@ def _aggregate_vggt_metrics(
     return metrics_groups
 
 
-def _extract_post_ba_result(result: VggtReconstruction) -> GtsfmData:
-    """Extract the post-BA reconstruction from the VGGT pipeline output."""
-    return result.gtsfm_data
-
-
-def _extract_pre_ba_result(result: VggtReconstruction) -> Optional[GtsfmData]:
-    """Extract the optional pre-BA reconstruction for debugging."""
-    return result.pre_ba_data
+# ---------------------------------------------------------------------------
+# ClusterVGGT
+# ---------------------------------------------------------------------------
 
 
 class ClusterVGGT(ClusterOptimizerBase):
-    """Cluster optimizer that runs VGGT to generate COLMAP-style reconstructions."""
+    """Cluster optimizer that runs VGGT to generate COLMAP-style reconstructions.
+
+    Composes a :class:`VggtGeometryTransformer` for model inference and a
+    :class:`MultiViewTracker` for feature tracking and GtsfmData assembly.
+    Cluster-level bundle adjustment is handled by :func:`_run_cluster_ba`.
+    """
 
     def __init__(
         self,
+        # --- Geometry transformer ---
+        geometry_transformer: VggtGeometryTransformer | None = None,
+        # --- Tracker ---
+        tracker: MultiViewTracker | None = None,
+        # --- Cluster BA params ---
+        ba_options: BundleAdjustmentOptions | None = None,
+        pre_ba_max_reproj_error: float = 14.0,
+        post_ba_max_reproj_error: float = 3.0,
+        drop_camera_with_no_track: bool = False,
+        # --- VGGT-specific operational params ---
         weights_path: Optional[str] = None,
-        conf_threshold: float = 5.0,
-        max_num_points: int = 100000,
-        tracking: bool = False,
-        tracking_max_query_pts: int = 2048,
-        tracking_query_frame_num: int = 3,
-        track_vis_thresh: float = 0.05,
-        track_conf_thresh: float = 0.2,
-        keypoint_extractor: str = "aliked+sp+sift",
         input_mode: str = "crop",
         save_processed_image: bool = False,
-        camera_type: str = "PINHOLE",
         seed: int = 42,
-        scene_dir: Optional[str] = None,
-        pose_angular_error_thresh: float = 3.0,
-        output_worker: Optional[str] = None,
         model_cache_key: Hashable | bool | None = None,
-        inference_dtype: Optional[Union[str, torch.dtype]] = None,
-        model_ctor_kwargs: Optional[dict[str, Any]] = None,
-        use_sparse_attention: bool = False,
-        fast_dtype: Optional[Union[str, torch.dtype]] = None,
-        merging: Optional[int] = None,
-        vis_attn_map: bool = False,
-        enable_protection: bool = False,
-        extra_model_kwargs: Optional[dict[str, Any]] = None,
-        run_bundle_adjustment_on_leaf: bool = False,
-        store_pre_ba_result: bool = False,
-        run_bundle_adjustment_on_parent: bool = True,
-        vggt_max_reproj_error: float = 8.0,
-        post_ba_max_reproj_error: float = 3.0,
-        min_triangulation_angle: float = 10.0,
-        plot_reprojection_histograms: bool = True,
-        merge_duplicate_tracks: bool = True,
-        drop_outlier_after_camera_merging: bool = True,
-        drop_child_if_merging_fail: bool = True,
-        drop_camera_with_no_track: bool = True,
-        ba_use_calibration_prior: bool = False,
-        ba_use_undistorted_camera_model: bool = False,
-        use_shared_calibration: bool = True,
-        use_gnc: bool = False,
-        gnc_loss: str = "GMC",
-        factor_weight_outlier_threshold: float = 1e-8,
-        min_track_length: int = 2,
-        keep_all_cameras_in_merging: bool = False,
+        metric_constructed_only: bool = False,
+        # --- Base class params (output routing) ---
+        output_worker: Optional[str] = None,
     ) -> None:
-        super().__init__(
-            pose_angular_error_thresh=pose_angular_error_thresh,
-            output_worker=output_worker,
-            drop_child_if_merging_fail=drop_child_if_merging_fail,
-            drop_camera_with_no_track=drop_camera_with_no_track,
-            drop_outlier_after_camera_merging=drop_outlier_after_camera_merging,
-            plot_reprojection_histograms=plot_reprojection_histograms,
-            run_bundle_adjustment_on_parent=run_bundle_adjustment_on_parent,
-            use_shared_calibration=use_shared_calibration,
-            merge_duplicate_tracks=merge_duplicate_tracks,
-            use_gnc=use_gnc,
-            gnc_loss=gnc_loss,
-            post_ba_max_reproj_error=post_ba_max_reproj_error,
-            min_track_length=min_track_length,
-            keep_all_cameras_in_merging=keep_all_cameras_in_merging,
-        )
+        super().__init__(output_worker=output_worker)
+
         self._weights_path = Path(weights_path) if weights_path is not None else None
-        self._conf_threshold = conf_threshold
-        self._max_points_for_colmap = max_num_points
-        self._tracking = tracking
-        self._tracking_max_query_pts = tracking_max_query_pts
-        self._tracking_query_frame_num = tracking_query_frame_num
-        self._track_vis_thresh = track_vis_thresh
-        self._track_conf_thresh = track_conf_thresh
-        self._keypoint_extractor = keypoint_extractor
         self._input_mode = input_mode
         self._save_processed_image = save_processed_image
-        self._camera_type = camera_type
-        self._vggt_max_reproj_error = vggt_max_reproj_error
-        self._min_triangulation_angle = min_triangulation_angle
         self._seed = seed
-        self._explicit_scene_dir = Path(scene_dir) if scene_dir is not None else None
-        self._use_sparse_attention = use_sparse_attention
-        self._dtype = inference_dtype
-        self._run_bundle_adjustment_on_leaf = run_bundle_adjustment_on_leaf
-        self._store_pre_ba_result = store_pre_ba_result
-        self._min_triangulation_angle = min_triangulation_angle
-        self._ba_use_calibration_prior = ba_use_calibration_prior
-        self._ba_use_undistorted_camera_model = ba_use_undistorted_camera_model
-        self._use_gnc = use_gnc
-        self._gnc_loss = gnc_loss
-        self._factor_weight_outlier_threshold = factor_weight_outlier_threshold
-        if fast_dtype is not None:
-            if self._dtype is None:
-                self._dtype = fast_dtype
-            elif self._dtype != fast_dtype:
-                logger.warning(
-                    "Ignoring fast_dtype=%s because inference_dtype=%s is already specified.",
-                    fast_dtype,
-                    self._dtype,
-                )
+        self._metric_constructed_only = metric_constructed_only
 
-        self._model_ctor_kwargs = dict(model_ctor_kwargs) if model_ctor_kwargs is not None else {}
-        if extra_model_kwargs:
-            self._model_ctor_kwargs.update(extra_model_kwargs)
+        # --- Geometry transformer ---
+        self.geometry_transformer = geometry_transformer or VggtGeometryTransformer()
 
-        def _maybe_set_model_kw(key: str, value: Any) -> None:
-            if value is None:
-                return
-            self._model_ctor_kwargs.setdefault(key, value)
+        # --- Tracker ---
+        self.tracker = tracker or MultiViewTracker()
 
-        _maybe_set_model_kw("merging", merging)
-        if vis_attn_map:
-            self._model_ctor_kwargs.setdefault("vis_attn_map", True)
-        if enable_protection:
-            self._model_ctor_kwargs.setdefault("enable_protection", True)
+        # --- Cluster BA params ---
+        self.ba_options = ba_options or BundleAdjustmentOptions()
+        self._pre_ba_max_reproj_error = pre_ba_max_reproj_error
+        self._post_ba_max_reproj_error = post_ba_max_reproj_error
+        self._drop_camera_with_no_track = drop_camera_with_no_track
 
+        # --- Model caching ---
         self._loader_kwargs: dict[str, Any] = {}
         if self._weights_path is not None:
             self._loader_kwargs["weights_path"] = self._weights_path
-        if self._model_ctor_kwargs:
-            self._loader_kwargs["model_kwargs"] = self._model_ctor_kwargs
+        model_kwargs = self.geometry_transformer.config.model_ctor_kwargs
+        if model_kwargs:
+            self._loader_kwargs["model_kwargs"] = model_kwargs
 
         if model_cache_key is False:
             self._model_cache_key: Hashable | None = None
         elif model_cache_key is None:
             kwargs_key = (
-                tuple(sorted((k, repr(v)) for k, v in self._model_ctor_kwargs.items()))
-                if self._model_ctor_kwargs
+                tuple(sorted((k, repr(v)) for k, v in model_kwargs.items()))
+                if model_kwargs
                 else None
             )
             self._model_cache_key = ("default_vggt_loader", self._weights_path, kwargs_key)
@@ -377,22 +424,17 @@ class ClusterVGGT(ClusterOptimizerBase):
 
     def __repr__(self) -> str:
         components = [
+            f"geometry_transformer={self.geometry_transformer.config}",
+            f"tracker={self.tracker.config}",
+            f"ba_options={self.ba_options}",
             f"weights_path={self._weights_path}",
-            f"camera_type={self._camera_type}",
-            f"dtype={self._dtype}",
             f"input_mode={self._input_mode}",
-            f"save_processed_image={self._save_processed_image}",
-            f"use_sparse_attention={self._use_sparse_attention}",
-            f"run_bundle_adjustment_on_leaf={self._run_bundle_adjustment_on_leaf}",
         ]
-        if self._model_ctor_kwargs:
-            components.append(f"model_ctor_kwargs={self._model_ctor_kwargs}")
         return "ClusterVGGT(\n  " + ",\n  ".join(str(c) for c in components) + "\n)"
 
     @staticmethod
     def get_ui_metadata() -> UiMetadata:
         """Returns data needed to display node and edge info for this process in the process graph."""
-        # This class and its subclasses (unless overridden) are not part of the UI.
         return UiMetadata(
             display_name="VGGT",
             input_products=("Key Images",),
@@ -413,34 +455,10 @@ class ClusterVGGT(ClusterOptimizerBase):
         global_indices = tuple(int(idx) for idx in keys)
         image_filenames = context.loader.image_filenames()
         image_names = tuple(str(image_filenames[idx]) for idx in keys)
+        dataset_dir = getattr(context.loader, "_dataset_dir", None)
+        dataset_dir = str(dataset_dir) if dataset_dir is not None else None
 
-        config = VggtConfiguration(
-            confidence_threshold=self._conf_threshold,
-            max_num_points=self._max_points_for_colmap,
-            tracking=self._tracking,
-            max_query_pts=self._tracking_max_query_pts,
-            query_frame_num=self._tracking_query_frame_num,
-            track_vis_thresh=self._track_vis_thresh,
-            track_conf_thresh=self._track_conf_thresh,
-            keypoint_extractor=self._keypoint_extractor,
-            dtype=self._dtype,
-            model_ctor_kwargs=self._model_ctor_kwargs.copy(),
-            use_sparse_attention=self._use_sparse_attention,
-            run_bundle_adjustment_on_leaf=self._run_bundle_adjustment_on_leaf,
-            store_pre_ba_result=self._store_pre_ba_result,
-            vggt_max_reproj_error=self._vggt_max_reproj_error,
-            post_ba_max_reproj_error=self.post_ba_max_reproj_error,
-            drop_camera_with_no_track=self.drop_camera_with_no_track,
-            min_triangulation_angle=self._min_triangulation_angle,
-            ba_use_calibration_prior=self._ba_use_calibration_prior,
-            ba_use_undistorted_camera_model=self._ba_use_undistorted_camera_model,
-            ba_use_shared_calibration=self.use_shared_calibration,
-            use_gnc=self._use_gnc,
-            gnc_loss=self._gnc_loss,
-            factor_weight_outlier_threshold=self._factor_weight_outlier_threshold,
-            min_track_length=self.min_track_length,
-        )
-
+        # 1. Load images.
         image_batch_graph, original_coords_graph = delayed(_load_vggt_inputs, nout=2)(
             context.loader,
             global_indices,
@@ -450,36 +468,51 @@ class ClusterVGGT(ClusterOptimizerBase):
             image_names=image_names,
         )
 
-        reconstruction_graph = delayed(_run_vggt_pipeline)(
+        # 2. Run VGGT pipeline (geometry + tracking -> GtsfmData, NO BA).
+        pre_ba_data_graph = delayed(_run_vggt_pipeline)(
             image_batch_graph,
-            seed=self._seed,
-            original_coords=original_coords_graph,
+            original_coords_graph,
+            transformer=self.geometry_transformer,
+            tracker=self.tracker,
             image_indices=global_indices,
             image_names=image_names,
-            config=config,
-            weights_path=self._weights_path,
+            dataset_dir=dataset_dir,
+            seed=self._seed,
             model_cache_key=self._model_cache_key,
             loader_kwargs=self._loader_kwargs or None,
+            weights_path=self._weights_path,
             cluster_label=context.label,
         )
-        result_graph = delayed(_extract_post_ba_result)(reconstruction_graph)
-        pre_ba_result_graph = delayed(_extract_pre_ba_result)(reconstruction_graph)
 
+        # 3. Run cluster-level BA.
+        ba_result_graph, pre_ba_result_graph = delayed(_run_cluster_ba, nout=2)(
+            pre_ba_data_graph,
+            ba_options=self.ba_options,
+            pre_ba_max_reproj_error=self._pre_ba_max_reproj_error,
+            post_ba_max_reproj_error=self._post_ba_max_reproj_error,
+            drop_camera_with_no_track=self._drop_camera_with_no_track,
+            min_track_length=self.tracker.config.min_track_length,
+            cluster_label=context.label,
+        )
+
+        # 4. Metrics.
         cameras_gt = [context.one_view_data_dict[idx].camera_gt for idx in range(context.num_images)]
         metrics_tasks = [
             delayed(_aggregate_vggt_metrics)(
-                result_graph,
+                ba_result_graph,
                 cameras_gt=cameras_gt,
                 pre_ba_result=pre_ba_result_graph,
                 save_dir=str(context.output_paths.metrics),
+                metric_constructed_only=self._metric_constructed_only,
             )
         ]
 
+        # 5. I/O tasks.
         io_tasks: list[Delayed] = []
         with self._output_annotation():
             io_tasks.append(
                 delayed(_save_reconstruction_as_text)(
-                    result_graph,
+                    ba_result_graph,
                     context.output_paths.results,
                 )
             )
@@ -493,5 +526,5 @@ class ClusterVGGT(ClusterOptimizerBase):
         return ClusterComputationGraph(
             io_tasks=tuple(io_tasks),
             metric_tasks=tuple(metrics_tasks),
-            sfm_result=result_graph,
+            sfm_result=ba_result_graph
         )

@@ -5,7 +5,7 @@ loader:
   _target_: gtsfm.loader.Hilti
   image_dir: "/path/to/images"
   metadata_dir: "/path/to/metadata"
-  use_gt_intrinsics: True
+  use_gt_intrinsics: false
 
 image_pairs_generator:
   _target_: gtsfm.retriever.image_pairs_generator.ImagePairsGenerator

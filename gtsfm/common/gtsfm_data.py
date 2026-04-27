@@ -573,6 +573,12 @@ class GtsfmData:
         new_camera = gtsfm_types.get_camera_class_for_calibration(K)(pose, K)
         self._cameras[index] = new_camera
 
+    def update_camera(self, index: int, camera: gtsfm_types.CAMERA_TYPE) -> None:
+        """Updates the camera at index."""
+        if index not in self._cameras:
+            raise ValueError(f"Camera at index {index} not found")
+        self._cameras[index] = camera
+
     def add_camera(self, index: int, camera: gtsfm_types.CAMERA_TYPE) -> None:
         """Adds camera at index if not already present."""
         if camera is None:
@@ -818,6 +824,9 @@ class GtsfmData:
         """Logs reprojection error stats for all 3d points in the entire scene."""
         scene_reproj_errors = self.get_scene_reprojection_errors()
         logger.info(
+            "# cameras: %d, # tracks: %d, # images: %d", len(self.cameras()), self.number_tracks(), self.number_images()
+        )
+        logger.info(
             "Min scene reproj error: %.3f", np.nanmin(scene_reproj_errors) if len(scene_reproj_errors) else np.nan
         )
         logger.info(
@@ -1001,7 +1010,7 @@ class GtsfmData:
 
         return aligned_data
 
-    def merged_with(self, other: "GtsfmData", aSb: Similarity3) -> "GtsfmData":
+    def merged_with(self, other: "GtsfmData", aSb: Similarity3, scale_focal_length: bool = False) -> "GtsfmData":
         """Return a new scene containing self and ``other`` transformed to this scene's frame.
 
         Args:
@@ -1012,7 +1021,9 @@ class GtsfmData:
             New ``GtsfmData`` containing cameras and tracks from both inputs.
         """
         merged_cameras = dict(self.cameras())
-        transformed_other_cameras = transform.camera_map_with_sim3(aSb, other.cameras())
+        transformed_other_cameras = transform.camera_map_with_sim3(
+            aSb, other.cameras(), scale_focal_length=scale_focal_length
+        )
         for key, camera in transformed_other_cameras.items():
             if key not in merged_cameras and camera is not None:
                 merged_cameras[key] = camera

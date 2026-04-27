@@ -5,26 +5,34 @@ Authors: Xiaolong Wu, John Lambert, Ayush Baid
 
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import dask
 import gtsam  # type: ignore
 import numpy as np
 from dask.delayed import Delayed
-from gtsam import BetweenFactorPose3, NonlinearFactorGraph, PriorFactorPoint3, PriorFactorPose3, Values  # type: ignore
+from gtsam import BetweenFactorPose3, NonlinearFactorGraph, PriorFactorPoint3, PriorFactorPose3, SfmTrack, Values  # type: ignore
 from gtsam.noiseModel import Diagonal, Isotropic, Robust, mEstimator  # type: ignore
 from gtsam.symbol_shorthand import K, P, X  # type: ignore
 from numpy.typing import NDArray
 
 import gtsfm.common.types as gtsfm_types
+import gtsfm.utils.reprojection as reprojection_utils
 import gtsfm.utils.logger as logger_utils
 import gtsfm.utils.metrics as metrics_utils
 import gtsfm.utils.tracks as track_utils
 from gtsfm.common import gtsfm_data
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.common.pose_prior import PosePrior
+from gtsfm.common.sfm_track import SfmMeasurement, SfmTrack2d
+from gtsfm.data_association.point3d_initializer import (
+    Point3dInitializer,
+    TriangulationOptions,
+    TriangulationSamplingMode,
+)
 from gtsfm.evaluation.metrics import GtsfmMetric, GtsfmMetricsGroup
 
 METRICS_GROUP = "bundle_adjustment_metrics"
@@ -51,6 +59,551 @@ class RobustBAMode(Enum):
     TLS = "TLS"
 
 
+@dataclass
+class BundleAdjustmentOptions:
+    """Shared configuration for bundle adjustment across leaf BA, merging BA, etc.
+
+    This dataclass captures the commonly-configured subset of BA parameters
+    that vary between call sites (leaf vs. merging). Parameters with fixed
+    defaults (e.g. ordering_type, allow_indeterminate_linear_system) are left
+    to the ``BundleAdjustmentOptimizer`` constructor.
+    """
+
+    robust_ba_mode: Union[RobustBAMode, str] = RobustBAMode.GMC
+    shared_calib: bool = False
+    use_calibration_prior: bool = False
+    use_pose_prior_all_cameras: bool = False
+    use_pose_prior_first_camera: bool = False
+    use_gnc: bool = False
+    gnc_loss: Union[RobustBAMode, str] = RobustBAMode.GMC
+    factor_weight_outlier_threshold: float = 0.0
+    min_track_length: int = 2
+    calibration_prior_focal_sigma: float = 20.0
+    calibration_prior_dist_sigma: float | Sequence[float] = 0.1
+    calibration_prior_pp_sigma: float = 1e-5
+    robust_noise_basin: float = 1.345
+
+    def to_optimizer(self, **overrides) -> "BundleAdjustmentOptimizer":
+        """Construct a :class:`BundleAdjustmentOptimizer` from these options.
+
+        Args:
+            **overrides: Keyword arguments that override dataclass fields or add
+                extra constructor params (e.g. ``min_track_length``,
+                ``reproj_error_thresholds``).
+        """
+        kwargs = dict(
+            robust_ba_mode=self.robust_ba_mode,
+            shared_calib=self.shared_calib,
+            use_calibration_prior=self.use_calibration_prior,
+            use_pose_prior_all_cameras=self.use_pose_prior_all_cameras,
+            use_pose_prior_first_camera=self.use_pose_prior_first_camera,
+            use_gnc=self.use_gnc,
+            gnc_loss=self.gnc_loss,
+            factor_weight_outlier_threshold=self.factor_weight_outlier_threshold,
+            min_track_length=self.min_track_length,
+            calibration_prior_focal_sigma=self.calibration_prior_focal_sigma,
+            calibration_prior_dist_sigma=self.calibration_prior_dist_sigma,
+            calibration_prior_pp_sigma=self.calibration_prior_pp_sigma,
+            robust_noise_basin=self.robust_noise_basin,
+        )
+        kwargs.update(overrides)
+        return BundleAdjustmentOptimizer(**kwargs)
+
+
+def filter_outlier_cameras(data: GtsfmData, min_covisibility_count: int = 5, min_track_len: int = 2) -> GtsfmData:
+    """Remove outlier cameras via covisibility clustering (GLOMAP Section 3.4).
+
+    Builds a covisibility graph from shared 3D points, finds strongly connected components
+    using an adaptive threshold, and keeps only the largest cluster. Small clusters weakly
+    connected to the main reconstruction are merged if possible.
+
+    Args:
+        data: GtsfmData with BA-optimized cameras and tracks.
+        min_covisibility_count: Minimum shared points to consider an edge in covisibility graph.
+        min_track_len: Minimum track length to keep after camera removal.
+
+    Returns:
+        New GtsfmData with only the largest camera cluster retained.
+    """
+    from gtsam import SfmTrack
+
+    camera_dict = data.cameras()
+    if len(camera_dict) < 3:
+        return data
+
+    # Step 1: Build covisibility graph — count shared 3D points per camera pair.
+    covisibility: dict[tuple[int, int], int] = defaultdict(int)
+    for track in data.get_tracks():
+        cam_idxs = []
+        for k in range(track.numberMeasurements()):
+            cam_idx, _ = track.measurement(k)
+            if cam_idx in camera_dict:
+                cam_idxs.append(cam_idx)
+        for a in range(len(cam_idxs)):
+            for b in range(a + 1, len(cam_idxs)):
+                i, j = min(cam_idxs[a], cam_idxs[b]), max(cam_idxs[a], cam_idxs[b])
+                covisibility[(i, j)] += 1
+
+    # Discard pairs below minimum count.
+    covisibility = {k: v for k, v in covisibility.items() if v >= min_covisibility_count}
+
+    if not covisibility:
+        logger.info("Covisibility clustering: no edges with >= %d shared points.", min_covisibility_count)
+        return data
+
+    # Step 2: Compute threshold τ = median of remaining pair counts.
+    counts = np.array(list(covisibility.values()))
+    tau = float(np.median(counts))
+
+    logger.info(
+        "Covisibility clustering: %d edges, counts min=%d, med=%d, max=%d, tau=%d",
+        len(covisibility), counts.min(), int(np.median(counts)), counts.max(), int(tau),
+    )
+
+    # Step 3: Build strong graph (edges with count > τ) and find connected components.
+    all_cameras = set(camera_dict.keys())
+    strong_adj: dict[int, set[int]] = defaultdict(set)
+    for (i, j), count in covisibility.items():
+        if count > tau:
+            strong_adj[i].add(j)
+            strong_adj[j].add(i)
+
+    # BFS to find connected components in strong graph.
+    visited = set()
+    components = []
+    for cam in all_cameras:
+        if cam in visited:
+            continue
+        component = set()
+        queue = [cam]
+        while queue:
+            node = queue.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            component.add(node)
+            for neighbor in strong_adj.get(node, []):
+                if neighbor not in visited:
+                    queue.append(neighbor)
+        components.append(component)
+
+    components.sort(key=len, reverse=True)
+    main_component = components[0]
+
+    # Step 4: Try to merge smaller components if they have ≥ 2 edges with count > 0.75τ to main.
+    merge_threshold = 0.75 * tau
+    for comp in components[1:]:
+        strong_edges_to_main = 0
+        for cam in comp:
+            for main_cam in main_component:
+                edge = (min(cam, main_cam), max(cam, main_cam))
+                if covisibility.get(edge, 0) > merge_threshold:
+                    strong_edges_to_main += 1
+        if strong_edges_to_main >= 2:
+            main_component = main_component | comp
+
+    logger.info(
+        "Covisibility clustering: %d components (sizes: %s). Keeping %d / %d cameras.",
+        len(components),
+        ", ".join(str(len(c)) for c in components[:5]),
+        len(main_component),
+        len(all_cameras),
+    )
+
+    if len(main_component) == len(all_cameras):
+        logger.info("Covisibility clustering: all cameras in one component, no filtering needed.")
+        return data
+
+    # Step 5: Rebuild GtsfmData with only the main component.
+    filtered = GtsfmData(number_images=data.number_images())
+    for cam_idx in main_component:
+        filtered.add_camera(cam_idx, camera_dict[cam_idx])
+        info = data.get_image_info(cam_idx)
+        filtered.set_image_info(cam_idx, name=info.name, shape=info.shape)
+
+    for track in data.get_tracks():
+        new_track = SfmTrack(track.point3())
+        for k in range(track.numberMeasurements()):
+            cam_idx, uv = track.measurement(k)
+            if cam_idx in main_component:
+                new_track.addMeasurement(cam_idx, uv)
+        if new_track.numberMeasurements() >= min_track_len:
+            filtered.add_track(new_track)
+
+    logger.info(
+        "Covisibility clustering: removed %d cameras, %d tracks remain.",
+        len(all_cameras) - len(main_component), filtered.number_tracks(),
+    )
+    return filtered
+
+
+def filter_tracks_by_min_tri_angle(
+    gtsfm_data: GtsfmData,
+    min_tri_angle_deg: float,
+) -> GtsfmData:
+    """Drop tracks whose max pairwise triangulation angle is below `min_tri_angle_deg`.
+
+    Mirrors GLOMAP's FilterPoints3DWithSmallTriangulationAngle (observation_manager.cc:345).
+    Vectorized: precomputes all camera centers as one numpy array, then per-track does
+    O(N²) pairwise angle via broadcasting + early-exit on first qualifying pair. ~1000x
+    faster than the naive `itertools.combinations` + GTSAM Unit3 approach for tracks
+    with mean length ~40+ measurements.
+
+    Args:
+        gtsfm_data: scene with cameras + tracks (post-BA).
+        min_tri_angle_deg: minimum required triangulation angle. GLOMAP default = 1.0°.
+
+    Returns:
+        New GtsfmData with cameras unchanged and degenerate tracks removed.
+    """
+    if min_tri_angle_deg <= 0:
+        return gtsfm_data
+
+    cameras_dict = {i: cam for i, cam in gtsfm_data.cameras().items() if cam is not None}
+    out = GtsfmData(gtsfm_data.number_images())
+    for cam_idx, cam in cameras_dict.items():
+        out.add_camera(cam_idx, cam)
+        info = gtsfm_data.get_image_info(cam_idx)
+        out.set_image_info(cam_idx, name=info.name, shape=info.shape)
+
+    # Precompute camera centers once (one (3,) vector per camera index).
+    centers: Dict[int, np.ndarray] = {}
+    for cam_idx, cam in cameras_dict.items():
+        centers[cam_idx] = np.asarray(cam.pose().translation(), dtype=float)
+
+    cos_threshold = float(np.cos(np.deg2rad(min_tri_angle_deg)))
+
+    n_in = gtsfm_data.number_tracks()
+    n_kept = 0
+    n_dropped = 0
+    for j in range(n_in):
+        track = gtsfm_data.get_track(j)
+        n_meas = track.numberMeasurements()
+        if n_meas < 2:
+            n_dropped += 1
+            continue
+        # Gather camera centers and compute rays (centers - point_3d).
+        point_3d = np.asarray(track.point3(), dtype=float)
+        cam_centers_list: List[np.ndarray] = []
+        for k in range(n_meas):
+            i, _ = track.measurement(k)
+            c = centers.get(int(i))
+            if c is None:
+                continue
+            cam_centers_list.append(c)
+        if len(cam_centers_list) < 2:
+            n_dropped += 1
+            continue
+        cam_centers = np.stack(cam_centers_list, axis=0)         # (N, 3)
+        rays = cam_centers - point_3d                            # (N, 3) — point→camera rays
+        norms = np.linalg.norm(rays, axis=1)                     # (N,)
+        valid = norms > 1e-9
+        if valid.sum() < 2:
+            n_dropped += 1
+            continue
+        rays = rays[valid] / norms[valid, None]                  # (M, 3) — unit rays
+        # Pairwise cos via dot product. The MAX angle = MIN cos (since cos is monotonic
+        # decreasing on [0, π]). If min cos < cos_threshold → max angle > threshold → keep.
+        cos_matrix = rays @ rays.T                               # (M, M)
+        np.fill_diagonal(cos_matrix, 1.0)                        # ignore self-pairs
+        min_cos = float(cos_matrix.min())
+        if min_cos < cos_threshold:
+            out.add_track(track)
+            n_kept += 1
+        else:
+            n_dropped += 1
+    logger.info(
+        "Min triangulation angle filter (≥ %.2f°): %d kept / %d input (%d dropped).",
+        min_tri_angle_deg, n_kept, n_in, n_dropped,
+    )
+    return out
+
+
+def multi_view_retriangulate_from_2d_tracks(
+    gtsfm_data: GtsfmData,
+    tracks_2d: List["SfmTrack2d"],
+    triangulation_options: Optional[TriangulationOptions] = None,
+    min_track_length: int = 3,
+    two_view_min_tri_angle_deg: float = 0.0,
+    two_view_max_count: int = 0,
+) -> GtsfmData:
+    """GLOMAP-style initial multi-view retriangulation (Phase 1).
+
+    Re-triangulates the union-find 2D track set with the current (post-BA) cameras.
+
+    Args:
+        gtsfm_data: Scene with optimized cameras (existing tracks ignored; cameras re-used).
+        tracks_2d: Full 2D track set from `CppDsfTracksEstimator.run()`.
+        triangulation_options: Per-track solve config. Defaults to RANSAC_SAMPLE_UNIFORM,
+            reproj_error_threshold=10 px, max_num_hypotheses=100.
+        min_track_length: Drop tracks with fewer measurements than this. Set to 2 to
+            admit 2-view tracks (then `two_view_min_tri_angle_deg` gates them by quality).
+        two_view_min_tri_angle_deg: Stricter triangulation-angle gate applied ONLY to
+            2-view output tracks. Multi-view tracks (length ≥ 3) are not affected by
+            this. Default 0.0 = no extra gate.
+        two_view_max_count: If > 0, cap the number of admitted 2-view tracks to this
+            value. After the threshold gate, candidates are ranked by tri-angle and
+            only the top-N admitted. Useful when Python/GTSAM BA wall time is bounded
+            and we want only the highest-quality 2-view supplements (e.g., 500-800).
+            Default 0 = no cap (admit all that pass `two_view_min_tri_angle_deg`).
+
+    Returns:
+        New GtsfmData with same cameras and an augmented track set.
+    """
+    if triangulation_options is None:
+        triangulation_options = TriangulationOptions(
+            reproj_error_threshold=10.0,
+            mode=TriangulationSamplingMode.RANSAC_SAMPLE_UNIFORM,
+            max_num_hypotheses=100,
+        )
+
+    camera_dict = {i: cam for i, cam in gtsfm_data.cameras().items() if cam is not None}
+    initializer = Point3dInitializer(camera_dict, triangulation_options)
+
+    out = GtsfmData(gtsfm_data.number_images())
+    for cam_idx, camera in camera_dict.items():
+        out.add_camera(cam_idx, camera)
+        info = gtsfm_data.get_image_info(cam_idx)
+        out.set_image_info(cam_idx, name=info.name, shape=info.shape)
+
+    # Precompute camera centers for the fast 2-view tri-angle gate.
+    camera_centers: Dict[int, np.ndarray] = {}
+    if two_view_min_tri_angle_deg > 0:
+        for cam_idx, cam in camera_dict.items():
+            camera_centers[cam_idx] = np.asarray(cam.pose().translation(), dtype=float)
+    cos_2view_threshold = float(np.cos(np.deg2rad(two_view_min_tri_angle_deg))) if two_view_min_tri_angle_deg > 0 else 1.0
+
+    n_in = len(tracks_2d)
+    n_kept_multi = 0  # multi-view tracks added immediately to `out`
+    n_short_input = 0
+    n_no_cams = 0
+    n_short_output = 0
+    n_triangulation_failed = 0
+    n_two_view_rejected_thin = 0
+    # Buffer 2-view candidates so we can rank-and-cap at the end (if cap enabled).
+    # Each entry: (tri_angle_deg, SfmTrack).
+    two_view_candidates: List[Tuple[float, "SfmTrack"]] = []
+    for track_2d in tracks_2d:
+        if track_2d.number_measurements() < min_track_length:
+            n_short_input += 1
+            continue
+        valid_measurements = [m for m in track_2d.measurements if m.i in camera_dict]
+        if len(valid_measurements) < min_track_length:
+            n_no_cams += 1
+            continue
+        track_2d_filtered = SfmTrack2d(measurements=valid_measurements)
+
+        new_track, _, _ = initializer.triangulate(track_2d_filtered)
+        if new_track is None:
+            n_triangulation_failed += 1
+            continue
+        if new_track.numberMeasurements() < min_track_length:
+            n_short_output += 1
+            continue
+
+        # 2-view tracks: compute tri angle, gate by threshold, buffer for cap.
+        # Multi-view tracks (length ≥ 3) bypass the gate and add immediately.
+        if new_track.numberMeasurements() == 2 and (two_view_min_tri_angle_deg > 0 or two_view_max_count > 0):
+            i0, _ = new_track.measurement(0)
+            i1, _ = new_track.measurement(1)
+            c0 = camera_centers.get(int(i0)) if camera_centers else None
+            c1 = camera_centers.get(int(i1)) if camera_centers else None
+            if c0 is None or c1 is None:
+                # camera_centers wasn't pre-populated (gate disabled); fall through to immediate add.
+                if two_view_min_tri_angle_deg > 0:
+                    n_two_view_rejected_thin += 1
+                    continue
+                out.add_track(new_track)
+                n_kept_multi += 1
+                continue
+            point_3d = np.asarray(new_track.point3(), dtype=float)
+            r0 = c0 - point_3d
+            r1 = c1 - point_3d
+            n0, n1 = float(np.linalg.norm(r0)), float(np.linalg.norm(r1))
+            if n0 < 1e-9 or n1 < 1e-9:
+                n_two_view_rejected_thin += 1
+                continue
+            cos_angle = float(np.clip(np.dot(r0 / n0, r1 / n1), -1.0, 1.0))
+            tri_angle_deg = float(np.degrees(np.arccos(cos_angle)))
+            if two_view_min_tri_angle_deg > 0 and tri_angle_deg < two_view_min_tri_angle_deg:
+                n_two_view_rejected_thin += 1
+                continue
+            two_view_candidates.append((tri_angle_deg, new_track))
+        else:
+            out.add_track(new_track)
+            n_kept_multi += 1
+
+    # Apply hard cap on 2-view tracks (rank by tri angle descending, take top-N).
+    n_two_view_admitted = 0
+    n_two_view_capped = 0
+    if two_view_candidates:
+        if two_view_max_count > 0 and len(two_view_candidates) > two_view_max_count:
+            two_view_candidates.sort(key=lambda t: t[0], reverse=True)
+            n_two_view_capped = len(two_view_candidates) - two_view_max_count
+            two_view_candidates = two_view_candidates[:two_view_max_count]
+        for _tri_deg, track in two_view_candidates:
+            out.add_track(track)
+            n_two_view_admitted += 1
+
+    n_kept = n_kept_multi + n_two_view_admitted
+    cap_log = f", -{n_two_view_capped} capped (top-{two_view_max_count} kept)" if two_view_max_count > 0 else ""
+    logger.info(
+        "Multi-view retriangulation: %d kept / %d input (min_len=%d): "
+        "%d short_in, %d no_cams, %d tri_failed, %d short_out, "
+        "2-view: +%d admitted (≥%.1f°), -%d rejected (thin baseline)%s.",
+        n_kept, n_in, min_track_length, n_short_input, n_no_cams,
+        n_triangulation_failed, n_short_output,
+        n_two_view_admitted, two_view_min_tri_angle_deg, n_two_view_rejected_thin,
+        cap_log,
+    )
+    return out
+
+
+def densify_with_two_view_tracks(
+    gtsfm_data: GtsfmData,
+    tracks_2d: List["SfmTrack2d"],
+    max_reproj_error_px: float = 4.0,
+    min_tri_angle_deg: float = 3.0,
+    max_count: int = 10000,
+) -> Tuple[GtsfmData, int]:
+    """Append high-quality 2-view tracks to a post-BA GtsfmData for visualization density.
+
+    This stage is **post-BA, cameras-frozen**: it does not affect any pose-derived
+    metric (AUC, rot°, trans°). It exists purely to enrich the 3D point cloud with
+    the well-baselined subset of 2-view tracks that union-find produced but our
+    multi-view-only Phase 1 retri dropped at `min_track_length=3`. Useful for
+    densified reconstructions (Gaussian splat init, pedagogical visualizations,
+    paper figures).
+
+    Why this is safe (unlike admitting 2-view tracks pre-BA): cameras are converged
+    and locked at this point. Triangulating 2-view tracks against a frozen camera
+    rig is just static linear algebra — no LM, no oscillation, no BA wall-time
+    pathology. The reproj + tri-angle gates are also genuinely meaningful here
+    because they're evaluated against the FINAL cameras, not intermediate ones.
+
+    Args:
+        gtsfm_data: Post-BA scene with cameras + multi-view tracks. **Mutated in
+            place**: 2-view tracks are appended via `add_track`.
+        tracks_2d: Full union-find 2D track set. We only process length-2 tracks
+            (multi-view tracks are assumed already in `gtsfm_data`).
+        max_reproj_error_px: Both measurements of a 2-view track must reproject
+            within this threshold under the post-BA cameras. Default 4.0 px (matches
+            COLMAP's `filter_max_reproj_error`).
+        min_tri_angle_deg: Triangulation angle gate. Default 3.0° admits well-
+            baselined 2-view tracks while filtering near-collinear pairs.
+        max_count: Cap on admitted 2-view tracks. Candidates ranked by tri-angle
+            descending, top-N kept. Default 10,000 — generous for visualization;
+            set lower for tighter filtering.
+
+    Returns:
+        (gtsfm_data, num_added) — same gtsfm_data instance (mutated), count of
+        2-view tracks added.
+    """
+    cameras_dict = {i: cam for i, cam in gtsfm_data.cameras().items() if cam is not None}
+    if len(cameras_dict) == 0:
+        logger.info("[2-view densify] No cameras — skipping.")
+        return gtsfm_data, 0
+
+    # Pre-pick the gtsam camera-set class once, based on the calibration type.
+    sample_cam = next(iter(cameras_dict.values()))
+    if hasattr(sample_cam.calibration(), "k1"):
+        camera_set_cls = gtsam.CameraSetCal3Bundler
+    else:
+        camera_set_cls = gtsam.CameraSetCal3_S2
+
+    # Process each 2-view union-find track; collect candidates passing both gates.
+    # Candidate format: (tri_angle_deg, SfmTrack).
+    candidates: List[Tuple[float, "SfmTrack"]] = []
+    n_in_two_view = 0
+    n_no_cams = 0
+    n_tri_failed = 0
+    n_high_reproj = 0
+    n_thin_baseline = 0
+    for track_2d in tracks_2d:
+        if track_2d.number_measurements() != 2:
+            continue
+        n_in_two_view += 1
+        # Both measurements must have valid cameras.
+        if track_2d.measurements[0].i not in cameras_dict or track_2d.measurements[1].i not in cameras_dict:
+            n_no_cams += 1
+            continue
+        i0, i1 = int(track_2d.measurements[0].i), int(track_2d.measurements[1].i)
+        uv0 = np.asarray(track_2d.measurements[0].uv, dtype=float)
+        uv1 = np.asarray(track_2d.measurements[1].uv, dtype=float)
+        cam0 = cameras_dict[i0]
+        cam1 = cameras_dict[i1]
+
+        # 2-view DLT triangulation against the frozen post-BA cameras.
+        try:
+            cam_set = camera_set_cls()
+            cam_set.append(cam0)
+            cam_set.append(cam1)
+            meas = gtsam.Point2Vector()
+            meas.append(uv0)
+            meas.append(uv1)
+            xyz = gtsam.triangulatePoint3(cam_set, meas, rank_tol=1e-9, optimize=True)
+        except RuntimeError:
+            n_tri_failed += 1
+            continue
+
+        # Reproj gate (both measurements must pass against frozen cameras).
+        try:
+            proj0 = cam0.project(xyz)
+            proj1 = cam1.project(xyz)
+        except RuntimeError:
+            n_tri_failed += 1
+            continue
+        err0 = float(np.hypot(proj0[0] - uv0[0], proj0[1] - uv0[1]))
+        err1 = float(np.hypot(proj1[0] - uv1[0], proj1[1] - uv1[1]))
+        if max(err0, err1) > max_reproj_error_px:
+            n_high_reproj += 1
+            continue
+
+        # Tri-angle gate (single pair → single ray-pair angle).
+        c0 = np.asarray(cam0.pose().translation(), dtype=float)
+        c1 = np.asarray(cam1.pose().translation(), dtype=float)
+        pt = np.asarray(xyz, dtype=float)
+        r0 = c0 - pt
+        r1 = c1 - pt
+        n0, n1 = float(np.linalg.norm(r0)), float(np.linalg.norm(r1))
+        if n0 < 1e-9 or n1 < 1e-9:
+            n_thin_baseline += 1
+            continue
+        cos_angle = float(np.clip(np.dot(r0 / n0, r1 / n1), -1.0, 1.0))
+        tri_angle_deg = float(np.degrees(np.arccos(cos_angle)))
+        if tri_angle_deg < min_tri_angle_deg:
+            n_thin_baseline += 1
+            continue
+
+        # Build the 3D track with both measurements.
+        new_track = SfmTrack(xyz)
+        new_track.addMeasurement(i0, uv0)
+        new_track.addMeasurement(i1, uv1)
+        candidates.append((tri_angle_deg, new_track))
+
+    # Rank by tri-angle desc; cap at max_count.
+    n_capped = 0
+    if max_count > 0 and len(candidates) > max_count:
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        n_capped = len(candidates) - max_count
+        candidates = candidates[:max_count]
+
+    # Append to gtsfm_data (post-BA, cameras frozen — no further optimization).
+    n_added = 0
+    for _tri, track in candidates:
+        gtsfm_data.add_track(track)
+        n_added += 1
+
+    logger.info(
+        "[2-view densify] added %d tracks (max_reproj=%.1fpx, min_tri=%.1f°, cap=%d). "
+        "Of %d input 2-view tracks: %d no_cams, %d tri_failed, %d high_reproj, "
+        "%d thin_baseline, %d capped (top-tri-angle kept).",
+        n_added, max_reproj_error_px, min_tri_angle_deg, max_count,
+        n_in_two_view, n_no_cams, n_tri_failed, n_high_reproj, n_thin_baseline, n_capped,
+    )
+    return gtsfm_data, n_added
+
+
 class BundleAdjustmentOptimizer:
     """Bundle adjustment using factor-graphs in GTSAM.
 
@@ -69,7 +622,8 @@ class BundleAdjustmentOptimizer:
         max_iterations: Optional[int] = None,
         cam_pose3_prior_noise_sigma: float = 0.1,
         calibration_prior_focal_sigma: float = 20.0,
-        calibration_prior_dist_sigma: float = 0.1,
+        calibration_prior_dist_sigma: float | Sequence[float] = 0.1,
+        calibration_prior_pp_sigma: float = 1e-5,
         measurement_noise_sigma: float = 2.0,
         allow_indeterminate_linear_system: bool = True,
         print_summary: bool = False,
@@ -77,11 +631,31 @@ class BundleAdjustmentOptimizer:
         save_iteration_visualization: bool = False,
         robust_noise_basin: float = 1.345,
         use_karcher_mean_factor: bool = True,
+        use_pose_prior_all_cameras: bool = False,
+        use_pose_prior_first_camera: bool = False,
         use_calibration_prior: bool = True,
         use_first_point_prior: bool = False,
         use_gnc: bool = False,
         gnc_loss: RobustBAMode | str = RobustBAMode.GMC,
-        factor_weight_outlier_threshold: float = 1e-8,
+        factor_weight_outlier_threshold: float = 0.0,
+        min_track_length: int = 2,
+        num_outer_ba_iterations: int = 1,
+        outer_ba_filter_scaling: bool = True,
+        outer_ba_min_track_change_frac: float = 0.001,
+        positions_only_stage1: bool = False,
+        use_multi_view_retriangulation: bool = False,
+        mv_retri_min_track_length: int = 3,
+        mv_retri_reproj_error_thresh: float = 10.0,
+        mv_retri_two_view_min_tri_angle_deg: float = 0.0,
+        mv_retri_two_view_max_count: int = 0,
+        # Post-BA per-observation reproj filter + min-tri-angle filter:
+        filter_max_reproj_error_px: float = 4.0,
+        filter_min_tri_angle_deg: float = 1.5,
+        # Post-BA 2-view track densification (visualization-only):
+        densify_with_two_view_tracks: bool = False,
+        densify_two_view_max_reproj_error_px: float = 4.0,
+        densify_two_view_min_tri_angle_deg: float = 3.0,
+        densify_two_view_max_count: int = 10000,
     ) -> None:
         """Initializes the parameters for bundle adjustment module.
 
@@ -104,11 +678,13 @@ class BundleAdjustmentOptimizer:
             save_iteration_visualization (optional): Save a Plotly animation showing optimization progress.
             robust_noise_basin (optional): Basin to use for the robust noise model.
             use_karcher_mean_factor (optional): Use Karcher mean factor to constrain the camera poses.
+            use_pose_prior (optional): Use pose prior to constrain the camera poses. (only used if we use karcher mean)
             use_calibration_prior (optional): Use calibration prior to constrain the camera intrinsics.
             use_first_point_prior (optional): Use first point prior to constrain the scale of the reconstruction.
             use_gnc (optional): Use the GNC optimizer for bundle adjustment.
             gnc_loss (optional): GNC loss to use. Defaults to GMC.
             factor_weight_outlier_threshold (optional): Threshold weight for a reprojection factor to be kept.
+            min_track_length: min number of measurements required to keep a track after weight filtering.
         """
         self._reproj_error_thresholds = reproj_error_thresholds
         if isinstance(robust_ba_mode, str):
@@ -121,6 +697,7 @@ class BundleAdjustmentOptimizer:
         self._use_calibration_prior = use_calibration_prior
         self._calibration_prior_focal_sigma = calibration_prior_focal_sigma
         self._calibration_prior_dist_sigma = calibration_prior_dist_sigma
+        self._calibration_prior_pp_sigma = calibration_prior_pp_sigma
         self._measurement_noise_sigma = measurement_noise_sigma
         self._allow_indeterminate_linear_system = allow_indeterminate_linear_system
         self._ordering_type = ordering_type
@@ -128,7 +705,8 @@ class BundleAdjustmentOptimizer:
         self._save_iteration_visualization = save_iteration_visualization
         self._robust_noise_basin = robust_noise_basin
         self._use_karcher_mean_factor = use_karcher_mean_factor
-
+        self._use_pose_prior_all_cameras = use_pose_prior_all_cameras
+        self._use_pose_prior_first_camera = use_pose_prior_first_camera
         self._use_first_point_prior = use_first_point_prior
         self._use_gnc = use_gnc
         if isinstance(gnc_loss, str):
@@ -136,6 +714,38 @@ class BundleAdjustmentOptimizer:
         else:
             self._gnc_loss = gnc_loss
         self._factor_weight_outlier_threshold = factor_weight_outlier_threshold
+        self._min_track_length = min_track_length
+        self._num_outer_ba_iterations = num_outer_ba_iterations
+        self._outer_ba_filter_scaling = outer_ba_filter_scaling
+        self._outer_ba_min_track_change_frac = outer_ba_min_track_change_frac
+        self._positions_only_stage1 = positions_only_stage1
+        # ── Phase 1 retri: re-triangulate union-find tracks against post-BA cameras ──
+        self._use_multi_view_retriangulation = use_multi_view_retriangulation
+        self._mv_retri_min_track_length = mv_retri_min_track_length
+        self._mv_retri_reproj_error_thresh = mv_retri_reproj_error_thresh
+        # Stricter triangulation-angle gate for length-2 output tracks (multi-view
+        # tracks bypass — consensus across views is its own quality check). 0.0 disables.
+        self._mv_retri_two_view_min_tri_angle_deg = mv_retri_two_view_min_tri_angle_deg
+        # Hard cap on 2-view track count after the threshold gate. Candidates ranked by
+        # tri-angle desc; top-N admitted. 0 = no cap.
+        self._mv_retri_two_view_max_count = mv_retri_two_view_max_count
+
+        # ── Post-BA filters (per-observation reproj + min-tri-angle) ──
+        # `filter_landmark_measurements` trims outlier MEASUREMENTS within tracks (vs.
+        # the per-track `filter_landmarks` which would drop the whole track).
+        # 4px reproj = COLMAP `filter_max_reproj_error`; 1.5° = `filter_min_tri_angle`.
+        self._filter_max_reproj_error_px = filter_max_reproj_error_px
+        self._filter_min_tri_angle_deg = filter_min_tri_angle_deg
+
+        # ── Post-BA 2-view densification (visualization-only) ──
+        # Appends well-baselined 2-view tracks (filtered out of Phase 1 retri at
+        # min_track_length=3) to the post-BA GtsfmData. Cameras are frozen — no BA
+        # wall-time pathology. Pose-derived metrics unchanged. Useful for Gaussian-
+        # splat init, pedagogical viz, paper figures.
+        self._densify_with_two_view_tracks = densify_with_two_view_tracks
+        self._densify_two_view_max_reproj_error_px = densify_two_view_max_reproj_error_px
+        self._densify_two_view_min_tri_angle_deg = densify_two_view_min_tri_angle_deg
+        self._densify_two_view_max_count = densify_two_view_max_count
 
     def __map_to_calibration_variable(self, camera_idx: int) -> int:
         return 0 if self._shared_calib else camera_idx
@@ -210,6 +820,26 @@ class BundleAdjustmentOptimizer:
 
         return graph
 
+    def __rotation_lock_priors(
+        self,
+        initial_data: GtsfmData,
+        cameras_to_model: List[int],
+    ) -> NonlinearFactorGraph:
+        """Tight rotation-only priors used for GLOMAP-style positions-only stage-1 BA.
+
+        Pins each camera's rotation to its current value (sigma 1e-6 on rotation tangent)
+        while leaving translation free (sigma 1e6). Calibration is locked separately via
+        the existing tight calibration prior.
+        """
+        graph = NonlinearFactorGraph()
+        sigmas = np.array([1e-6, 1e-6, 1e-6, 1e6, 1e6, 1e6], dtype=float)
+        noise_model = gtsam.noiseModel.Diagonal.Sigmas(sigmas)
+        for camera_idx in cameras_to_model:
+            camera_i = initial_data.get_camera(camera_idx)
+            assert camera_i is not None, f"Camera {camera_idx} in initial data is None"
+            graph.push_back(PriorFactorPose3(X(camera_idx), camera_i.pose(), noise_model))
+        return graph
+
     def __pose_priors(
         self,
         absolute_pose_priors: List[Optional[PosePrior]],
@@ -224,7 +854,19 @@ class BundleAdjustmentOptimizer:
         if self._use_karcher_mean_factor:
             camera_keys = [X(i) for i in cameras_to_model]
             graph.push_back(gtsam.KarcherMeanFactorPose3(camera_keys, 6, 1000))
-        else:
+
+        if self._use_pose_prior_all_cameras:
+            for camera_idx in cameras_to_model:
+                camera_i = initial_data.get_camera(camera_idx)
+                assert camera_i is not None, f"Camera {camera_idx} in initial data is None"
+                graph.push_back(
+                    PriorFactorPose3(
+                        X(camera_idx),
+                        camera_i.pose(),
+                        Isotropic.Sigma(CAM_POSE3_DOF, self._cam_pose3_prior_noise_sigma),
+                    )
+                )
+        elif self._use_pose_prior_first_camera:
             first_camera = initial_data.get_camera(cameras_to_model[0])
             assert first_camera is not None, "First camera in initial data is None"
             graph.push_back(
@@ -251,7 +893,7 @@ class BundleAdjustmentOptimizer:
             first_camera.calibration(),
             focal_sigma=self._calibration_prior_focal_sigma,
             dist_sigma=self._calibration_prior_dist_sigma,
-            pp_sigma=1e-5,
+            pp_sigma=self._calibration_prior_pp_sigma,
             skew_sigma=1e-6,
         )
         if self._shared_calib:
@@ -279,7 +921,11 @@ class BundleAdjustmentOptimizer:
         return graph
 
     def __construct_simple_factor_graph(
-        self, cameras_to_model: List[int], initial_data: GtsfmData, robust_noise_basin: float | None = None
+        self,
+        cameras_to_model: List[int],
+        initial_data: GtsfmData,
+        robust_noise_basin: float | None = None,
+        lock_rotations: bool = False,
     ) -> tuple[NonlinearFactorGraph, Dict[int, gtsfm_types.CAMERA_TYPE]]:
         """Construct the factor graph with just reprojection factors and calibration priors."""
 
@@ -298,6 +944,9 @@ class BundleAdjustmentOptimizer:
             self.__pose_priors(absolute_pose_priors=[], initial_data=initial_data, cameras_to_model=cameras_to_model)
         )
 
+        if lock_rotations:
+            graph.push_back(self.__rotation_lock_priors(initial_data, cameras_to_model))
+
         if self._use_first_point_prior and initial_data.number_tracks() > 0:
             graph.push_back(
                 PriorFactorPoint3(P(0), initial_data.get_track(0).point3(), Isotropic.Sigma(POINT3_DOF, 0.1))
@@ -314,11 +963,12 @@ class BundleAdjustmentOptimizer:
         absolute_pose_priors: List[Optional[PosePrior]],
         relative_pose_priors: Dict[Tuple[int, int], PosePrior],
         robust_noise_basin: float | None = None,
+        lock_rotations: bool = False,
     ) -> tuple[NonlinearFactorGraph, Dict[int, gtsfm_types.CAMERA_TYPE]]:
         """Construct the factor graph with reprojection factors, BetweenFactors, and prior factors."""
         # Create a factor graph.
         graph, cameras_without_tracks = self.__construct_simple_factor_graph(
-            cameras_to_model, initial_data, robust_noise_basin
+            cameras_to_model, initial_data, robust_noise_basin, lock_rotations=lock_rotations
         )
 
         # Add priors
@@ -410,7 +1060,7 @@ class BundleAdjustmentOptimizer:
         result_values, _, weights = self.__optimize_factor_graph(graph, initial_values, ordering_type)
         final_error = graph.error(result_values)
         optimized_data = GtsfmData.from_values(result_values, initial_data, self._shared_calib)
-        if self._use_gnc and weights is not None:
+        if self._use_gnc and weights is not None and self._factor_weight_outlier_threshold > 0:
             optimized_data = self.__filter_tracks_by_factor_weights(graph, optimized_data, weights)
         return optimized_data, result_values, final_error
 
@@ -436,6 +1086,9 @@ class BundleAdjustmentOptimizer:
                 track_id = int(gtsam.symbolIndex(track_key))
                 cams_to_remove_per_track[track_id].add(camera_id)
 
+        if not cams_to_remove_per_track:
+            return optimized_data
+
         for track_id, camera_ids in cams_to_remove_per_track.items():
             track = optimized_data.get_track(track_id)
             new_measurements = []
@@ -444,9 +1097,27 @@ class BundleAdjustmentOptimizer:
                 if cam_id not in camera_ids:
                     new_measurements.append(track.measurement(m_idx))
             track.measurements = new_measurements
-        if cams_to_remove_per_track:
+
+        length_filtered_tracks = [
+            track for track in optimized_data.get_tracks() if track.numberMeasurements() >= self._min_track_length
+        ]
+        if len(length_filtered_tracks) == optimized_data.number_tracks():
             optimized_data._camera_to_measurement_map = None
-        return optimized_data
+            return optimized_data
+
+        image_info = {
+            image_id: optimized_data.get_image_info(image_id) for image_id in optimized_data.get_all_image_ids()
+        }
+
+        filtered_data = GtsfmData.from_cameras_and_tracks(
+            cameras=optimized_data.cameras(),
+            tracks=length_filtered_tracks,
+            number_images=optimized_data.number_images(),
+            image_info=image_info,
+            gaussian_splats=optimized_data.get_gaussian_splats(),
+        )
+
+        return filtered_data
 
     def run_simple_ba(
         self, initial_data: GtsfmData, robust_noise_basin: float | None = None
@@ -491,6 +1162,7 @@ class BundleAdjustmentOptimizer:
         relative_pose_priors: Dict[Tuple[int, int], PosePrior],
         reproj_error_thresh: Optional[float],
         verbose: bool = True,
+        lock_rotations: bool = False,
     ) -> Tuple[GtsfmData, GtsfmData, List[bool], float]:
         """Runs bundle adjustment and optionally filters the resulting tracks by reprojection error.
 
@@ -520,7 +1192,8 @@ class BundleAdjustmentOptimizer:
 
         cameras_to_model = sorted(initial_data.get_valid_camera_indices())
         graph, cameras_without_tracks = self.__construct_factor_graph(
-            cameras_to_model, initial_data, absolute_pose_priors, relative_pose_priors
+            cameras_to_model, initial_data, absolute_pose_priors, relative_pose_priors,
+            lock_rotations=lock_rotations,
         )
         optimized_data, result_values, final_error = self.__optimize_and_recover(
             initial_data, graph, self._ordering_type if not cameras_without_tracks else "COLAMD"
@@ -577,15 +1250,17 @@ class BundleAdjustmentOptimizer:
                 threshold.
         """
         num_ba_steps = len(self._reproj_error_thresholds)
+        current_data = initial_data
         for step, reproj_error_thresh in enumerate(self._reproj_error_thresholds):
-            # Use intermediate result as initial condition for next step.
+            # Use previous round's filtered result as initial condition for this step.
             (optimized_data, filtered_result, valid_mask, final_error) = self.run_ba_stage_with_filtering(
-                initial_data,
+                current_data,
                 absolute_pose_priors,
                 relative_pose_priors,
                 reproj_error_thresh,
                 verbose,
             )
+            current_data = filtered_result
             # Print intermediate results.
             if num_ba_steps > 1:
                 logger.info(
@@ -603,6 +1278,7 @@ class BundleAdjustmentOptimizer:
         cameras_gt: List[Optional[gtsfm_types.CAMERA_TYPE]],
         save_dir: Optional[str] = None,
         verbose: bool = True,
+        tracks_2d: Optional[List["SfmTrack2d"]] = None,
     ) -> Tuple[GtsfmData, GtsfmData, List[bool], GtsfmMetricsGroup]:
         """Runs the equivalent of `run_ba()` and `evaluate()` in a single function, to enable time profiling."""
         logger.info(
@@ -622,32 +1298,209 @@ class BundleAdjustmentOptimizer:
         step_times = []
         start_time = time.time()
 
-        num_ba_steps = len(self._reproj_error_thresholds)
-        assert num_ba_steps > 0, "No BA steps to perform"
+        # GLOMAP-style outer BA iteration. Mirrors global_mapper.cc:201-260 exactly:
+        #
+        #   while ite < num_outer:
+        #     run BA   (no filter)
+        #     filter_num = 0
+        #     while ite < num_outer:
+        #       scaling = max(num_outer - ite, 1)             # 3, 2, 1
+        #       filter_num += filter @ scaling * max_reproj
+        #       if filter_num > 0.1% of tracks:               # significant drop
+        #         break inner   → next outer (do BA again)
+        #       else:
+        #         ite++                                       # tighten without BA
+        #     if no significant drop ever happened: break outer (converged)
+        #     ite++
+        #
+        # This means BA count varies from 1 (early termination, tracks already settled)
+        # to num_outer (each outer iter actually needed BA after a significant filter pass).
+        # We use the LAST element of reproj_error_thresholds as the base threshold;
+        # earlier elements are ignored.
+        num_outer = max(1, self._num_outer_ba_iterations)
+        max_reproj = self._reproj_error_thresholds[-1]
+        if max_reproj is None:
+            max_reproj = 3.0  # safety: GLOMAP-default tight threshold
 
-        for step, reproj_error_thresh in enumerate(self._reproj_error_thresholds):
-            step_start_time = time.time()
-            (optimized_data, filtered_result, valid_mask, final_error) = self.run_ba_stage_with_filtering(
-                initial_data=initial_data,
+        current_data = initial_data
+        # Track state across iterations.
+        optimized_data = initial_data
+        filtered_result = initial_data
+        valid_mask: List[bool] = [True] * initial_data.number_tracks()
+        final_error = 0.0
+
+        ite = 0
+        while ite < num_outer:
+            # ── Stage 1: positions-only BA (rotations + intrinsics locked) ──
+            # GLOMAP-style: lets translations + landmarks settle before rotations move,
+            # which reduces BA basin variance on scenes with mirror-symmetric structure.
+            ba_start = time.time()
+            if self._positions_only_stage1:
+                logger.info("[OuterBA ite=%d] Stage 1: positions-only (rotations locked)", ite)
+                (stage1_data, _, _, _) = self.run_ba_stage_with_filtering(
+                    initial_data=current_data,
+                    absolute_pose_priors=absolute_pose_priors,
+                    relative_pose_priors=relative_pose_priors,
+                    reproj_error_thresh=None,
+                    verbose=verbose,
+                    lock_rotations=True,
+                )
+                current_data = stage1_data
+
+            # ── Stage 2: full BA (no filter — we filter ourselves below) ──
+            if self._positions_only_stage1:
+                logger.info("[OuterBA ite=%d] Stage 2: full BA", ite)
+            (optimized_data, _, _, final_error) = self.run_ba_stage_with_filtering(
+                initial_data=current_data,
                 absolute_pose_priors=absolute_pose_priors,
                 relative_pose_priors=relative_pose_priors,
-                reproj_error_thresh=reproj_error_thresh,
+                reproj_error_thresh=None,
                 verbose=verbose,
             )
-            step_times.append(time.time() - step_start_time)
+            current_data = optimized_data
+            step_times.append(time.time() - ba_start)
 
-            # Print intermediate results.
-            if num_ba_steps > 1:
+            # ── Inner filter loop: tighten scaling, only re-BA if significant filter drop ──
+            initial_tracks_for_iter = current_data.number_tracks()
+            filter_num = 0
+            status = True  # True == "no significant drop yet at any scaling"
+
+            while status and ite < num_outer:
+                scaling = max(num_outer - ite, 1)
+                thresh = scaling * max_reproj
+                before = current_data.number_tracks()
+                filtered_result, valid_mask = current_data.filter_landmarks(thresh)
+                after = filtered_result.number_tracks()
+                dropped = before - after
+                filter_num += dropped
+                current_data = filtered_result
+
                 logger.info(
-                    "[BA Stage @ thresh=%.2f px %d/%d] Error: %.2f, Number of tracks: %d"
-                    % (
-                        reproj_error_thresh if reproj_error_thresh is not None else float("nan"),
-                        step + 1,
-                        num_ba_steps,
-                        final_error,
-                        filtered_result.number_tracks(),
-                    )
+                    "[OuterBA ite=%d/%d, scaling=%dx (thresh=%.2fpx)] dropped %d (cumul %d / %.2f%%), tracks=%d",
+                    ite, num_outer, scaling, thresh, dropped, filter_num,
+                    100 * filter_num / max(initial_tracks_for_iter, 1), after,
                 )
+
+                if filter_num > self._outer_ba_min_track_change_frac * initial_tracks_for_iter:
+                    # Significant drop — re-run BA next outer iter.
+                    status = False
+                else:
+                    # Few changes — tighten scaling without re-running BA.
+                    ite += 1
+
+            if status:
+                logger.info(
+                    "[OuterBA] converged after iter ite=%d: filtered %d tracks (<%.3f%% threshold) — exit outer.",
+                    ite, filter_num, 100 * self._outer_ba_min_track_change_frac,
+                )
+                break
+
+            ite += 1  # mirrors GLOMAP's outer for-loop increment
+
+        # ── Phase 1 retriangulation stage ──
+        # Re-triangulate union-find tracks_2d against post-OuterBA cameras using
+        # multi_view_retriangulate_from_2d_tracks. Recovers tracks dropped between
+        # union-find (~46K) and BA's filter passes (~14K). Followed by final BA on
+        # the augmented track set + per-observation reproj filter + min-tri-angle
+        # filter for completeness.
+        # See notes/phase1_vs_glomap_full_retri.md for the full architectural story.
+        if self._use_multi_view_retriangulation:
+            if tracks_2d is None:
+                logger.warning(
+                    "use_multi_view_retriangulation is True but tracks_2d was not "
+                    "passed to _run_ba_and_evaluate — skipping retri stage."
+                )
+            else:
+                retri_start = time.time()
+                logger.info(
+                    "[Retri] Phase 1 multi-view retriangulation on %d 2D tracks "
+                    "(min_track_len=%d, reproj_error_thresh=%.1fpx)",
+                    len(tracks_2d), self._mv_retri_min_track_length,
+                    self._mv_retri_reproj_error_thresh,
+                )
+                retri_options = TriangulationOptions(
+                    reproj_error_threshold=self._mv_retri_reproj_error_thresh,
+                    mode=TriangulationSamplingMode.RANSAC_SAMPLE_UNIFORM,
+                    max_num_hypotheses=100,
+                )
+                retri_data = multi_view_retriangulate_from_2d_tracks(
+                    gtsfm_data=filtered_result,
+                    tracks_2d=tracks_2d,
+                    triangulation_options=retri_options,
+                    min_track_length=self._mv_retri_min_track_length,
+                    two_view_min_tri_angle_deg=self._mv_retri_two_view_min_tri_angle_deg,
+                    two_view_max_count=self._mv_retri_two_view_max_count,
+                )
+                logger.info(
+                    "[Retri] %d → %d tracks after Phase 1 retri (%.1fs)",
+                    filtered_result.number_tracks(), retri_data.number_tracks(),
+                    time.time() - retri_start,
+                )
+                if retri_data.number_tracks() > 0:
+                    # Per-observation filter (mirrors GLOMAP's
+                    # FilterPoints3DWithLargeReprojectionError, observation_manager.cc:407):
+                    # trims outlier MEASUREMENTS instead of dropping whole tracks. A track
+                    # with 9 good measurements + 1 bad outlier loses just the outlier; with
+                    # the prior per-track filter (`filter_landmarks`) the whole track was
+                    # killed. Bumped threshold from 3 → 4px to match COLMAP's default
+                    # `filter_max_reproj_error`.
+                    filter_reproj = self._filter_max_reproj_error_px
+                    final_ba_start = time.time()
+                    logger.info(
+                        "[Retri] Final BA on %d retri'd tracks", retri_data.number_tracks(),
+                    )
+                    (optimized_data, filtered_result, valid_mask, _) = self.run_ba_stage_with_filtering(
+                        initial_data=retri_data,
+                        absolute_pose_priors=absolute_pose_priors,
+                        relative_pose_priors=relative_pose_priors,
+                        reproj_error_thresh=None,  # per-obs filter applied below instead
+                        verbose=verbose,
+                    )
+                    n_pre_filter = filtered_result.number_tracks()
+                    filtered_result = filtered_result.filter_landmark_measurements(
+                        reproj_err_thresh=filter_reproj,
+                        min_track_length=2,
+                        retain_cameras_without_tracks=True,
+                    )
+                    if self._filter_min_tri_angle_deg > 0:
+                        filtered_result = filter_tracks_by_min_tri_angle(
+                            filtered_result, self._filter_min_tri_angle_deg,
+                        )
+                    valid_mask = [True] * filtered_result.number_tracks()
+                    logger.info(
+                        "[Retri] Phase 1 final BA + per-obs filter (reproj<%.1fpx, "
+                        "min_tri≥%.1f°): %d → %d tracks, %.1fs (full retri stage %.1fs)",
+                        filter_reproj, self._filter_min_tri_angle_deg,
+                        n_pre_filter, filtered_result.number_tracks(),
+                        time.time() - final_ba_start, time.time() - retri_start,
+                    )
+                step_times.append(time.time() - retri_start)
+
+
+        # ── Visualization-only 2-view track densification ──
+        # Post-BA, cameras frozen. Appends well-baselined 2-view tracks (filtered out
+        # of Phase 1 retri at min_track_length=3) to densify the 3D point cloud for
+        # downstream visualization / Gaussian-splat init. Does not affect pose-derived
+        # metrics — cameras are locked at this point. AUC/rot°/trans° remain identical
+        # to the pre-densification values; only track count grows.
+        if self._densify_with_two_view_tracks and tracks_2d is not None:
+            densify_start = time.time()
+            n_pre = filtered_result.number_tracks()
+            filtered_result, n_added = densify_with_two_view_tracks(
+                gtsfm_data=filtered_result,
+                tracks_2d=tracks_2d,
+                max_reproj_error_px=self._densify_two_view_max_reproj_error_px,
+                min_tri_angle_deg=self._densify_two_view_min_tri_angle_deg,
+                max_count=self._densify_two_view_max_count,
+            )
+            valid_mask = [True] * filtered_result.number_tracks()
+            logger.info(
+                "[Densify] %d → %d tracks (+%d 2-view, %.1fs).",
+                n_pre, filtered_result.number_tracks(), n_added,
+                time.time() - densify_start,
+            )
+            step_times.append(time.time() - densify_start)
+
         total_time = time.time() - start_time
 
         metrics = self.evaluate(optimized_data, filtered_result, cameras_gt, save_dir)  # type: ignore
@@ -686,7 +1539,8 @@ class BundleAdjustmentOptimizer:
         # Align the sparse multi-view estimate after BA to the ground truth pose graph.
         aligned_filtered_data = filtered_data.align_via_sim3_and_transform(poses_gt)
         ba_pose_error_metrics = metrics_utils.compute_ba_pose_metrics(
-            gt_wTi=poses_gt, computed_wTi=aligned_filtered_data.get_camera_poses(), save_dir=save_dir
+            gt_wTi=poses_gt, computed_wTi=aligned_filtered_data.get_camera_poses(), save_dir=save_dir,
+            metric_constructed_only=True,
         )
         ba_metrics.extend(metrics_group=ba_pose_error_metrics)
 
@@ -714,6 +1568,7 @@ class BundleAdjustmentOptimizer:
         relative_pose_priors: Dict[Tuple[int, int], PosePrior],
         cameras_gt: List[Optional[gtsfm_types.CAMERA_TYPE]],
         save_dir: Optional[str] = None,
+        tracks_2d: Optional[Delayed] = None,
     ) -> Tuple[Delayed, Delayed]:
         """Create the computation graph for performing bundle adjustment.
 
@@ -723,6 +1578,9 @@ class BundleAdjustmentOptimizer:
             relative_pose_priors: Priors on poses between cameras (not delayed).
             cameras_gt: Ground truth camera calibration & pose for each image/camera.
             save_dir: Directory where artifacts and plots should be saved to disk.
+            tracks_2d: (optional) Delayed list of 2D tracks from CppDsfTracksEstimator.
+                Required if `use_multi_view_retriangulation` is enabled — used to retriangulate
+                the full union-find track set with post-BA cameras.
 
         Returns:
             GtsfmData aligned to GT (if provided), wrapped up using dask.delayed
@@ -735,5 +1593,6 @@ class BundleAdjustmentOptimizer:
             relative_pose_priors,
             cameras_gt,
             save_dir=save_dir,
+            tracks_2d=tracks_2d,
         )
         return filtered_sfm_data, metrics_graph

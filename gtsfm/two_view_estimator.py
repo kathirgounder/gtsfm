@@ -20,6 +20,7 @@ import gtsfm.common.types as gtsfm_types
 import gtsfm.utils.geometry_comparisons as comp_utils
 import gtsfm.utils.logger as logger_utils
 import gtsfm.utils.metrics as metric_utils
+import gtsfm.utils.verification as verification_utils
 from gtsfm.bundle.two_view_ba import TwoViewBundleAdjustment
 from gtsfm.bundle.bundle_adjustment import RobustBAMode
 from gtsfm.common.dask_db_module_base import DaskDBModuleBase
@@ -92,8 +93,9 @@ class TwoViewEstimator(DaskDBModuleBase):
             use_calibration_prior=True,
             robust_noise_basin=1.345,
             use_karcher_mean_factor=False,
-            calibration_prior_focal_sigma=1e-5,
-            calibration_prior_dist_sigma=1e-5,
+            use_pose_prior_first_camera=True,
+            calibration_prior_focal_sigma=20.0,
+            calibration_prior_dist_sigma=0.1,
             cam_pose3_prior_noise_sigma=0.1,
             measurement_noise_sigma=1.0,
         )
@@ -407,6 +409,10 @@ class TwoViewEstimator(DaskDBModuleBase):
             gt_camera_i2=gt_camera_i2,
             gt_scene_mesh=gt_scene_mesh,
         )
+
+        # Note: Track quality filtering (epipole + cheirality + angle) is now done as a separate
+        # F-matrix re-scoring pass in multi_view_optimizer.py, using intrinsic-independent F-matrix
+        # Sampson error. This is more robust than the E-matrix based filtering that was here before.
 
         # Optionally, do two-view bundle adjustment
         if self._bundle_adjust_2view and len(pre_ba_v_corr_idxs) >= self.processor._min_num_inliers_est_model:
