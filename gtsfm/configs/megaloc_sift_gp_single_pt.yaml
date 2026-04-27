@@ -15,8 +15,8 @@ image_pairs_generator:
       _target_: gtsfm.frontend.global_descriptor.MegaLoc
   retriever:
     _target_: gtsfm.retriever.Similarity
-    num_matched: 75
-    min_score: 0.20
+    num_matched: 50
+    min_score: 0.25
     use_diffusion_preprocessing: false
     use_mst_augmentation: false
   batch_size: 16
@@ -114,6 +114,14 @@ cluster_optimizer:
       min_track_measurements: 3
       max_reproj_error: 10.0
       save_iteration_visualization: True
+      # GLOMAP-style GP filter (uncalibrated cameras path, global_mapper.cc:233-281).
+      # 3-pass sequential filter: 2x angular relaxed → min tri angle → 10x NORMALIZED reproj.
+      # Way more permissive than the legacy 1° AND 10px filter — keeps more measurements
+      # per track to give BA more constraints.
+      use_glomap_filter: true
+      glomap_max_angular_reproj_error_deg: 5.0
+      glomap_min_tri_angle_deg: 1.0
+      glomap_max_normalized_reproj_error: 0.01
 
     run_view_graph_calibration: true
     rotation_outlier_threshold_deg: 0
@@ -141,19 +149,41 @@ cluster_optimizer:
       # suboptimal RA basin prevents BA from escaping it. The single-stage
       # outer loop's bigger BA step is doing the real work on Brussels.
       positions_only_stage1: false
-      # GLOMAP-style multi-view retriangulation: after the outer BA loop converges,
-      # re-triangulate the full 2D track set from union-find with post-BA cameras,
-      # then run a final BA on the augmented set. Recovers tracks that were dropped
-      # between union-find (~46K) and BA's filter passes (~14K). See plan Phase 1.
+      # ── Phase 1 multi-view retriangulation ──
+      # After the outer BA loop converges, re-triangulate the full 2D track set
+      # (union-find tracks_2d) with the post-BA cameras, then run a final BA on
+      # the augmented set. Recovers tracks dropped between union-find (~40K) and
+      # OuterBA's filter passes (~15K). 2-view tracks are excluded — they
+      # annihilate BA wall time in Python/GTSAM (under-conditioned LM directions).
+      # See notes/phase1_vs_glomap_full_retri.md for the full architectural story.
       use_multi_view_retriangulation: true
       mv_retri_min_track_length: 3
       mv_retri_reproj_error_thresh: 10.0
-      # Phase 2: COLMAP §4.3 recursive triangulation splitter. Each input 2D track
-      # may produce multiple 3D points if union-find falsely merged independent
-      # observations. Targets repetitive-feature scenes (Brussels bimodal, BM
-      # colonnade, Pantheon columns). Default false — flip to true to test.
-      mv_retri_use_recursive_splitter: false
-      mv_retri_recursive_max_depth: 5
+      # 2-view admission disabled (min_track_length=3). Knobs kept for sweep configs.
+      mv_retri_two_view_min_tri_angle_deg: 0.0
+      mv_retri_two_view_max_count: 0
+
+      # ── Post-BA per-observation reproj filter + min-tri-angle filter ──
+      # Per-observation granularity: trims outlier MEASUREMENTS within a track,
+      # keeps the track as long as ≥2 measurements survive. Replaces the prior
+      # per-track filter that killed whole tracks for any aggregate-reproj outlier.
+      # 6px / 0.5° are slightly looser than COLMAP's 4px / 1.5° defaults for
+      # completeness — tight-baseline multi-view tracks add coverage without
+      # affecting pose estimation.
+      filter_max_reproj_error_px: 6.0
+      filter_min_tri_angle_deg: 0.5
+
+      # ── Post-BA 2-view track densification (visualization-only) ──
+      # Cameras are FROZEN at this stage — no BA wall-time pathology, no effect on
+      # pose-derived metrics (AUC/rot°/trans° are byte-identical). Triangulates the
+      # 22,876 union-find 2-view tracks against the final cameras, gates by reproj +
+      # tri-angle, ranks by tri-angle, takes top-N. Pure point cloud densification
+      # for visualization / Gaussian-splat init / paper figures.
+      densify_with_two_view_tracks: true
+      # 4px reproj on FROZEN cameras is meaningful (cameras locked-in, no LM noise).
+      densify_two_view_max_reproj_error_px: 4.0
+      densify_two_view_min_tri_angle_deg: 3.0
+      densify_two_view_max_count: 10000
 
   dense_multiview_optimizer: null
   gaussian_splatting_optimizer: null

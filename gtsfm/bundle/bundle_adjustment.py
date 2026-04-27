@@ -14,7 +14,7 @@ import dask
 import gtsam  # type: ignore
 import numpy as np
 from dask.delayed import Delayed
-from gtsam import BetweenFactorPose3, NonlinearFactorGraph, PriorFactorPoint3, PriorFactorPose3, Values  # type: ignore
+from gtsam import BetweenFactorPose3, NonlinearFactorGraph, PriorFactorPoint3, PriorFactorPose3, SfmTrack, Values  # type: ignore
 from gtsam.noiseModel import Diagonal, Isotropic, Robust, mEstimator  # type: ignore
 from gtsam.symbol_shorthand import K, P, X  # type: ignore
 from numpy.typing import NDArray
@@ -33,7 +33,6 @@ from gtsfm.data_association.point3d_initializer import (
     TriangulationOptions,
     TriangulationSamplingMode,
 )
-from gtsfm.data_association.recursive_triangulator import triangulate_track_recursive
 from gtsfm.evaluation.metrics import GtsfmMetric, GtsfmMetricsGroup
 
 METRICS_GROUP = "bundle_adjustment_metrics"
@@ -238,38 +237,115 @@ def filter_outlier_cameras(data: GtsfmData, min_covisibility_count: int = 5, min
     return filtered
 
 
+def filter_tracks_by_min_tri_angle(
+    gtsfm_data: GtsfmData,
+    min_tri_angle_deg: float,
+) -> GtsfmData:
+    """Drop tracks whose max pairwise triangulation angle is below `min_tri_angle_deg`.
+
+    Mirrors GLOMAP's FilterPoints3DWithSmallTriangulationAngle (observation_manager.cc:345).
+    Vectorized: precomputes all camera centers as one numpy array, then per-track does
+    O(N²) pairwise angle via broadcasting + early-exit on first qualifying pair. ~1000x
+    faster than the naive `itertools.combinations` + GTSAM Unit3 approach for tracks
+    with mean length ~40+ measurements.
+
+    Args:
+        gtsfm_data: scene with cameras + tracks (post-BA).
+        min_tri_angle_deg: minimum required triangulation angle. GLOMAP default = 1.0°.
+
+    Returns:
+        New GtsfmData with cameras unchanged and degenerate tracks removed.
+    """
+    if min_tri_angle_deg <= 0:
+        return gtsfm_data
+
+    cameras_dict = {i: cam for i, cam in gtsfm_data.cameras().items() if cam is not None}
+    out = GtsfmData(gtsfm_data.number_images())
+    for cam_idx, cam in cameras_dict.items():
+        out.add_camera(cam_idx, cam)
+        info = gtsfm_data.get_image_info(cam_idx)
+        out.set_image_info(cam_idx, name=info.name, shape=info.shape)
+
+    # Precompute camera centers once (one (3,) vector per camera index).
+    centers: Dict[int, np.ndarray] = {}
+    for cam_idx, cam in cameras_dict.items():
+        centers[cam_idx] = np.asarray(cam.pose().translation(), dtype=float)
+
+    cos_threshold = float(np.cos(np.deg2rad(min_tri_angle_deg)))
+
+    n_in = gtsfm_data.number_tracks()
+    n_kept = 0
+    n_dropped = 0
+    for j in range(n_in):
+        track = gtsfm_data.get_track(j)
+        n_meas = track.numberMeasurements()
+        if n_meas < 2:
+            n_dropped += 1
+            continue
+        # Gather camera centers and compute rays (centers - point_3d).
+        point_3d = np.asarray(track.point3(), dtype=float)
+        cam_centers_list: List[np.ndarray] = []
+        for k in range(n_meas):
+            i, _ = track.measurement(k)
+            c = centers.get(int(i))
+            if c is None:
+                continue
+            cam_centers_list.append(c)
+        if len(cam_centers_list) < 2:
+            n_dropped += 1
+            continue
+        cam_centers = np.stack(cam_centers_list, axis=0)         # (N, 3)
+        rays = cam_centers - point_3d                            # (N, 3) — point→camera rays
+        norms = np.linalg.norm(rays, axis=1)                     # (N,)
+        valid = norms > 1e-9
+        if valid.sum() < 2:
+            n_dropped += 1
+            continue
+        rays = rays[valid] / norms[valid, None]                  # (M, 3) — unit rays
+        # Pairwise cos via dot product. The MAX angle = MIN cos (since cos is monotonic
+        # decreasing on [0, π]). If min cos < cos_threshold → max angle > threshold → keep.
+        cos_matrix = rays @ rays.T                               # (M, M)
+        np.fill_diagonal(cos_matrix, 1.0)                        # ignore self-pairs
+        min_cos = float(cos_matrix.min())
+        if min_cos < cos_threshold:
+            out.add_track(track)
+            n_kept += 1
+        else:
+            n_dropped += 1
+    logger.info(
+        "Min triangulation angle filter (≥ %.2f°): %d kept / %d input (%d dropped).",
+        min_tri_angle_deg, n_kept, n_in, n_dropped,
+    )
+    return out
+
+
 def multi_view_retriangulate_from_2d_tracks(
     gtsfm_data: GtsfmData,
     tracks_2d: List["SfmTrack2d"],
     triangulation_options: Optional[TriangulationOptions] = None,
     min_track_length: int = 3,
-    use_recursive_splitter: bool = False,
-    recursive_max_depth: int = 5,
+    two_view_min_tri_angle_deg: float = 0.0,
+    two_view_max_count: int = 0,
 ) -> GtsfmData:
-    """GLOMAP-style multi-view retriangulation.
+    """GLOMAP-style initial multi-view retriangulation (Phase 1).
 
-    Re-triangulates the FULL 2D track set with the current (post-BA) cameras. The lift over
-    `gtsfm_data`'s existing track set comes from recovering tracks that were dropped between
-    union-find (CppDsfTracksEstimator) and BA's filter passes — these are the tracks GLOMAP
-    rescues in their retri stage (incremental_triangulator.cc::Retriangulate).
-
-    GLOMAP doesn't re-match features here; it reuses correspondences from the cached match
-    graph. We do the same — `tracks_2d` is the union-find output, no re-matching.
+    Re-triangulates the union-find 2D track set with the current (post-BA) cameras.
 
     Args:
         gtsfm_data: Scene with optimized cameras (existing tracks ignored; cameras re-used).
         tracks_2d: Full 2D track set from `CppDsfTracksEstimator.run()`.
         triangulation_options: Per-track solve config. Defaults to RANSAC_SAMPLE_UNIFORM,
             reproj_error_threshold=10 px, max_num_hypotheses=100.
-        min_track_length: Drop tracks with fewer measurements than this (input + output).
-            5e1183e1 found 3 best for British Museum — pure 2-view tracks flood BA with
-            weak constraints. Brussels' bimodal scene may benefit from 2 (Phase 2 sweep).
-        use_recursive_splitter: When True, use COLMAP-paper Section 4.3 recursive
-            triangulation. Each input track may produce *multiple* output 3D points if it
-            was a faulty union-find merge. Targets repetitive-feature scenes (Brussels'
-            bimodal plaza, BM's colonnade, Pantheon's columns).
-        recursive_max_depth: Max recursive splits per input track (only used when
-            use_recursive_splitter=True). Default 5.
+        min_track_length: Drop tracks with fewer measurements than this. Set to 2 to
+            admit 2-view tracks (then `two_view_min_tri_angle_deg` gates them by quality).
+        two_view_min_tri_angle_deg: Stricter triangulation-angle gate applied ONLY to
+            2-view output tracks. Multi-view tracks (length ≥ 3) are not affected by
+            this. Default 0.0 = no extra gate.
+        two_view_max_count: If > 0, cap the number of admitted 2-view tracks to this
+            value. After the threshold gate, candidates are ranked by tri-angle and
+            only the top-N admitted. Useful when Python/GTSAM BA wall time is bounded
+            and we want only the highest-quality 2-view supplements (e.g., 500-800).
+            Default 0 = no cap (admit all that pass `two_view_min_tri_angle_deg`).
 
     Returns:
         New GtsfmData with same cameras and an augmented track set.
@@ -287,14 +363,26 @@ def multi_view_retriangulate_from_2d_tracks(
     out = GtsfmData(gtsfm_data.number_images())
     for cam_idx, camera in camera_dict.items():
         out.add_camera(cam_idx, camera)
+        info = gtsfm_data.get_image_info(cam_idx)
+        out.set_image_info(cam_idx, name=info.name, shape=info.shape)
+
+    # Precompute camera centers for the fast 2-view tri-angle gate.
+    camera_centers: Dict[int, np.ndarray] = {}
+    if two_view_min_tri_angle_deg > 0:
+        for cam_idx, cam in camera_dict.items():
+            camera_centers[cam_idx] = np.asarray(cam.pose().translation(), dtype=float)
+    cos_2view_threshold = float(np.cos(np.deg2rad(two_view_min_tri_angle_deg))) if two_view_min_tri_angle_deg > 0 else 1.0
 
     n_in = len(tracks_2d)
-    n_kept = 0
+    n_kept_multi = 0  # multi-view tracks added immediately to `out`
     n_short_input = 0
     n_no_cams = 0
     n_short_output = 0
     n_triangulation_failed = 0
-    n_split_into_multiple = 0  # how many input tracks produced > 1 output (recursive only)
+    n_two_view_rejected_thin = 0
+    # Buffer 2-view candidates so we can rank-and-cap at the end (if cap enabled).
+    # Each entry: (tri_angle_deg, SfmTrack).
+    two_view_candidates: List[Tuple[float, "SfmTrack"]] = []
     for track_2d in tracks_2d:
         if track_2d.number_measurements() < min_track_length:
             n_short_input += 1
@@ -305,49 +393,215 @@ def multi_view_retriangulate_from_2d_tracks(
             continue
         track_2d_filtered = SfmTrack2d(measurements=valid_measurements)
 
-        if use_recursive_splitter:
-            new_tracks = triangulate_track_recursive(
-                track_2d_filtered, initializer,
-                min_consensus_size=min_track_length,
-                max_recursion_depth=recursive_max_depth,
-            )
-            if not new_tracks:
-                n_triangulation_failed += 1
-                continue
-            if len(new_tracks) > 1:
-                n_split_into_multiple += 1
-            for new_track in new_tracks:
-                if new_track.numberMeasurements() < min_track_length:
-                    n_short_output += 1
+        new_track, _, _ = initializer.triangulate(track_2d_filtered)
+        if new_track is None:
+            n_triangulation_failed += 1
+            continue
+        if new_track.numberMeasurements() < min_track_length:
+            n_short_output += 1
+            continue
+
+        # 2-view tracks: compute tri angle, gate by threshold, buffer for cap.
+        # Multi-view tracks (length ≥ 3) bypass the gate and add immediately.
+        if new_track.numberMeasurements() == 2 and (two_view_min_tri_angle_deg > 0 or two_view_max_count > 0):
+            i0, _ = new_track.measurement(0)
+            i1, _ = new_track.measurement(1)
+            c0 = camera_centers.get(int(i0)) if camera_centers else None
+            c1 = camera_centers.get(int(i1)) if camera_centers else None
+            if c0 is None or c1 is None:
+                # camera_centers wasn't pre-populated (gate disabled); fall through to immediate add.
+                if two_view_min_tri_angle_deg > 0:
+                    n_two_view_rejected_thin += 1
                     continue
                 out.add_track(new_track)
-                n_kept += 1
+                n_kept_multi += 1
+                continue
+            point_3d = np.asarray(new_track.point3(), dtype=float)
+            r0 = c0 - point_3d
+            r1 = c1 - point_3d
+            n0, n1 = float(np.linalg.norm(r0)), float(np.linalg.norm(r1))
+            if n0 < 1e-9 or n1 < 1e-9:
+                n_two_view_rejected_thin += 1
+                continue
+            cos_angle = float(np.clip(np.dot(r0 / n0, r1 / n1), -1.0, 1.0))
+            tri_angle_deg = float(np.degrees(np.arccos(cos_angle)))
+            if two_view_min_tri_angle_deg > 0 and tri_angle_deg < two_view_min_tri_angle_deg:
+                n_two_view_rejected_thin += 1
+                continue
+            two_view_candidates.append((tri_angle_deg, new_track))
         else:
-            new_track, _, _ = initializer.triangulate(track_2d_filtered)
-            if new_track is None:
-                n_triangulation_failed += 1
-                continue
-            if new_track.numberMeasurements() < min_track_length:
-                n_short_output += 1
-                continue
             out.add_track(new_track)
-            n_kept += 1
+            n_kept_multi += 1
 
-    if use_recursive_splitter:
-        logger.info(
-            "Multi-view retriangulation (recursive): %d kept / %d input (min_len=%d): "
-            "%d short_in, %d no_cams, %d tri_failed, %d short_out, %d input tracks split into >1 output.",
-            n_kept, n_in, min_track_length, n_short_input, n_no_cams,
-            n_triangulation_failed, n_short_output, n_split_into_multiple,
-        )
-    else:
-        logger.info(
-            "Multi-view retriangulation: %d kept / %d input (min_len=%d): "
-            "%d short_in, %d no_cams, %d tri_failed, %d short_out.",
-            n_kept, n_in, min_track_length, n_short_input, n_no_cams,
-            n_triangulation_failed, n_short_output,
-        )
+    # Apply hard cap on 2-view tracks (rank by tri angle descending, take top-N).
+    n_two_view_admitted = 0
+    n_two_view_capped = 0
+    if two_view_candidates:
+        if two_view_max_count > 0 and len(two_view_candidates) > two_view_max_count:
+            two_view_candidates.sort(key=lambda t: t[0], reverse=True)
+            n_two_view_capped = len(two_view_candidates) - two_view_max_count
+            two_view_candidates = two_view_candidates[:two_view_max_count]
+        for _tri_deg, track in two_view_candidates:
+            out.add_track(track)
+            n_two_view_admitted += 1
+
+    n_kept = n_kept_multi + n_two_view_admitted
+    cap_log = f", -{n_two_view_capped} capped (top-{two_view_max_count} kept)" if two_view_max_count > 0 else ""
+    logger.info(
+        "Multi-view retriangulation: %d kept / %d input (min_len=%d): "
+        "%d short_in, %d no_cams, %d tri_failed, %d short_out, "
+        "2-view: +%d admitted (≥%.1f°), -%d rejected (thin baseline)%s.",
+        n_kept, n_in, min_track_length, n_short_input, n_no_cams,
+        n_triangulation_failed, n_short_output,
+        n_two_view_admitted, two_view_min_tri_angle_deg, n_two_view_rejected_thin,
+        cap_log,
+    )
     return out
+
+
+def densify_with_two_view_tracks(
+    gtsfm_data: GtsfmData,
+    tracks_2d: List["SfmTrack2d"],
+    max_reproj_error_px: float = 4.0,
+    min_tri_angle_deg: float = 3.0,
+    max_count: int = 10000,
+) -> Tuple[GtsfmData, int]:
+    """Append high-quality 2-view tracks to a post-BA GtsfmData for visualization density.
+
+    This stage is **post-BA, cameras-frozen**: it does not affect any pose-derived
+    metric (AUC, rot°, trans°). It exists purely to enrich the 3D point cloud with
+    the well-baselined subset of 2-view tracks that union-find produced but our
+    multi-view-only Phase 1 retri dropped at `min_track_length=3`. Useful for
+    densified reconstructions (Gaussian splat init, pedagogical visualizations,
+    paper figures).
+
+    Why this is safe (unlike admitting 2-view tracks pre-BA): cameras are converged
+    and locked at this point. Triangulating 2-view tracks against a frozen camera
+    rig is just static linear algebra — no LM, no oscillation, no BA wall-time
+    pathology. The reproj + tri-angle gates are also genuinely meaningful here
+    because they're evaluated against the FINAL cameras, not intermediate ones.
+
+    Args:
+        gtsfm_data: Post-BA scene with cameras + multi-view tracks. **Mutated in
+            place**: 2-view tracks are appended via `add_track`.
+        tracks_2d: Full union-find 2D track set. We only process length-2 tracks
+            (multi-view tracks are assumed already in `gtsfm_data`).
+        max_reproj_error_px: Both measurements of a 2-view track must reproject
+            within this threshold under the post-BA cameras. Default 4.0 px (matches
+            COLMAP's `filter_max_reproj_error`).
+        min_tri_angle_deg: Triangulation angle gate. Default 3.0° admits well-
+            baselined 2-view tracks while filtering near-collinear pairs.
+        max_count: Cap on admitted 2-view tracks. Candidates ranked by tri-angle
+            descending, top-N kept. Default 10,000 — generous for visualization;
+            set lower for tighter filtering.
+
+    Returns:
+        (gtsfm_data, num_added) — same gtsfm_data instance (mutated), count of
+        2-view tracks added.
+    """
+    cameras_dict = {i: cam for i, cam in gtsfm_data.cameras().items() if cam is not None}
+    if len(cameras_dict) == 0:
+        logger.info("[2-view densify] No cameras — skipping.")
+        return gtsfm_data, 0
+
+    # Pre-pick the gtsam camera-set class once, based on the calibration type.
+    sample_cam = next(iter(cameras_dict.values()))
+    if hasattr(sample_cam.calibration(), "k1"):
+        camera_set_cls = gtsam.CameraSetCal3Bundler
+    else:
+        camera_set_cls = gtsam.CameraSetCal3_S2
+
+    # Process each 2-view union-find track; collect candidates passing both gates.
+    # Candidate format: (tri_angle_deg, SfmTrack).
+    candidates: List[Tuple[float, "SfmTrack"]] = []
+    n_in_two_view = 0
+    n_no_cams = 0
+    n_tri_failed = 0
+    n_high_reproj = 0
+    n_thin_baseline = 0
+    for track_2d in tracks_2d:
+        if track_2d.number_measurements() != 2:
+            continue
+        n_in_two_view += 1
+        # Both measurements must have valid cameras.
+        if track_2d.measurements[0].i not in cameras_dict or track_2d.measurements[1].i not in cameras_dict:
+            n_no_cams += 1
+            continue
+        i0, i1 = int(track_2d.measurements[0].i), int(track_2d.measurements[1].i)
+        uv0 = np.asarray(track_2d.measurements[0].uv, dtype=float)
+        uv1 = np.asarray(track_2d.measurements[1].uv, dtype=float)
+        cam0 = cameras_dict[i0]
+        cam1 = cameras_dict[i1]
+
+        # 2-view DLT triangulation against the frozen post-BA cameras.
+        try:
+            cam_set = camera_set_cls()
+            cam_set.append(cam0)
+            cam_set.append(cam1)
+            meas = gtsam.Point2Vector()
+            meas.append(uv0)
+            meas.append(uv1)
+            xyz = gtsam.triangulatePoint3(cam_set, meas, rank_tol=1e-9, optimize=True)
+        except RuntimeError:
+            n_tri_failed += 1
+            continue
+
+        # Reproj gate (both measurements must pass against frozen cameras).
+        try:
+            proj0 = cam0.project(xyz)
+            proj1 = cam1.project(xyz)
+        except RuntimeError:
+            n_tri_failed += 1
+            continue
+        err0 = float(np.hypot(proj0[0] - uv0[0], proj0[1] - uv0[1]))
+        err1 = float(np.hypot(proj1[0] - uv1[0], proj1[1] - uv1[1]))
+        if max(err0, err1) > max_reproj_error_px:
+            n_high_reproj += 1
+            continue
+
+        # Tri-angle gate (single pair → single ray-pair angle).
+        c0 = np.asarray(cam0.pose().translation(), dtype=float)
+        c1 = np.asarray(cam1.pose().translation(), dtype=float)
+        pt = np.asarray(xyz, dtype=float)
+        r0 = c0 - pt
+        r1 = c1 - pt
+        n0, n1 = float(np.linalg.norm(r0)), float(np.linalg.norm(r1))
+        if n0 < 1e-9 or n1 < 1e-9:
+            n_thin_baseline += 1
+            continue
+        cos_angle = float(np.clip(np.dot(r0 / n0, r1 / n1), -1.0, 1.0))
+        tri_angle_deg = float(np.degrees(np.arccos(cos_angle)))
+        if tri_angle_deg < min_tri_angle_deg:
+            n_thin_baseline += 1
+            continue
+
+        # Build the 3D track with both measurements.
+        new_track = SfmTrack(xyz)
+        new_track.addMeasurement(i0, uv0)
+        new_track.addMeasurement(i1, uv1)
+        candidates.append((tri_angle_deg, new_track))
+
+    # Rank by tri-angle desc; cap at max_count.
+    n_capped = 0
+    if max_count > 0 and len(candidates) > max_count:
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        n_capped = len(candidates) - max_count
+        candidates = candidates[:max_count]
+
+    # Append to gtsfm_data (post-BA, cameras frozen — no further optimization).
+    n_added = 0
+    for _tri, track in candidates:
+        gtsfm_data.add_track(track)
+        n_added += 1
+
+    logger.info(
+        "[2-view densify] added %d tracks (max_reproj=%.1fpx, min_tri=%.1f°, cap=%d). "
+        "Of %d input 2-view tracks: %d no_cams, %d tri_failed, %d high_reproj, "
+        "%d thin_baseline, %d capped (top-tri-angle kept).",
+        n_added, max_reproj_error_px, min_tri_angle_deg, max_count,
+        n_in_two_view, n_no_cams, n_tri_failed, n_high_reproj, n_thin_baseline, n_capped,
+    )
+    return gtsfm_data, n_added
 
 
 class BundleAdjustmentOptimizer:
@@ -392,8 +646,16 @@ class BundleAdjustmentOptimizer:
         use_multi_view_retriangulation: bool = False,
         mv_retri_min_track_length: int = 3,
         mv_retri_reproj_error_thresh: float = 10.0,
-        mv_retri_use_recursive_splitter: bool = False,
-        mv_retri_recursive_max_depth: int = 5,
+        mv_retri_two_view_min_tri_angle_deg: float = 0.0,
+        mv_retri_two_view_max_count: int = 0,
+        # Post-BA per-observation reproj filter + min-tri-angle filter:
+        filter_max_reproj_error_px: float = 4.0,
+        filter_min_tri_angle_deg: float = 1.5,
+        # Post-BA 2-view track densification (visualization-only):
+        densify_with_two_view_tracks: bool = False,
+        densify_two_view_max_reproj_error_px: float = 4.0,
+        densify_two_view_min_tri_angle_deg: float = 3.0,
+        densify_two_view_max_count: int = 10000,
     ) -> None:
         """Initializes the parameters for bundle adjustment module.
 
@@ -457,17 +719,33 @@ class BundleAdjustmentOptimizer:
         self._outer_ba_filter_scaling = outer_ba_filter_scaling
         self._outer_ba_min_track_change_frac = outer_ba_min_track_change_frac
         self._positions_only_stage1 = positions_only_stage1
-        # GLOMAP-style multi-view retriangulation (after the outer BA loop converges).
-        # See multi_view_retriangulate_from_2d_tracks above + plan section "Phase 1".
+        # ── Phase 1 retri: re-triangulate union-find tracks against post-BA cameras ──
         self._use_multi_view_retriangulation = use_multi_view_retriangulation
         self._mv_retri_min_track_length = mv_retri_min_track_length
         self._mv_retri_reproj_error_thresh = mv_retri_reproj_error_thresh
-        # Phase 2: COLMAP paper §4.3 recursive triangulation splitter. When True, each
-        # input 2D track may produce multiple 3D points if it was a faulty union-find
-        # merge. Targets repetitive-feature scenes (Brussels bimodal, BM colonnade,
-        # Pantheon columns). See gtsfm/data_association/recursive_triangulator.py.
-        self._mv_retri_use_recursive_splitter = mv_retri_use_recursive_splitter
-        self._mv_retri_recursive_max_depth = mv_retri_recursive_max_depth
+        # Stricter triangulation-angle gate for length-2 output tracks (multi-view
+        # tracks bypass — consensus across views is its own quality check). 0.0 disables.
+        self._mv_retri_two_view_min_tri_angle_deg = mv_retri_two_view_min_tri_angle_deg
+        # Hard cap on 2-view track count after the threshold gate. Candidates ranked by
+        # tri-angle desc; top-N admitted. 0 = no cap.
+        self._mv_retri_two_view_max_count = mv_retri_two_view_max_count
+
+        # ── Post-BA filters (per-observation reproj + min-tri-angle) ──
+        # `filter_landmark_measurements` trims outlier MEASUREMENTS within tracks (vs.
+        # the per-track `filter_landmarks` which would drop the whole track).
+        # 4px reproj = COLMAP `filter_max_reproj_error`; 1.5° = `filter_min_tri_angle`.
+        self._filter_max_reproj_error_px = filter_max_reproj_error_px
+        self._filter_min_tri_angle_deg = filter_min_tri_angle_deg
+
+        # ── Post-BA 2-view densification (visualization-only) ──
+        # Appends well-baselined 2-view tracks (filtered out of Phase 1 retri at
+        # min_track_length=3) to the post-BA GtsfmData. Cameras are frozen — no BA
+        # wall-time pathology. Pose-derived metrics unchanged. Useful for Gaussian-
+        # splat init, pedagogical viz, paper figures.
+        self._densify_with_two_view_tracks = densify_with_two_view_tracks
+        self._densify_two_view_max_reproj_error_px = densify_two_view_max_reproj_error_px
+        self._densify_two_view_min_tri_angle_deg = densify_two_view_min_tri_angle_deg
+        self._densify_two_view_max_count = densify_two_view_max_count
 
     def __map_to_calibration_variable(self, camera_idx: int) -> int:
         return 0 if self._shared_calib else camera_idx
@@ -1119,10 +1397,13 @@ class BundleAdjustmentOptimizer:
 
             ite += 1  # mirrors GLOMAP's outer for-loop increment
 
-        # ── Multi-view retriangulation + final BA ──
-        # Recover tracks dropped between union-find and BA's filter passes by re-triangulating
-        # the full 2D track set with post-BA cameras, then re-BA on the augmented track set.
-        # See multi_view_retriangulate_from_2d_tracks() and the plan's Phase 1 description.
+        # ── Phase 1 retriangulation stage ──
+        # Re-triangulate union-find tracks_2d against post-OuterBA cameras using
+        # multi_view_retriangulate_from_2d_tracks. Recovers tracks dropped between
+        # union-find (~46K) and BA's filter passes (~14K). Followed by final BA on
+        # the augmented track set + per-observation reproj filter + min-tri-angle
+        # filter for completeness.
+        # See notes/phase1_vs_glomap_full_retri.md for the full architectural story.
         if self._use_multi_view_retriangulation:
             if tracks_2d is None:
                 logger.warning(
@@ -1132,7 +1413,7 @@ class BundleAdjustmentOptimizer:
             else:
                 retri_start = time.time()
                 logger.info(
-                    "[Retri] Running multi-view retriangulation on %d 2D tracks "
+                    "[Retri] Phase 1 multi-view retriangulation on %d 2D tracks "
                     "(min_track_len=%d, reproj_error_thresh=%.1fpx)",
                     len(tracks_2d), self._mv_retri_min_track_length,
                     self._mv_retri_reproj_error_thresh,
@@ -1147,33 +1428,78 @@ class BundleAdjustmentOptimizer:
                     tracks_2d=tracks_2d,
                     triangulation_options=retri_options,
                     min_track_length=self._mv_retri_min_track_length,
-                    use_recursive_splitter=self._mv_retri_use_recursive_splitter,
-                    recursive_max_depth=self._mv_retri_recursive_max_depth,
+                    two_view_min_tri_angle_deg=self._mv_retri_two_view_min_tri_angle_deg,
+                    two_view_max_count=self._mv_retri_two_view_max_count,
                 )
                 logger.info(
-                    "[Retri] %d → %d tracks (%.1f%%) after retriangulation, took %.1fs",
+                    "[Retri] %d → %d tracks after Phase 1 retri (%.1fs)",
                     filtered_result.number_tracks(), retri_data.number_tracks(),
-                    100 * retri_data.number_tracks() / max(filtered_result.number_tracks(), 1),
                     time.time() - retri_start,
                 )
-
-                # Final BA on the retri'd track set (no inner outer-loop here — single pass).
                 if retri_data.number_tracks() > 0:
+                    # Per-observation filter (mirrors GLOMAP's
+                    # FilterPoints3DWithLargeReprojectionError, observation_manager.cc:407):
+                    # trims outlier MEASUREMENTS instead of dropping whole tracks. A track
+                    # with 9 good measurements + 1 bad outlier loses just the outlier; with
+                    # the prior per-track filter (`filter_landmarks`) the whole track was
+                    # killed. Bumped threshold from 3 → 4px to match COLMAP's default
+                    # `filter_max_reproj_error`.
+                    filter_reproj = self._filter_max_reproj_error_px
                     final_ba_start = time.time()
-                    final_thresh = self._reproj_error_thresholds[-1] or 3.0
+                    logger.info(
+                        "[Retri] Final BA on %d retri'd tracks", retri_data.number_tracks(),
+                    )
                     (optimized_data, filtered_result, valid_mask, _) = self.run_ba_stage_with_filtering(
                         initial_data=retri_data,
                         absolute_pose_priors=absolute_pose_priors,
                         relative_pose_priors=relative_pose_priors,
-                        reproj_error_thresh=final_thresh,
+                        reproj_error_thresh=None,  # per-obs filter applied below instead
                         verbose=verbose,
                     )
-                    logger.info(
-                        "[Retri] Final BA on %d retri'd tracks: filtered to %d (%.1fs).",
-                        retri_data.number_tracks(), filtered_result.number_tracks(),
-                        time.time() - final_ba_start,
+                    n_pre_filter = filtered_result.number_tracks()
+                    filtered_result = filtered_result.filter_landmark_measurements(
+                        reproj_err_thresh=filter_reproj,
+                        min_track_length=2,
+                        retain_cameras_without_tracks=True,
                     )
-                    step_times.append(time.time() - retri_start)
+                    if self._filter_min_tri_angle_deg > 0:
+                        filtered_result = filter_tracks_by_min_tri_angle(
+                            filtered_result, self._filter_min_tri_angle_deg,
+                        )
+                    valid_mask = [True] * filtered_result.number_tracks()
+                    logger.info(
+                        "[Retri] Phase 1 final BA + per-obs filter (reproj<%.1fpx, "
+                        "min_tri≥%.1f°): %d → %d tracks, %.1fs (full retri stage %.1fs)",
+                        filter_reproj, self._filter_min_tri_angle_deg,
+                        n_pre_filter, filtered_result.number_tracks(),
+                        time.time() - final_ba_start, time.time() - retri_start,
+                    )
+                step_times.append(time.time() - retri_start)
+
+
+        # ── Visualization-only 2-view track densification ──
+        # Post-BA, cameras frozen. Appends well-baselined 2-view tracks (filtered out
+        # of Phase 1 retri at min_track_length=3) to densify the 3D point cloud for
+        # downstream visualization / Gaussian-splat init. Does not affect pose-derived
+        # metrics — cameras are locked at this point. AUC/rot°/trans° remain identical
+        # to the pre-densification values; only track count grows.
+        if self._densify_with_two_view_tracks and tracks_2d is not None:
+            densify_start = time.time()
+            n_pre = filtered_result.number_tracks()
+            filtered_result, n_added = densify_with_two_view_tracks(
+                gtsfm_data=filtered_result,
+                tracks_2d=tracks_2d,
+                max_reproj_error_px=self._densify_two_view_max_reproj_error_px,
+                min_tri_angle_deg=self._densify_two_view_min_tri_angle_deg,
+                max_count=self._densify_two_view_max_count,
+            )
+            valid_mask = [True] * filtered_result.number_tracks()
+            logger.info(
+                "[Densify] %d → %d tracks (+%d 2-view, %.1fs).",
+                n_pre, filtered_result.number_tracks(), n_added,
+                time.time() - densify_start,
+            )
+            step_times.append(time.time() - densify_start)
 
         total_time = time.time() - start_time
 

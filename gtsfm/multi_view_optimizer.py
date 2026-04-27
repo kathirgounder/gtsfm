@@ -262,7 +262,7 @@ class MultiViewOptimizer:
             pose_priors_graph,
             cameras_gt,
             save_dir=str(output_root) if output_root else None,
-            tracks_2d=retri_tracks_2d_graph,  # Full 2D track set — used if multi-view retri is enabled.
+            tracks_2d=retri_tracks_2d_graph,
         )
 
         multiview_optimizer_metrics_graph = [
