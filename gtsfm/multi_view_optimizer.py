@@ -218,6 +218,7 @@ class MultiViewOptimizer:
             pose_priors_graph,
             cameras_gt,
             save_dir=str(output_root) if output_root else None,
+            tracks_2d=tracks2d_graph,
         )
 
         multiview_optimizer_metrics_graph = [
