@@ -24,7 +24,7 @@ class TestBundleAdjustmentOptimizer(unittest.TestCase):
         super().setUp()
 
         reproj_error_thresholds = [100.0]
-        self.ba = BundleAdjustmentOptimizer(reproj_error_thresholds=reproj_error_thresholds)
+        self.ba = BundleAdjustmentOptimizer(reproj_error_thresholds=reproj_error_thresholds, min_tracks_per_camera=5)
 
         self.test_data = EXAMPLE_DATA
 
