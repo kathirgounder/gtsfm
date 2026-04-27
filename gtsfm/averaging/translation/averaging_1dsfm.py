@@ -45,6 +45,7 @@ from gtsfm.common.sfm_track import SfmTrack2d
 from gtsfm.evaluation.metrics import GtsfmMetric, GtsfmMetricsGroup
 from gtsfm.products.visibility_graph import AnnotatedGraph, ImageIndexPair, ImageIndexPairs
 from gtsfm.utils import align, transform
+from gtsfm.utils.tracks import compute_world_directions
 
 # Hyperparameters for 1D-SFM
 # maximum number of times 1dsfm will project the Unit3's to a 1d subspace for outlier rejection
@@ -416,25 +417,9 @@ class TranslationAveraging1DSFM(TranslationAveragingBase):
         Returns:
             Dictionary of unit directions from camera to track in world frame indexed by (track_id, camera_id).
         """
-        landmark_directions = {}
-        for track_id, track in enumerate(tracks_2d):
-            for j in range(track.number_measurements()):
-                measurement = track.measurement(j)
-                cam_idx = measurement.i
-
-                # TODO(akshay-krishnan): consider changing input type and checking elsewhere
-                intrinsics_i = intrinsics[cam_idx]
-                wRi = wRi_list[cam_idx]
-                assert wRi is not None, "Camera must have valid rotation to use tracks for averaging."
-                assert intrinsics_i is not None, "Camera must be calibrated to use tracks for averaging."
-
-                measurement_xy = intrinsics_i.calibrate(measurement.uv)
-                measurement_homogeneous = Point3(measurement_xy[0], measurement_xy[1], 1.0)
-                w_cam_U_track = Unit3(wRi.rotate(Unit3(measurement_homogeneous).point3()))
-
-                # Direction starts at camera, but first index is track_id.
-                landmark_directions[(track_id, cam_idx)] = w_cam_U_track
-        return landmark_directions
+        observations = compute_world_directions(tracks_2d, intrinsics, wRi_list)
+        return {(track_id, cam_idx): Unit3(Point3(*direction))
+                for track_id, cam_idx, direction in observations}
 
     def __run_averaging(
         self,

@@ -25,6 +25,7 @@ from gtsfm.common.two_view_estimation_report import TwoViewEstimationReport
 from gtsfm.data_association.cpp_dsf_tracks_estimator import CppDsfTracksEstimator
 from gtsfm.data_association.data_assoc import DataAssociation
 from gtsfm.evaluation.metrics import GtsfmMetricsGroup
+from gtsfm.global_positioner.global_positioner import GlobalPositioner
 from gtsfm.products.one_view_data import OneViewData
 from gtsfm.products.two_view_result import TwoViewResult
 from gtsfm.products.visibility_graph import AnnotatedGraph
@@ -71,12 +72,14 @@ class MultiViewOptimizer:
         data_association_module: DataAssociation,
         bundle_adjustment_module: GlobalBundleAdjustment,
         view_graph_estimator: Optional[ViewGraphEstimatorBase] = None,
+        global_positioner: Optional[GlobalPositioner] = None,
     ) -> None:
         self.view_graph_estimator = view_graph_estimator
         self.rot_avg_module = rot_avg_module
         self.trans_avg_module = trans_avg_module
         self.data_association_module = data_association_module
         self.ba_optimizer = bundle_adjustment_module
+        self.global_positioner = global_positioner
         self._run_view_graph_estimator: bool = self.view_graph_estimator is not None
 
         self.view_graph_estimator_v2 = CycleConsistentRotationViewGraphEstimator(
@@ -185,32 +188,43 @@ class MultiViewOptimizer:
         tracks2d_graph = delayed(get_2d_tracks)(viewgraph_v_corr_idxs_graph, keypoints_graph)
 
         absolute_pose_priors = [one_view_data_dict[idx].absolute_pose_prior for idx in range(num_images)]
-        wTi_graph, ta_metrics, ta_inlier_idx_i1_i2 = self.trans_avg_module.create_computation_graph(
-            num_images,
-            pruned_i2Ui1_graph,
-            delayed_wRi,
-            tracks2d_graph,
-            all_intrinsics,
-            absolute_pose_priors,
-            pose_priors_graph,
-            gt_wTi_list=gt_wTi_list,
-        )
-        ta_v_corr_idxs_graph = delayed(filter_corr_by_idx)(viewgraph_v_corr_idxs_graph, ta_inlier_idx_i1_i2)
-        ta_inlier_tracks_2d_graph = delayed(get_2d_tracks)(ta_v_corr_idxs_graph, keypoints_graph)
-        # TODO(akshay-krishnan): update pose priors also with the same inlier indices, right now these are unused.
-
-        init_cameras_graph = delayed(init_cameras)(wTi_graph, all_intrinsics)
-
         cameras_gt = [one_view_data_dict[idx].camera_gt for idx in sorted(list(one_view_data_dict.keys()))]
-        images: List[Future] = [image_future_map[idx] for idx in sorted(list(one_view_data_dict.keys()))]
-        ba_input_graph, data_assoc_metrics_graph = self.data_association_module.create_computation_graph(
-            num_images,
-            init_cameras_graph,
-            ta_inlier_tracks_2d_graph,
-            cameras_gt,
-            pose_priors_graph,
-            images,
-        )
+
+        if self.global_positioner is not None:
+            # Path B: Global positioner replaces trans_avg + data_assoc.
+            ba_input_graph, gp_metrics = delayed(self.global_positioner.run, nout=2)(
+                num_images, delayed_wRi, tracks2d_graph, all_intrinsics,
+                output_root=output_root,
+            )
+            ta_metrics = gp_metrics
+            data_assoc_metrics_graph = delayed(GtsfmMetricsGroup)("data_association_metrics", [])
+        else:
+            # Path A: Existing pipeline — trans_avg + data_assoc.
+            wTi_graph, ta_metrics, ta_inlier_idx_i1_i2 = self.trans_avg_module.create_computation_graph(
+                num_images,
+                pruned_i2Ui1_graph,
+                delayed_wRi,
+                tracks2d_graph,
+                all_intrinsics,
+                absolute_pose_priors,
+                pose_priors_graph,
+                gt_wTi_list=gt_wTi_list,
+            )
+            ta_v_corr_idxs_graph = delayed(filter_corr_by_idx)(viewgraph_v_corr_idxs_graph, ta_inlier_idx_i1_i2)
+            ta_inlier_tracks_2d_graph = delayed(get_2d_tracks)(ta_v_corr_idxs_graph, keypoints_graph)
+            # TODO(akshay-krishnan): update pose priors also with the same inlier indices, right now these are unused.
+
+            init_cameras_graph = delayed(init_cameras)(wTi_graph, all_intrinsics)
+
+            images: List[Future] = [image_future_map[idx] for idx in sorted(list(one_view_data_dict.keys()))]
+            ba_input_graph, data_assoc_metrics_graph = self.data_association_module.create_computation_graph(
+                num_images,
+                init_cameras_graph,
+                ta_inlier_tracks_2d_graph,
+                cameras_gt,
+                pose_priors_graph,
+                images,
+            )
 
         ba_result_graph, ba_metrics_graph = self.ba_optimizer.create_computation_graph(
             ba_input_graph,

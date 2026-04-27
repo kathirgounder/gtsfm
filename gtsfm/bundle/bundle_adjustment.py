@@ -5,9 +5,10 @@ Authors: Xiaolong Wu, John Lambert, Ayush Baid
 
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import dask
 import gtsam  # type: ignore
@@ -136,6 +137,61 @@ def multi_view_retriangulate_from_2d_tracks(
         n_triangulation_failed, n_short_output,
     )
     return out
+@dataclass
+class BundleAdjustmentOptions:
+    """Shared configuration for bundle adjustment across leaf BA, merging BA, etc.
+
+    This dataclass captures the commonly-configured subset of BA parameters
+    that vary between call sites (leaf vs. merging). Parameters with fixed
+    defaults (e.g. ordering_type, allow_indeterminate_linear_system) are left
+    to the ``BundleAdjustmentOptimizer`` constructor.
+    """
+
+    robust_ba_mode: Union[RobustBAMode, str] = RobustBAMode.GMC
+    shared_calib: bool = False
+    use_calibration_prior: bool = False
+    use_pose_prior_all_cameras: bool = False
+    use_pose_prior_first_camera: bool = False
+    use_gnc: bool = False
+    gnc_loss: Union[RobustBAMode, str] = RobustBAMode.GMC
+    factor_weight_outlier_threshold: float = 0.0
+    min_track_length: int = 2
+    calibration_prior_focal_sigma: float = 20.0
+    calibration_prior_dist_sigma: float | Sequence[float] = 0.1
+    calibration_prior_pp_sigma: float = 1e-5
+    robust_noise_basin: float = 1.345
+    min_tracks_per_camera: int = 15
+    compute_pose_covariances: bool = False
+    optimizer_relative_cost_tol: float = 1e-5
+
+    def to_optimizer(self, **overrides) -> "BundleAdjustmentOptimizer":
+        """Construct a :class:`BundleAdjustmentOptimizer` from these options.
+
+        Args:
+            **overrides: Keyword arguments that override dataclass fields or add
+                extra constructor params (e.g. ``min_track_length``,
+                ``reproj_error_thresholds``).
+        """
+        kwargs = dict(
+            robust_ba_mode=self.robust_ba_mode,
+            shared_calib=self.shared_calib,
+            use_calibration_prior=self.use_calibration_prior,
+            use_pose_prior_all_cameras=self.use_pose_prior_all_cameras,
+            use_pose_prior_first_camera=self.use_pose_prior_first_camera,
+            use_gnc=self.use_gnc,
+            gnc_loss=self.gnc_loss,
+            factor_weight_outlier_threshold=self.factor_weight_outlier_threshold,
+            min_track_length=self.min_track_length,
+            calibration_prior_focal_sigma=self.calibration_prior_focal_sigma,
+            calibration_prior_dist_sigma=self.calibration_prior_dist_sigma,
+            calibration_prior_pp_sigma=self.calibration_prior_pp_sigma,
+            robust_noise_basin=self.robust_noise_basin,
+            min_tracks_per_camera=self.min_tracks_per_camera,
+            compute_pose_covariances=self.compute_pose_covariances,
+            optimizer_relative_cost_tol=self.optimizer_relative_cost_tol,
+        )
+        kwargs.update(overrides)
+        return BundleAdjustmentOptimizer(**kwargs)
 
 
 class BundleAdjustmentOptimizer:
@@ -156,7 +212,8 @@ class BundleAdjustmentOptimizer:
         max_iterations: Optional[int] = None,
         cam_pose3_prior_noise_sigma: float = 0.1,
         calibration_prior_focal_sigma: float = 20.0,
-        calibration_prior_dist_sigma: float = 0.1,
+        calibration_prior_dist_sigma: float | Sequence[float] = 0.1,
+        calibration_prior_pp_sigma: float = 1e-5,
         measurement_noise_sigma: float = 2.0,
         allow_indeterminate_linear_system: bool = True,
         print_summary: bool = False,
@@ -164,6 +221,8 @@ class BundleAdjustmentOptimizer:
         save_iteration_visualization: bool = False,
         robust_noise_basin: float = 1.345,
         use_karcher_mean_factor: bool = True,
+        use_pose_prior_all_cameras: bool = False,
+        use_pose_prior_first_camera: bool = False,
         use_calibration_prior: bool = True,
         use_first_point_prior: bool = False,
         use_gnc: bool = False,
@@ -179,6 +238,11 @@ class BundleAdjustmentOptimizer:
         use_multi_view_retriangulation: bool = False,
         mv_retri_min_track_length: int = 3,
         mv_retri_reproj_error_thresh: float = 10.0,
+        factor_weight_outlier_threshold: float = 0.0,
+        min_track_length: int = 2,
+        min_tracks_per_camera: int = 15,
+        compute_pose_covariances: bool = False,
+        optimizer_relative_cost_tol: float = 1e-5,
     ) -> None:
         """Initializes the parameters for bundle adjustment module.
 
@@ -201,11 +265,14 @@ class BundleAdjustmentOptimizer:
             save_iteration_visualization (optional): Save a Plotly animation showing optimization progress.
             robust_noise_basin (optional): Basin to use for the robust noise model.
             use_karcher_mean_factor (optional): Use Karcher mean factor to constrain the camera poses.
+            use_pose_prior (optional): Use pose prior to constrain the camera poses. (only used if we use karcher mean)
             use_calibration_prior (optional): Use calibration prior to constrain the camera intrinsics.
             use_first_point_prior (optional): Use first point prior to constrain the scale of the reconstruction.
             use_gnc (optional): Use the GNC optimizer for bundle adjustment.
             gnc_loss (optional): GNC loss to use. Defaults to GMC.
             factor_weight_outlier_threshold (optional): Threshold weight for a reprojection factor to be kept.
+            min_track_length: min number of measurements required to keep a track after weight filtering.
+            compute_pose_covariances: If true, compute marginal covariance for all camera pose variables and return it.
         """
         self._reproj_error_thresholds = reproj_error_thresholds
         if isinstance(robust_ba_mode, str):
@@ -218,6 +285,7 @@ class BundleAdjustmentOptimizer:
         self._use_calibration_prior = use_calibration_prior
         self._calibration_prior_focal_sigma = calibration_prior_focal_sigma
         self._calibration_prior_dist_sigma = calibration_prior_dist_sigma
+        self._calibration_prior_pp_sigma = calibration_prior_pp_sigma
         self._measurement_noise_sigma = measurement_noise_sigma
         self._allow_indeterminate_linear_system = allow_indeterminate_linear_system
         self._ordering_type = ordering_type
@@ -225,7 +293,8 @@ class BundleAdjustmentOptimizer:
         self._save_iteration_visualization = save_iteration_visualization
         self._robust_noise_basin = robust_noise_basin
         self._use_karcher_mean_factor = use_karcher_mean_factor
-
+        self._use_pose_prior_all_cameras = use_pose_prior_all_cameras
+        self._use_pose_prior_first_camera = use_pose_prior_first_camera
         self._use_first_point_prior = use_first_point_prior
         self._use_gnc = use_gnc
         if isinstance(gnc_loss, str):
@@ -233,6 +302,10 @@ class BundleAdjustmentOptimizer:
         else:
             self._gnc_loss = gnc_loss
         self._factor_weight_outlier_threshold = factor_weight_outlier_threshold
+        self._min_track_length = min_track_length
+        self._min_tracks_per_camera = min_tracks_per_camera
+        self._compute_pose_covariances = compute_pose_covariances
+        self._optimizer_relative_cost_tol = optimizer_relative_cost_tol
 
         # Post-BA multi-view retriangulation (opt-in). See `__init__` docstring above.
         self._use_multi_view_retriangulation = use_multi_view_retriangulation
@@ -241,6 +314,14 @@ class BundleAdjustmentOptimizer:
 
     def __map_to_calibration_variable(self, camera_idx: int) -> int:
         return 0 if self._shared_calib else camera_idx
+
+    def __get_cameras_with_insufficient_tracks(self, initial_data: GtsfmData) -> set[int]:
+        """Get the cameras with insufficient fewer tracks that self._min_tracks_per_camera."""
+        cameras_with_insufficient_tracks = set()
+        for i in initial_data.get_valid_camera_indices():
+            if len(initial_data.get_measurements_for_camera(i)) < self._min_tracks_per_camera:
+                cameras_with_insufficient_tracks.add(i)
+        return cameras_with_insufficient_tracks
 
     def __reprojection_factors(
         self, initial_data: GtsfmData, cameras_to_model: List[int], robust_noise_basin: float | None = None
@@ -261,17 +342,17 @@ class BundleAdjustmentOptimizer:
         assert first_camera is not None, "First camera in initial data is None"
         sfm_factor_class = gtsfm_types.get_sfm_factor_for_calibration(first_camera.calibration())
 
-        cameras_with_tracks = set()
         for j in range(initial_data.number_tracks()):
             track = initial_data.get_track(j)  # SfmTrack
+            valid_measurements = [
+                m_idx for m_idx in range(track.numberMeasurements()) if track.measurement(m_idx)[0] in cameras_to_model
+            ]
+            if len(valid_measurements) < self._min_track_length:
+                continue
             # Retrieve the SfmMeasurement objects.
-            for m_idx in range(track.numberMeasurements()):
+            for m_idx in valid_measurements:
                 # `i` represents the camera index, and `uv` is the 2d measurement
                 i, uv = track.measurement(m_idx)
-                cameras_with_tracks.add(i)
-                # Note use of shorthand symbols `X` and `P`.
-                if i not in cameras_to_model:
-                    continue
                 graph.push_back(
                     sfm_factor_class(
                         uv,
@@ -282,14 +363,7 @@ class BundleAdjustmentOptimizer:
                     )  # type: ignore
                 )
 
-        cameras_without_tracks = {}
-        for i in cameras_to_model:
-            if i not in cameras_with_tracks:
-                cameras_without_tracks[i] = initial_data.get_camera(i)
-        if len(cameras_without_tracks) > 0:
-            logger.info(f"Cameras without tracks: {cameras_without_tracks.keys()}")
-
-        return graph, cameras_without_tracks
+        return graph
 
     def _between_factors(
         self, relative_pose_priors: Dict[Tuple[int, int], PosePrior], cameras_to_model: List[int]
@@ -326,7 +400,19 @@ class BundleAdjustmentOptimizer:
         if self._use_karcher_mean_factor:
             camera_keys = [X(i) for i in cameras_to_model]
             graph.push_back(gtsam.KarcherMeanFactorPose3(camera_keys, 6, 1000))
-        else:
+
+        if self._use_pose_prior_all_cameras:
+            for camera_idx in cameras_to_model:
+                camera_i = initial_data.get_camera(camera_idx)
+                assert camera_i is not None, f"Camera {camera_idx} in initial data is None"
+                graph.push_back(
+                    PriorFactorPose3(
+                        X(camera_idx),
+                        camera_i.pose(),
+                        Isotropic.Sigma(CAM_POSE3_DOF, self._cam_pose3_prior_noise_sigma),
+                    )
+                )
+        elif self._use_pose_prior_first_camera:
             first_camera = initial_data.get_camera(cameras_to_model[0])
             assert first_camera is not None, "First camera in initial data is None"
             graph.push_back(
@@ -353,7 +439,7 @@ class BundleAdjustmentOptimizer:
             first_camera.calibration(),
             focal_sigma=self._calibration_prior_focal_sigma,
             dist_sigma=self._calibration_prior_dist_sigma,
-            pp_sigma=1e-5,
+            pp_sigma=self._calibration_prior_pp_sigma,
             skew_sigma=1e-6,
         )
         if self._shared_calib:
@@ -382,14 +468,14 @@ class BundleAdjustmentOptimizer:
 
     def __construct_simple_factor_graph(
         self, cameras_to_model: List[int], initial_data: GtsfmData, robust_noise_basin: float | None = None
-    ) -> tuple[NonlinearFactorGraph, Dict[int, gtsfm_types.CAMERA_TYPE]]:
+    ) -> NonlinearFactorGraph:
         """Construct the factor graph with just reprojection factors and calibration priors."""
 
         graph = NonlinearFactorGraph()
         if not cameras_to_model:
-            return graph, {}
+            return graph
 
-        reprojection_graph, cameras_without_tracks = self.__reprojection_factors(
+        reprojection_graph = self.__reprojection_factors(
             initial_data=initial_data,
             cameras_to_model=cameras_to_model,
             robust_noise_basin=robust_noise_basin,
@@ -407,7 +493,7 @@ class BundleAdjustmentOptimizer:
         if self._use_calibration_prior:
             graph.push_back(self.__calibration_priors(initial_data, cameras_to_model))
 
-        return graph, cameras_without_tracks
+        return graph
 
     def __construct_factor_graph(
         self,
@@ -416,19 +502,17 @@ class BundleAdjustmentOptimizer:
         absolute_pose_priors: List[Optional[PosePrior]],
         relative_pose_priors: Dict[Tuple[int, int], PosePrior],
         robust_noise_basin: float | None = None,
-    ) -> tuple[NonlinearFactorGraph, Dict[int, gtsfm_types.CAMERA_TYPE]]:
+    ) -> NonlinearFactorGraph:
         """Construct the factor graph with reprojection factors, BetweenFactors, and prior factors."""
         # Create a factor graph.
-        graph, cameras_without_tracks = self.__construct_simple_factor_graph(
-            cameras_to_model, initial_data, robust_noise_basin
-        )
+        graph = self.__construct_simple_factor_graph(cameras_to_model, initial_data, robust_noise_basin)
 
         # Add priors
         graph.push_back(
             self._between_factors(relative_pose_priors=relative_pose_priors, cameras_to_model=cameras_to_model)
         )
 
-        return graph, cameras_without_tracks
+        return graph
 
     def __optimize_factor_graph(
         self, graph: NonlinearFactorGraph, initial_values: Values, ordering_type: str
@@ -443,6 +527,8 @@ class BundleAdjustmentOptimizer:
             params.setMaxIterations(self._max_iterations)
 
         if not self._use_gnc:
+            if self._optimizer_relative_cost_tol is not None:
+                params.setRelativeErrorTol(self._optimizer_relative_cost_tol)
             lm = gtsam.LevenbergMarquardtOptimizer(graph, initial_values, params)
         else:
             gnc_params = gtsam.GncLMParams(params)
@@ -454,7 +540,8 @@ class BundleAdjustmentOptimizer:
                 raise ValueError(f"Unsupported GNC loss type: {self._gnc_loss}.")
             gnc_params.setVerbosityGNC(gtsam.GncLMParams.Verbosity.SUMMARY)
             gnc_params.setAllowNonNoiseModelFactors(True)
-            gnc_params.setRelativeCostTol(1e-3)
+            if self._optimizer_relative_cost_tol is not None:
+                gnc_params.setRelativeCostTol(self._optimizer_relative_cost_tol)
             lm = gtsam.GncLMOptimizer(graph, initial_values, gnc_params)
 
         # gnc does not support getAbsoluteErrorTol and getRelativeErrorTol params
@@ -504,6 +591,22 @@ class BundleAdjustmentOptimizer:
         """Determines whether two-view bundle adjustment is being executed."""
         return len(initial_data.get_valid_camera_indices()) == 2
 
+    def __compute_camera_pose_covariances(
+        self, marginals: gtsam.Marginals, cameras_to_model: List[int]
+    ) -> Dict[int, NDArray[np.float64]]:
+        """Compute marginal covariance for all camera pose variables."""
+        pose_covariances: Dict[int, NDArray[np.float64]] = {}
+        for camera_idx in cameras_to_model:
+            try:
+                full_cov = np.asarray(marginals.marginalCovariance(X(camera_idx)))
+                pose_covariances[camera_idx] = full_cov[:CAM_POSE3_DOF, :CAM_POSE3_DOF]
+            except Exception:
+                logger.error(
+                    f"Error computing covariance for camera {camera_idx}, likely due to indeterminate linear system."
+                )
+                continue
+        return pose_covariances
+
     def __optimize_and_recover(
         self, initial_data: GtsfmData, graph: NonlinearFactorGraph, ordering_type: str
     ) -> Tuple[GtsfmData, Values, float]:
@@ -512,7 +615,7 @@ class BundleAdjustmentOptimizer:
         result_values, _, weights = self.__optimize_factor_graph(graph, initial_values, ordering_type)
         final_error = graph.error(result_values)
         optimized_data = GtsfmData.from_values(result_values, initial_data, self._shared_calib)
-        if self._use_gnc and weights is not None:
+        if self._use_gnc and weights is not None and self._factor_weight_outlier_threshold > 0:
             optimized_data = self.__filter_tracks_by_factor_weights(graph, optimized_data, weights)
         return optimized_data, result_values, final_error
 
@@ -538,6 +641,9 @@ class BundleAdjustmentOptimizer:
                 track_id = int(gtsam.symbolIndex(track_key))
                 cams_to_remove_per_track[track_id].add(camera_id)
 
+        if not cams_to_remove_per_track:
+            return optimized_data
+
         for track_id, camera_ids in cams_to_remove_per_track.items():
             track = optimized_data.get_track(track_id)
             new_measurements = []
@@ -546,9 +652,27 @@ class BundleAdjustmentOptimizer:
                 if cam_id not in camera_ids:
                     new_measurements.append(track.measurement(m_idx))
             track.measurements = new_measurements
-        if cams_to_remove_per_track:
+
+        length_filtered_tracks = [
+            track for track in optimized_data.get_tracks() if track.numberMeasurements() >= self._min_track_length
+        ]
+        if len(length_filtered_tracks) == optimized_data.number_tracks():
             optimized_data._camera_to_measurement_map = None
-        return optimized_data
+            return optimized_data
+
+        image_info = {
+            image_id: optimized_data.get_image_info(image_id) for image_id in optimized_data.get_all_image_ids()
+        }
+
+        filtered_data = GtsfmData.from_cameras_and_tracks(
+            cameras=optimized_data.cameras(),
+            tracks=length_filtered_tracks,
+            number_images=optimized_data.number_images(),
+            image_info=image_info,
+            gaussian_splats=optimized_data.get_gaussian_splats(),
+        )
+
+        return filtered_data
 
     def run_simple_ba(
         self, initial_data: GtsfmData, robust_noise_basin: float | None = None
@@ -564,16 +688,26 @@ class BundleAdjustmentOptimizer:
             Final error value of the optimization problem.
         """
         cameras_to_model = sorted(initial_data.get_valid_camera_indices())
+        cameras_with_insufficient_tracks = self.__get_cameras_with_insufficient_tracks(initial_data)
+        cameras_to_model = [i for i in cameras_to_model if i not in cameras_with_insufficient_tracks]
+        logger.info(
+            "Cameras with insufficient tracks (fewer than %d): %s, will be excluded from BA.",
+            self._min_tracks_per_camera,
+            cameras_with_insufficient_tracks,
+        )
+        graph = self.__construct_simple_factor_graph(cameras_to_model, initial_data, robust_noise_basin)
+        optimized_data, result_values, final_error = self.__optimize_and_recover(
+            initial_data, graph, self._ordering_type
+        )
+        if self._compute_pose_covariances:
+            try:
+                marginals = gtsam.Marginals(graph, result_values)
+                optimized_data.set_camera_pose_covariances(
+                    self.__compute_camera_pose_covariances(marginals, cameras_to_model)
+                )
+            except Exception:
+                logger.info("Error computing marginals, likely due to indeterminate linear system.")
 
-        graph, cameras_without_tracks = self.__construct_simple_factor_graph(
-            cameras_to_model, initial_data, robust_noise_basin
-        )
-        if len(cameras_without_tracks) == len(initial_data.cameras()):
-            logger.warning("Skipping bundle adjustment because all cameras are without tracks.")
-            return initial_data, 0.0
-        optimized_data, _, final_error = self.__optimize_and_recover(
-            initial_data, graph, self._ordering_type if not cameras_without_tracks else "COLAMD"
-        )
         return optimized_data, final_error
 
     def run_iterative_robust_ba(
@@ -593,7 +727,7 @@ class BundleAdjustmentOptimizer:
         relative_pose_priors: Dict[Tuple[int, int], PosePrior],
         reproj_error_thresh: Optional[float],
         verbose: bool = True,
-    ) -> Tuple[GtsfmData, GtsfmData, List[bool], float]:
+    ) -> Tuple[Optional[GtsfmData], Optional[GtsfmData], Optional[List[bool]], Optional[float]]:
         """Runs bundle adjustment and optionally filters the resulting tracks by reprojection error.
 
         Args:
@@ -620,28 +754,50 @@ class BundleAdjustmentOptimizer:
             )
             return initial_data, initial_data, [False] * initial_data.number_tracks(), 0.0
 
+        running_two_view_ba = self.is_two_view_ba(initial_data)
+
         cameras_to_model = sorted(initial_data.get_valid_camera_indices())
-        graph, cameras_without_tracks = self.__construct_factor_graph(
+        if not running_two_view_ba:
+            cameras_with_insufficient_tracks = self.__get_cameras_with_insufficient_tracks(initial_data)
+            cameras_to_model = [i for i in cameras_to_model if i not in cameras_with_insufficient_tracks]
+            logger.info(
+                "Cameras with insufficient tracks (fewer than %d): %s, will be excluded from BA.",
+                self._min_track_length,
+                cameras_with_insufficient_tracks,
+            )
+
+        graph = self.__construct_factor_graph(
             cameras_to_model, initial_data, absolute_pose_priors, relative_pose_priors
         )
         optimized_data, result_values, final_error = self.__optimize_and_recover(
-            initial_data, graph, self._ordering_type if not cameras_without_tracks else "COLAMD"
+            initial_data, graph, self._ordering_type
         )
+        if not running_two_view_ba:
+            # Add the non-BA cameras from initial_data back.
+            for camera_idx in cameras_with_insufficient_tracks:
+                optimized_data._cameras[camera_idx] = initial_data.get_camera(camera_idx)
 
-        if self.is_two_view_ba(initial_data):
+        if running_two_view_ba or self._compute_pose_covariances:
             try:
-                # Calculate marginal covariances for all two pose variables.
                 marginals = gtsam.Marginals(graph, result_values)
-                graph_keys = self.get_two_view_ba_pose_graph_keys(initial_data)
-                for key in graph_keys:
-                    _ = marginals.marginalCovariance(key)
+                if running_two_view_ba:
+                    # Calculate marginal covariances for all two pose variables.
+                    graph_keys = self.get_two_view_ba_pose_graph_keys(initial_data)
+                    for key in graph_keys:
+                        _ = marginals.marginalCovariance(key)
+                if self._compute_pose_covariances:
+                    optimized_data.set_camera_pose_covariances(
+                        self.__compute_camera_pose_covariances(marginals, cameras_to_model)
+                    )
 
             except RuntimeError:
-                if not self._allow_indeterminate_linear_system:
+                if running_two_view_ba and not self._allow_indeterminate_linear_system:
                     logger.error(
                         "BA result discarded due to Indeterminate Linear System (ILS) when computing marginals."
                     )
                     return None, None, None, None
+                elif not running_two_view_ba:
+                    logger.info("Error computing marginals, likely due to indeterminate linear system.")
 
         # Convert the `Values` results to a `GtsfmData` instance.
         # Filter landmarks by reprojection error.
@@ -655,6 +811,13 @@ class BundleAdjustmentOptimizer:
         else:
             valid_mask = [True] * optimized_data.number_tracks()
             filtered_result = optimized_data
+        if self._compute_pose_covariances:
+            filtered_pose_covariances = {
+                i: cov
+                for i, cov in optimized_data.get_camera_pose_covariances().items()
+                if i in filtered_result.get_valid_camera_indices()
+            }
+            filtered_result.set_camera_pose_covariances(filtered_pose_covariances)
         return optimized_data, filtered_result, valid_mask, final_error
 
     def run_ba(
@@ -663,7 +826,7 @@ class BundleAdjustmentOptimizer:
         absolute_pose_priors: List[Optional[PosePrior]],
         relative_pose_priors: Dict[Tuple[int, int], PosePrior],
         verbose: bool = True,
-    ) -> Tuple[GtsfmData, GtsfmData, List[bool]]:
+    ) -> Tuple[Optional[GtsfmData], Optional[GtsfmData], Optional[List[bool]]]:
         """Runs bundle adjustment by forming a factor graph and optimizing it using Levenberg–Marquardt optimization.
 
         Args:

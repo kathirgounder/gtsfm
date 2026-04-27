@@ -15,6 +15,7 @@ from omegaconf import OmegaConf
 
 import gtsfm.utils.logger as logger_utils
 from gtsfm import cluster_merging
+from gtsfm.cluster_merging import MergingOptions
 from gtsfm.cluster_optimizer import Base, save_metrics_reports
 from gtsfm.cluster_optimizer.cluster_optimizer_base import ClusterContext
 from gtsfm.common.gtsfm_data import GtsfmData
@@ -108,37 +109,31 @@ class SceneOptimizer:
         graph_partitioner: GraphPartitionerBase = SinglePartitioner(),
         output_root: str = DEFAULT_OUTPUT_ROOT,
         output_worker: Optional[str] = None,
-        plot_reprojection_histograms: bool = True,
-        use_nonlinear_sim3_merging: bool = False,
-        merging_pre_ba_max_reproj_error: float = 14.0,
-        merging_pre_ba_min_track_length: int = 2,
-        merging_ba_use_calibration_prior: bool = False,
-        merging_use_gnc: bool = False,
+        merging_options: MergingOptions | None = None,
+        # --- Bridge params ---
+        bridge_min_similarity: float = 0.0,
+        bridge_top_k: int = 10,
+        bridge_min_component_size: int = 3,
     ) -> None:
         self.loader = loader
         self.image_pairs_generator = image_pairs_generator
         self.graph_partitioner = graph_partitioner
         self.cluster_optimizer = cluster_optimizer
-        self._run_bundle_adjustment_on_parent = getattr(self.cluster_optimizer, "run_bundle_adjustment_on_parent", True)
-        self._plot_reprojection_histograms = getattr(
-            self.cluster_optimizer, "plot_reprojection_histograms", plot_reprojection_histograms
-        )
-        self._merge_duplicate_tracks = getattr(self.cluster_optimizer, "merge_duplicate_tracks", True)
-        self._drop_outlier_after_camera_merging = getattr(
-            self.cluster_optimizer, "drop_outlier_after_camera_merging", True
-        )
-        self._post_ba_max_reproj_error = getattr(self.cluster_optimizer, "post_ba_max_reproj_error", 3.0)
-        self._drop_camera_with_no_track = getattr(self.cluster_optimizer, "drop_camera_with_no_track", True)
-        self._drop_child_if_merging_fail = getattr(self.cluster_optimizer, "drop_child_if_merging_fail", True)
-        self._use_shared_calibration = getattr(self.cluster_optimizer, "use_shared_calibration", True)
-        self._gnc_loss = getattr(self.cluster_optimizer, "gnc_loss", "GMC")
-        self._use_nonlinear_sim3_merging = use_nonlinear_sim3_merging
-        self._min_track_length = getattr(self.cluster_optimizer, "min_track_length", 2)
-        self._keep_all_cameras_in_merging = getattr(self.cluster_optimizer, "keep_all_cameras_in_merging", False)
-        self._merging_pre_ba_max_reproj_error = merging_pre_ba_max_reproj_error
-        self._merging_pre_ba_min_track_length = merging_pre_ba_min_track_length
-        self._merging_ba_use_calibration_prior = merging_ba_use_calibration_prior
-        self._merging_use_gnc = merging_use_gnc
+        self._merging_options = merging_options or MergingOptions()
+        self._bridge_min_similarity = bridge_min_similarity
+        self._bridge_top_k = bridge_top_k
+        self._bridge_min_component_size = bridge_min_component_size
+        # Propagate metric_constructed_only to the cluster optimizer if it supports it.
+        if hasattr(self.cluster_optimizer, "_metric_constructed_only"):
+            setattr(self.cluster_optimizer, "_metric_constructed_only", self._merging_options.metric_constructed_only)
+        elif hasattr(self.cluster_optimizer, "_optimizer") and hasattr(
+            getattr(self.cluster_optimizer, "_optimizer"), "_metric_constructed_only"
+        ):
+            setattr(
+                self.cluster_optimizer._optimizer,
+                "_metric_constructed_only",
+                self._merging_options.metric_constructed_only,
+            )
         self._config_snapshot = None
         self.output_root = Path(output_root)
         if output_worker is not None:
@@ -210,9 +205,32 @@ class SceneOptimizer:
         process_graph_generator.save_graph(str(base_output_paths.plots / "process_graph_output.svg"))
 
         logger.info("🔥 GTSFM: Running image pair retrieval...")
-        retriever_metrics, visibility_graph = self._run_retriever(client, base_output_paths)
+        retriever_metrics, visibility_graph, similarity_matrix = self._run_retriever(client, base_output_paths)
         base_metrics_groups.append(retriever_metrics)
         image_future_map = self.loader.get_image_futures(client)
+
+        # Bridge reconnection: add cross-component edges to reconnect island components.
+        if similarity_matrix is not None and self._bridge_min_similarity > 0:
+            from gtsfm.utils.viewgraph_reconnector import reconnect_visibility_graph
+
+            bridge_result = reconnect_visibility_graph(
+                visibility_graph=visibility_graph,
+                similarity_matrix=similarity_matrix,
+                min_bridge_similarity=self._bridge_min_similarity,
+                top_k_per_component=self._bridge_top_k,
+                min_component_size=self._bridge_min_component_size,
+            )
+            if bridge_result.bridge_edges:
+                logger.info(
+                    "🌉 Bridge reconnection: added %d edges, components %d -> %d " "(reconnected %d, unreachable %d)",
+                    len(bridge_result.bridge_edges),
+                    bridge_result.num_components_before,
+                    bridge_result.num_components_after,
+                    bridge_result.components_reconnected,
+                    bridge_result.components_unreachable,
+                )
+                visibility_graph = bridge_result.reconnected_graph
+            del similarity_matrix
 
         # Graph partitioning: Divide the visibility graph into clusters (runs eagerly, no delayed/futures).
         logger.info("🔥 GTSFM: Partitioning the view graph...")
@@ -263,23 +281,7 @@ class SceneOptimizer:
                         cast(Optional[GtsfmData], reconstruction),
                         child_results,
                         cameras_gt=cameras_gt,
-                        post_ba_max_reproj_error=self._post_ba_max_reproj_error,
-                        run_bundle_adjustment_on_parent=self._run_bundle_adjustment_on_parent,
-                        plot_reprojection_histograms=self._plot_reprojection_histograms,
-                        merge_duplicate_tracks=self._merge_duplicate_tracks,
-                        drop_outlier_after_camera_merging=self._drop_outlier_after_camera_merging,
-                        drop_camera_with_no_track=self._drop_camera_with_no_track,
-                        drop_child_if_merging_fail=self._drop_child_if_merging_fail,
-                        store_full_data=False,
-                        use_nonlinear_sim3_alignment=self._use_nonlinear_sim3_merging,
-                        use_shared_calibration=self._use_shared_calibration,
-                        use_gnc=self._merging_use_gnc,
-                        gnc_loss=self._gnc_loss,
-                        min_track_length=self._min_track_length,
-                        keep_all_cameras_in_merging=self._keep_all_cameras_in_merging,
-                        pre_ba_max_reproj_error=self._merging_pre_ba_max_reproj_error,
-                        pre_ba_min_track_length=self._merging_pre_ba_min_track_length,
-                        ba_use_calibration_prior=self._merging_ba_use_calibration_prior,
+                        options=self._merging_options,
                     )
 
                 merged_future_tree = submit_tree_map_with_children(client, reconstruction_tree, merge_fn)
@@ -337,7 +339,9 @@ class SceneOptimizer:
 
         save_metrics_reports(base_metrics_groups, str(base_output_paths.metrics))
 
-    def _run_retriever(self, client: Client, output_paths: OutputPaths) -> tuple[GtsfmMetricsGroup, VisibilityGraph]:
+    def _run_retriever(
+        self, client: Client, output_paths: OutputPaths
+    ) -> tuple[GtsfmMetricsGroup, VisibilityGraph, Optional[object]]:
         # TODO(Frank): refactor to move more of this logic into ImagePairsGenerator
         retriever_start_time = time.time()
         batch_size = self.image_pairs_generator._batch_size
@@ -359,6 +363,15 @@ class SceneOptimizer:
             )
 
         retriever = self.image_pairs_generator._retriever
+
+        # Grab the similarity matrix BEFORE save_diagnostics clears it (sets to None).
+        similarity_matrix = getattr(retriever, "_latest_similarity_matrix", None)
+        if similarity_matrix is None:
+            # Handle JointSimilaritySequentialRetriever wrapper.
+            inner = getattr(retriever, "_similarity_retriever", None)
+            if inner is not None:
+                similarity_matrix = getattr(inner, "_latest_similarity_matrix", None)
+
         try:
             retriever.save_diagnostics(
                 image_fnames=image_fnames,
@@ -373,4 +386,4 @@ class SceneOptimizer:
         retriever_metrics.add_metric(GtsfmMetric("retriever_duration_sec", retriever_duration_sec))
         logger.info("🚀 Image pair retrieval took %.2f min.", retriever_duration_sec / 60.0)
 
-        return retriever_metrics, visibility_graph
+        return retriever_metrics, visibility_graph, similarity_matrix

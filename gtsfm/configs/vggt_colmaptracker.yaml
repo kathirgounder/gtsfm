@@ -41,18 +41,16 @@ cluster_optimizer:
         seed: 42
 
     tracker:
-      _target_: gtsfm.frontend.multi_view_tracker.MultiViewTracker
+      _target_: gtsfm.frontend.multi_view_tracker.ColmapTracker
       config:
         _target_: gtsfm.frontend.multi_view_tracker.TrackingConfig
         tracking: true
-        max_query_pts: 512
-        query_frame_num: 3
-        keypoint_extractor: aliked+sp+sift
-        track_vis_thresh: 0.05
-        track_conf_thresh: 0.2
-        vggt_max_reproj_error: 14.0
-        min_triangulation_angle: 10.0
         min_track_length: 3
+        vggt_max_reproj_error: 14.0
+        min_triangulation_angle: 0.2
+        ba_use_undistorted_camera_model: false
+        ba_track_patch_size: 14
+        enable_ba_track_patching: true
 
     pre_ba_max_reproj_error: 14.0
     post_ba_max_reproj_error: 3.0
@@ -62,8 +60,9 @@ cluster_optimizer:
       shared_calib: true
       use_calibration_prior: false
       use_gnc: true
-      gnc_loss: GMC
+      gnc_loss: TLS
       factor_weight_outlier_threshold: 1e-8
+      compute_pose_covariances: false
 
     # --- VGGT operational params ---
     input_mode: crop
@@ -84,11 +83,14 @@ merging_options:
   plot_reprojection_histograms: true
   use_nonlinear_sim3_alignment: true
   pre_ba_max_reproj_error: 14.0
-  pre_ba_min_track_length: 2
+  pre_ba_min_track_length: 3
   post_ba_max_reproj_error: 3.0
+  max_track_correspondences_for_sim3: 150
   min_track_length: 3
   ba_options:
     _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptions
     shared_calib: true
     use_calibration_prior: true
-    use_gnc: false
+    use_gnc: true
+    gnc_loss: GMC
+    compute_pose_covariances: false
