@@ -181,12 +181,17 @@ def _build_gtsfm_data_from_vggt_depth(
                 continue
 
             local_idx = global_to_local[global_idx]
-            _, orig_W = image_shapes[global_idx]
+            orig_H, orig_W = image_shapes[global_idx]
 
-            # VGGT coords for depth lookup only — not stored as measurements.
-            vggt_scale = W_vggt / orig_W
-            u_c = int(np.clip(round(m.uv[0] * vggt_scale - original_coords[local_idx, 0]), 0, W_vggt - 1))
-            v_c = int(np.clip(round(m.uv[1] * vggt_scale - original_coords[local_idx, 1]), 0, H_vggt - 1))
+            # Map frontend keypoints into VGGT dense-map coordinates using the actual
+            # per-axis resized image dimensions plus the crop/pad offsets recorded in
+            # original_coords for this image.
+            left, top = original_coords[local_idx, 0], original_coords[local_idx, 1]
+            scaled_W, scaled_H = original_coords[local_idx, 4], original_coords[local_idx, 5]
+            u_scale = scaled_W / orig_W if orig_W > 0 else 0.0
+            v_scale = scaled_H / orig_H if orig_H > 0 else 0.0
+            u_c = int(np.clip(round(m.uv[0] * u_scale - left), 0, W_vggt - 1))
+            v_c = int(np.clip(round(m.uv[1] * v_scale - top), 0, H_vggt - 1))
 
             pt3d = dense_points[local_idx, v_c, u_c]
             conf = float(depth_confidence[local_idx, v_c, u_c])

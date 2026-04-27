@@ -352,8 +352,8 @@ class ClusterMVO(ClusterOptimizerBase):
         (correspondence generation and two-view estimation) before invoking the multi-view optimizer.
 
         Returns:
-            - List of Delayed I/O tasks to be computed
-            - List of Delayed metrics to be computed
+            A ``ClusterComputationGraph`` containing the delayed computations for this cluster's
+            outputs and metrics, or ``None`` if no computation graph can be created.
         """
         frontend_graphs: FrontendGraphs = self._build_frontend_graphs(context=context)
 

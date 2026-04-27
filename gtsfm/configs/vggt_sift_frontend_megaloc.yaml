@@ -1,5 +1,5 @@
 # VGGT-with-frontend configuration.
-# Poses from VGGT geometry; 2D tracks from SuperPoint+LightGlue frontend.
+# Poses from VGGT geometry; 2D tracks from SIFT+TwoWayMatcher frontend.
 # 3D points are depth-lifted from VGGT dense predictions, then refined by cluster BA.
 
 # @package _global_
