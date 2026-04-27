@@ -7,7 +7,7 @@ from typing import Any, Hashable, NamedTuple, Optional
 
 import numpy as np
 import torch
-from dask.delayed import Delayed, delayed
+from dask.delayed import delayed
 from gtsam import Point2, Point3, SfmTrack
 
 import gtsfm.common.types as gtsfm_types
