@@ -162,9 +162,11 @@ def _build_gtsfm_data_from_vggt_depth(
     # Register cameras with intrinsics rescaled to original image resolution.
     gtsfm_data = GtsfmData(number_images=num_images)
     for global_idx, camera in cameras.items():
-        if global_idx in image_shapes:
+        if global_idx in image_shapes and global_idx in global_to_local:
             _, orig_W = image_shapes[global_idx]
-            camera = _scale_camera_intrinsics(camera, scale=orig_W / W_vggt)
+            local_idx = global_to_local[global_idx]
+            scaled_W = float(original_coords[local_idx, 4])
+            camera = _scale_camera_intrinsics(camera, scale=orig_W / scaled_W)
         gtsfm_data.add_camera(global_idx, camera)
 
     for track_2d in tracks_2d:
