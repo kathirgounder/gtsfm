@@ -3,10 +3,13 @@
 Authors: Ayush Baid, John Lambert
 """
 
+import dataclasses
+import logging
 import os
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Tuple
 
+import cv2
 import numpy as np
 from dask.delayed import Delayed, delayed
 from dask.distributed import Future
@@ -29,11 +32,15 @@ from gtsfm.global_positioner.global_positioner import GlobalPositioner
 from gtsfm.products.one_view_data import OneViewData
 from gtsfm.products.two_view_result import TwoViewResult
 from gtsfm.products.visibility_graph import AnnotatedGraph
+from gtsfm.utils import verification as verification_utils
 from gtsfm.view_graph_estimator.cycle_consistent_rotation_estimator import (
     CycleConsistentRotationViewGraphEstimator,
     EdgeErrorAggregationCriterion,
 )
+from gtsfm.view_graph_estimator import view_graph_calibration
 from gtsfm.view_graph_estimator.view_graph_estimator_base import ViewGraphEstimatorBase
+
+logger = logging.getLogger(__name__)
 
 
 class MultiViewOptimizer:
@@ -73,6 +80,7 @@ class MultiViewOptimizer:
         bundle_adjustment_module: GlobalBundleAdjustment,
         view_graph_estimator: Optional[ViewGraphEstimatorBase] = None,
         global_positioner: Optional[GlobalPositioner] = None,
+        run_view_graph_calibration: bool = False,
     ) -> None:
         self.view_graph_estimator = view_graph_estimator
         self.rot_avg_module = rot_avg_module
@@ -81,6 +89,7 @@ class MultiViewOptimizer:
         self.ba_optimizer = bundle_adjustment_module
         self.global_positioner = global_positioner
         self._run_view_graph_estimator: bool = self.view_graph_estimator is not None
+        self._run_view_graph_calibration = run_view_graph_calibration
 
         self.view_graph_estimator_v2 = CycleConsistentRotationViewGraphEstimator(
             edge_error_aggregation_criterion=EdgeErrorAggregationCriterion.MEDIAN_EDGE_ERROR
@@ -172,6 +181,30 @@ class MultiViewOptimizer:
             viewgraph_two_view_reports_graph = two_view_reports
             viewgraph_estimation_metrics = delayed(GtsfmMetricsGroup("view_graph_estimation_metrics", []))
 
+        # View graph calibration: refine focal lengths from F-matrices
+        if self._run_view_graph_calibration:
+            all_intrinsics, edges_to_remove = delayed(view_graph_calibration.calibrate_view_graph, nout=2)(
+                viewgraph_v_corr_idxs_graph, keypoints_graph, all_intrinsics, num_images
+            )
+            # Remove edges with high calibration error
+            viewgraph_i2Ri1_graph, viewgraph_i2Ui1_graph, viewgraph_v_corr_idxs_graph = delayed(_filter_edges, nout=3)(
+                viewgraph_i2Ri1_graph, viewgraph_i2Ui1_graph, viewgraph_v_corr_idxs_graph, edges_to_remove
+            )
+            # Re-estimate relative poses with refined intrinsics
+            viewgraph_i2Ri1_graph, viewgraph_i2Ui1_graph = delayed(reestimate_relative_poses, nout=2)(
+                viewgraph_i2Ri1_graph,
+                viewgraph_i2Ui1_graph,
+                viewgraph_v_corr_idxs_graph,
+                keypoints_graph,
+                all_intrinsics,
+            )
+            viewgraph_two_view_reports_graph = delayed(_sync_two_view_reports_after_calibration)(
+                viewgraph_two_view_reports_graph,
+                viewgraph_i2Ri1_graph,
+                viewgraph_i2Ui1_graph,
+                viewgraph_v_corr_idxs_graph,
+            )
+
         # Prune the graph to a single connected component.
         gt_wTi = {k: val.pose_gt for k, val in one_view_data_dict.items()}
         gt_wTi_list = [gt_wTi[i] for i in sorted(list(gt_wTi.keys()))]
@@ -193,7 +226,10 @@ class MultiViewOptimizer:
         if self.global_positioner is not None:
             # Path B: Global positioner replaces trans_avg + data_assoc.
             ba_input_graph, gp_metrics = delayed(self.global_positioner.run, nout=2)(
-                num_images, delayed_wRi, tracks2d_graph, all_intrinsics,
+                num_images,
+                delayed_wRi,
+                tracks2d_graph,
+                all_intrinsics,
                 output_root=output_root,
             )
             ta_metrics = gp_metrics
@@ -252,6 +288,134 @@ class MultiViewOptimizer:
         ba_input_graph = delayed(GtsfmData.align_via_sim3_and_transform)(ba_input_graph, gt_wTi_dict)
 
         return ba_input_graph, ba_result_graph, viewgraph_two_view_reports_graph, multiview_optimizer_metrics_graph
+
+
+def _filter_edges(
+    i2Ri1_dict: Dict[Tuple[int, int], Rot3],
+    i2Ui1_dict: Dict[Tuple[int, int], Unit3],
+    v_corr_idxs_dict: AnnotatedGraph[np.ndarray],
+    edges_to_remove: set,
+) -> Tuple[Dict[Tuple[int, int], Rot3], Dict[Tuple[int, int], Unit3], AnnotatedGraph[np.ndarray]]:
+    """Remove edges flagged by view graph calibration."""
+    if not edges_to_remove:
+        return i2Ri1_dict, i2Ui1_dict, v_corr_idxs_dict
+    filtered_R = {k: v for k, v in i2Ri1_dict.items() if k not in edges_to_remove}
+    filtered_U = {k: v for k, v in i2Ui1_dict.items() if k not in edges_to_remove}
+    filtered_corr = {k: v for k, v in v_corr_idxs_dict.items() if k not in edges_to_remove}
+    logger.info("Edge filtering: removed %d edges, %d remain.", len(edges_to_remove), len(filtered_R))
+    return filtered_R, filtered_U, filtered_corr
+
+
+def _sync_two_view_reports_after_calibration(
+    two_view_reports: AnnotatedGraph[TwoViewEstimationReport],
+    i2Ri1_dict: Dict[Tuple[int, int], Rot3],
+    i2Ui1_dict: Dict[Tuple[int, int], Unit3],
+    v_corr_idxs_dict: AnnotatedGraph[np.ndarray],
+) -> AnnotatedGraph[TwoViewEstimationReport]:
+    """Keep view-graph reports consistent with the calibrated edge set and poses.
+
+    After view-graph calibration, edges may be removed and surviving edges may get
+    updated relative poses. The reports returned from the earlier view-graph estimator
+    should reflect that final state.
+    """
+    synced_reports: AnnotatedGraph[TwoViewEstimationReport] = {}
+
+    for edge, report in two_view_reports.items():
+        if report is None or edge not in i2Ri1_dict or edge not in i2Ui1_dict or edge not in v_corr_idxs_dict:
+            continue
+
+        v_corr_idxs = v_corr_idxs_dict[edge]
+        synced_reports[edge] = dataclasses.replace(
+            report,
+            v_corr_idxs=v_corr_idxs,
+            num_inliers_est_model=v_corr_idxs.shape[0],
+            i2Ri1=i2Ri1_dict[edge],
+            i2Ui1=i2Ui1_dict[edge],
+        )
+
+    return synced_reports
+
+
+def reestimate_relative_poses(
+    i2Ri1_dict: Dict[Tuple[int, int], Rot3],
+    i2Ui1_dict: Dict[Tuple[int, int], Unit3],
+    v_corr_idxs_dict: AnnotatedGraph[np.ndarray],
+    keypoints_list: List[Keypoints],
+    intrinsics: List[gtsfm_types.CALIBRATION_TYPE],
+) -> Tuple[Dict[Tuple[int, int], Rot3], Dict[Tuple[int, int], Unit3]]:
+    """Re-estimate relative poses using refined intrinsics.
+
+    After view graph calibration improves focal lengths, re-compute E-matrices
+    and decompose into relative rotation/translation using the updated intrinsics.
+
+    Args:
+        i2Ri1_dict: Current relative rotations.
+        i2Ui1_dict: Current relative translation directions.
+        v_corr_idxs_dict: Verified correspondence indices per image pair.
+        keypoints_list: Keypoints for all images.
+        intrinsics: Refined intrinsics from view graph calibration.
+
+    Returns:
+        Updated relative rotations and translation directions.
+    """
+
+    updated_i2Ri1 = {}
+    updated_i2Ui1 = {}
+    num_updated = 0
+    num_failed = 0
+
+    for i1, i2 in i2Ri1_dict:
+        if (i1, i2) not in v_corr_idxs_dict:
+            updated_i2Ri1[(i1, i2)] = i2Ri1_dict[(i1, i2)]
+            updated_i2Ui1[(i1, i2)] = i2Ui1_dict[(i1, i2)]
+            continue
+
+        v_corr_idxs = v_corr_idxs_dict[(i1, i2)]
+        if v_corr_idxs.shape[0] < 5:
+            updated_i2Ri1[(i1, i2)] = i2Ri1_dict[(i1, i2)]
+            updated_i2Ui1[(i1, i2)] = i2Ui1_dict[(i1, i2)]
+            continue
+
+        coords_i1 = keypoints_list[i1].coordinates[v_corr_idxs[:, 0]]
+        coords_i2 = keypoints_list[i2].coordinates[v_corr_idxs[:, 1]]
+
+        K1 = intrinsics[i1]
+        K2 = intrinsics[i2]
+
+        # Estimate F-matrix from verified correspondences.
+        F, mask = cv2.findFundamentalMat(coords_i1, coords_i2, method=cv2.FM_8POINT)
+        if F is None or F.shape != (3, 3):
+            updated_i2Ri1[(i1, i2)] = i2Ri1_dict[(i1, i2)]
+            updated_i2Ui1[(i1, i2)] = i2Ui1_dict[(i1, i2)]
+            num_failed += 1
+            continue
+
+        # Convert F → E using refined intrinsics, then decompose.
+        i2Ei1 = verification_utils.fundamental_to_essential_matrix(F, K1, K2)
+        i2Ri1_new, i2Ui1_new = verification_utils.recover_relative_pose_from_essential_matrix(
+            i2Ei1,
+            coords_i1,
+            coords_i2,
+            K1,
+            K2,
+        )
+
+        if i2Ri1_new is not None and i2Ui1_new is not None:
+            updated_i2Ri1[(i1, i2)] = i2Ri1_new
+            updated_i2Ui1[(i1, i2)] = i2Ui1_new
+            num_updated += 1
+        else:
+            updated_i2Ri1[(i1, i2)] = i2Ri1_dict[(i1, i2)]
+            updated_i2Ui1[(i1, i2)] = i2Ui1_dict[(i1, i2)]
+            num_failed += 1
+
+    logger.info(
+        "Re-estimated relative poses: %d updated, %d failed, %d total.",
+        num_updated,
+        num_failed,
+        len(i2Ri1_dict),
+    )
+    return updated_i2Ri1, updated_i2Ui1
 
 
 def init_cameras(

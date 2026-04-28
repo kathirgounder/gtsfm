@@ -20,8 +20,8 @@ import gtsfm.common.types as gtsfm_types
 import gtsfm.utils.geometry_comparisons as comp_utils
 import gtsfm.utils.logger as logger_utils
 import gtsfm.utils.metrics as metric_utils
-from gtsfm.bundle.two_view_ba import TwoViewBundleAdjustment
 from gtsfm.bundle.bundle_adjustment import RobustBAMode
+from gtsfm.bundle.two_view_ba import TwoViewBundleAdjustment
 from gtsfm.common.dask_db_module_base import DaskDBModuleBase
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.common.keypoints import Keypoints
@@ -58,6 +58,8 @@ class TwoViewEstimator(DaskDBModuleBase):
         ba_reproj_error_thresholds: List[Optional[float]] = [0.5],
         allow_indeterminate_linear_system: bool = False,
         postgres_params=None,
+        ba_focal_length_prior_sigma=1e-5,
+        ba_dist_prior_sigma=1e-3,
     ) -> None:
         """Initializes the two-view estimator from verifier.
 
@@ -93,8 +95,8 @@ class TwoViewEstimator(DaskDBModuleBase):
             robust_noise_basin=1.345,
             use_karcher_mean_factor=False,
             use_pose_prior_first_camera=True,
-            calibration_prior_focal_sigma=1e-5,
-            calibration_prior_dist_sigma=1e-5,
+            calibration_prior_focal_sigma=ba_focal_length_prior_sigma,
+            calibration_prior_dist_sigma=ba_dist_prior_sigma,
             cam_pose3_prior_noise_sigma=1e-3,
             measurement_noise_sigma=1.0,
             min_tracks_per_camera=5,
@@ -271,7 +273,7 @@ class TwoViewEstimator(DaskDBModuleBase):
         relative_pose_prior_for_ba = {(0, 1): i2Ti1_prior} if i2Ti1_prior is not None else {}
 
         # Optimize!
-        _, ba_output, valid_mask = self._ba_optimizer.run_ba(
+        _, ba_output, valid_mask, _ = self._ba_optimizer.run_ba(
             ba_input, absolute_pose_priors=[], relative_pose_priors=relative_pose_prior_for_ba, verbose=False
         )
         if ba_output is None:

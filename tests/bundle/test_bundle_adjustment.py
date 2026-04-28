@@ -4,6 +4,7 @@ Authors: Ayush Baid
 """
 
 import unittest
+from unittest.mock import MagicMock, patch
 
 import dask
 import gtsam  # type: ignore
@@ -63,7 +64,7 @@ class TestBundleAdjustmentOptimizer(unittest.TestCase):
         absolute_pose_priors = [None] * EXAMPLE_DATA.number_images()
         relative_pose_priors = {}
 
-        expected_result, _, _ = self.ba.run_ba(
+        expected_result, _, _, _ = self.ba.run_ba(
             self.test_data, absolute_pose_priors=absolute_pose_priors, relative_pose_priors=relative_pose_priors
         )
 
@@ -121,6 +122,83 @@ class TestBundleAdjustmentOptimizer(unittest.TestCase):
 
         self.assertEqual(computed_result.number_images(), self.test_data.number_images())
         self.assertAlmostEqual(error, 0.3675, places=2)
+
+    def test_multistage_ba_uses_previous_filtered_result(self):
+        """Ensure each BA stage consumes the previous stage's filtered output."""
+        ba = BundleAdjustmentOptimizer(reproj_error_thresholds=[10.0, 5.0, 3.0])
+
+        input_data = MagicMock(spec=GtsfmData)
+        input_data.number_tracks.return_value = 3
+
+        stage1_filtered = MagicMock(spec=GtsfmData)
+        stage1_filtered.number_tracks.return_value = 2
+
+        stage2_filtered = MagicMock(spec=GtsfmData)
+        stage2_filtered.number_tracks.return_value = 1
+
+        stage3_filtered = MagicMock(spec=GtsfmData)
+        stage3_filtered.number_tracks.return_value = 1
+
+        stage_outputs = [
+            (MagicMock(spec=GtsfmData), stage1_filtered, [True, False, True], 1.0),
+            (MagicMock(spec=GtsfmData), stage2_filtered, [False, True], 0.5),
+            (MagicMock(spec=GtsfmData), stage3_filtered, [True], 0.1),
+        ]
+
+        call_inputs = []
+
+        def capture_stage_input(stage_input, *args, **kwargs):
+            call_inputs.append(stage_input)
+            return stage_outputs[len(call_inputs) - 1]
+
+        with patch.object(ba, "run_ba_stage_with_filtering", side_effect=capture_stage_input):
+            _, final_filtered, valid_mask, _ = ba.run_ba(
+                input_data,
+                absolute_pose_priors=[],
+                relative_pose_priors={},
+                verbose=False,
+            )
+
+        self.assertEqual(call_inputs, [input_data, stage1_filtered, stage2_filtered])
+        self.assertIs(final_filtered, stage3_filtered)
+        self.assertEqual(valid_mask, [False, False, True])
+
+    def test_stage_mask_maps_gnc_filtered_tracks_to_input_tracks(self):
+        """Ensure GNC-pruned tracks are represented in the stage validity mask."""
+        # min_tracks_per_camera=0 disables the insufficient-tracks check, so the BA
+        # path doesn't try to mutate optimized_data._cameras (which the MagicMock
+        # spec=GtsfmData wouldn't expose since it's set in __init__ rather than at
+        # class level).
+        ba = BundleAdjustmentOptimizer(reproj_error_thresholds=[5.0], min_tracks_per_camera=0)
+
+        initial_data = MagicMock(spec=GtsfmData)
+        initial_data.number_tracks.return_value = 4
+        initial_data.get_valid_camera_indices.return_value = [0, 1, 2]
+
+        optimized_data = MagicMock(spec=GtsfmData)
+        optimized_data.number_tracks.return_value = 3
+
+        filtered_result = MagicMock(spec=GtsfmData)
+        optimized_data.filter_landmarks.return_value = (filtered_result, [True, False, True])
+
+        with patch.object(
+            ba,
+            "_BundleAdjustmentOptimizer__construct_factor_graph",
+            return_value=MagicMock(),
+        ), patch.object(
+            ba,
+            "_BundleAdjustmentOptimizer__optimize_and_recover",
+            return_value=(optimized_data, MagicMock(), 1.0, [True, False, True, True]),
+        ):
+            _, _, valid_mask, _ = ba.run_ba_stage_with_filtering(
+                initial_data,
+                absolute_pose_priors=[],
+                relative_pose_priors={},
+                reproj_error_thresh=5.0,
+                verbose=False,
+            )
+
+        self.assertEqual(valid_mask, [True, False, False, True])
 
 
 if __name__ == "__main__":
