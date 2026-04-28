@@ -83,7 +83,10 @@ def multi_view_retriangulate_from_2d_tracks(
         gtsfm_data: Scene with optimized cameras (existing tracks ignored; cameras re-used).
         tracks_2d: Full 2D track set from `CppDsfTracksEstimator.run()`.
         triangulation_options: Per-track solve config. Defaults to RANSAC_SAMPLE_UNIFORM,
-            reproj_error_threshold=10 px, max_num_hypotheses=100.
+            reproj_error_threshold=10 px, max_num_hypotheses=100. For tracks with
+            N measurements there are N*(N-1)/2 possible 2-view samples, so for
+            typical short tracks the cap is rarely binding; set lower if RANSAC
+            wall-time matters on long tracks.
         min_track_length: Drop tracks with fewer measurements than this.
 
     Returns:
@@ -245,6 +248,7 @@ class BundleAdjustmentOptimizer:
         use_multi_view_retriangulation: bool = False,
         mv_retri_min_track_length: int = 3,
         mv_retri_reproj_error_thresh: float = 10.0,
+        mv_retri_max_num_hypotheses: int = 100,
     ) -> None:
         """Initializes the parameters for bundle adjustment module.
 
@@ -313,6 +317,7 @@ class BundleAdjustmentOptimizer:
         self._use_multi_view_retriangulation = use_multi_view_retriangulation
         self._mv_retri_min_track_length = mv_retri_min_track_length
         self._mv_retri_reproj_error_thresh = mv_retri_reproj_error_thresh
+        self._mv_retri_max_num_hypotheses = mv_retri_max_num_hypotheses
 
     def __map_to_calibration_variable(self, camera_idx: int) -> int:
         return 0 if self._shared_calib else camera_idx
@@ -940,7 +945,7 @@ class BundleAdjustmentOptimizer:
                 retri_options = TriangulationOptions(
                     reproj_error_threshold=self._mv_retri_reproj_error_thresh,
                     mode=TriangulationSamplingMode.RANSAC_SAMPLE_UNIFORM,
-                    max_num_hypotheses=100,
+                    max_num_hypotheses=self._mv_retri_max_num_hypotheses,
                 )
                 logger.info(
                     "[Retri] Multi-view retriangulation on %d 2D tracks "
