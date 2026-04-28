@@ -227,7 +227,11 @@ class BundleAdjustmentOptimizer:
         use_first_point_prior: bool = False,
         use_gnc: bool = False,
         gnc_loss: RobustBAMode | str = RobustBAMode.GMC,
-        factor_weight_outlier_threshold: float = 1e-8,
+        factor_weight_outlier_threshold: float = 0.0,
+        min_track_length: int = 2,
+        min_tracks_per_camera: int = 15,
+        compute_pose_covariances: bool = False,
+        optimizer_relative_cost_tol: float = 1e-5,
         # ── Optional post-BA multi-view retriangulation (opt-in) ──
         # When `use_multi_view_retriangulation=True`: after the existing BA loop
         # converges, re-triangulate the union-find 2D tracks against the post-BA
@@ -238,11 +242,6 @@ class BundleAdjustmentOptimizer:
         use_multi_view_retriangulation: bool = False,
         mv_retri_min_track_length: int = 3,
         mv_retri_reproj_error_thresh: float = 10.0,
-        factor_weight_outlier_threshold: float = 0.0,
-        min_track_length: int = 2,
-        min_tracks_per_camera: int = 15,
-        compute_pose_covariances: bool = False,
-        optimizer_relative_cost_tol: float = 1e-5,
     ) -> None:
         """Initializes the parameters for bundle adjustment module.
 
