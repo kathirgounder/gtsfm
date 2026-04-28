@@ -508,23 +508,25 @@ class BundleAdjustmentOptimizer:
 
     def __optimize_and_recover(
         self, initial_data: GtsfmData, graph: NonlinearFactorGraph, ordering_type: str
-    ) -> Tuple[GtsfmData, Values, float]:
+    ) -> Tuple[GtsfmData, Values, float, List[bool]]:
         """Optimize the graph, report errors, and convert `Values` back to `GtsfmData`."""
         initial_values = initial_data.to_values(shared_calib=self._shared_calib)
         result_values, _, weights = self.__optimize_factor_graph(graph, initial_values, ordering_type)
         final_error = graph.error(result_values)
         optimized_data = GtsfmData.from_values(result_values, initial_data, self._shared_calib)
+        gnc_valid_mask = [True] * initial_data.number_tracks()
         if self._use_gnc and weights is not None and self._factor_weight_outlier_threshold > 0:
-            optimized_data = self.__filter_tracks_by_factor_weights(graph, optimized_data, weights)
-        return optimized_data, result_values, final_error
+            optimized_data, gnc_valid_mask = self.__filter_tracks_by_factor_weights(graph, optimized_data, weights)
+        return optimized_data, result_values, final_error, gnc_valid_mask
 
     def __filter_tracks_by_factor_weights(
         self, graph: NonlinearFactorGraph, optimized_data: GtsfmData, weights: NDArray[np.float64]
-    ) -> GtsfmData:
+    ) -> Tuple[GtsfmData, List[bool]]:
         """Filter tracks based on the weights of the reprojection factors, if GNC optimization is used."""
+        gnc_valid_mask = [True] * optimized_data.number_tracks()
         if weights is None:
             logger.error("Weights array is None, cannot filter tracks by factor weights.")
-            return optimized_data
+            return optimized_data, gnc_valid_mask
         cameras_to_model = sorted(optimized_data.get_valid_camera_indices())
         first_camera = optimized_data.get_camera(cameras_to_model[0])
         assert first_camera is not None, "First camera in optimized factor graph is None"
@@ -541,7 +543,7 @@ class BundleAdjustmentOptimizer:
                 cams_to_remove_per_track[track_id].add(camera_id)
 
         if not cams_to_remove_per_track:
-            return optimized_data
+            return optimized_data, gnc_valid_mask
 
         for track_id, camera_ids in cams_to_remove_per_track.items():
             track = optimized_data.get_track(track_id)
@@ -552,12 +554,16 @@ class BundleAdjustmentOptimizer:
                     new_measurements.append(track.measurement(m_idx))
             track.measurements = new_measurements
 
-        length_filtered_tracks = [
-            track for track in optimized_data.get_tracks() if track.numberMeasurements() >= self._min_track_length
-        ]
+        length_filtered_tracks = []
+        for track_idx, track in enumerate(optimized_data.get_tracks()):
+            if track.numberMeasurements() >= self._min_track_length:
+                length_filtered_tracks.append(track)
+            else:
+                gnc_valid_mask[track_idx] = False
+
         if len(length_filtered_tracks) == optimized_data.number_tracks():
             optimized_data._camera_to_measurement_map = None
-            return optimized_data
+            return optimized_data, gnc_valid_mask
 
         image_info = {
             image_id: optimized_data.get_image_info(image_id) for image_id in optimized_data.get_all_image_ids()
@@ -571,7 +577,7 @@ class BundleAdjustmentOptimizer:
             gaussian_splats=optimized_data.get_gaussian_splats(),
         )
 
-        return filtered_data
+        return filtered_data, gnc_valid_mask
 
     def run_simple_ba(
         self, initial_data: GtsfmData, robust_noise_basin: float | None = None
@@ -595,8 +601,11 @@ class BundleAdjustmentOptimizer:
             cameras_with_insufficient_tracks,
         )
         graph = self.__construct_simple_factor_graph(cameras_to_model, initial_data, robust_noise_basin)
-        optimized_data, result_values, final_error = self.__optimize_and_recover(
-            initial_data, graph, self._ordering_type
+        if len(cameras_with_insufficient_tracks) == len(initial_data.cameras()):
+            logger.warning("Skipping bundle adjustment because all cameras are without tracks.")
+            return initial_data, 0.0
+        optimized_data, result_values, final_error, _ = self.__optimize_and_recover(
+            initial_data, graph, self._ordering_type if not cameras_with_insufficient_tracks else "COLAMD"
         )
         if self._compute_pose_covariances:
             try:
@@ -656,6 +665,7 @@ class BundleAdjustmentOptimizer:
         running_two_view_ba = self.is_two_view_ba(initial_data)
 
         cameras_to_model = sorted(initial_data.get_valid_camera_indices())
+        cameras_with_insufficient_tracks = None
         if not running_two_view_ba:
             cameras_with_insufficient_tracks = self.__get_cameras_with_insufficient_tracks(initial_data)
             cameras_to_model = [i for i in cameras_to_model if i not in cameras_with_insufficient_tracks]
@@ -668,8 +678,8 @@ class BundleAdjustmentOptimizer:
         graph = self.__construct_factor_graph(
             cameras_to_model, initial_data, absolute_pose_priors, relative_pose_priors
         )
-        optimized_data, result_values, final_error = self.__optimize_and_recover(
-            initial_data, graph, self._ordering_type
+        optimized_data, result_values, final_error, gnc_valid_mask = self.__optimize_and_recover(
+            initial_data, graph, self._ordering_type if not cameras_with_insufficient_tracks else "COLAMD"
         )
         if not running_two_view_ba:
             # Add the non-BA cameras from initial_data back.
@@ -703,13 +713,18 @@ class BundleAdjustmentOptimizer:
         if reproj_error_thresh is not None:
             if verbose:
                 logger.info("[Result] Number of tracks before filtering: %d", optimized_data.number_tracks())
-            filtered_result, valid_mask = optimized_data.filter_landmarks(reproj_error_thresh)
+            filtered_result, postfilter_valid_mask = optimized_data.filter_landmarks(reproj_error_thresh)
             if verbose:
                 logger.info("[Result] Number of tracks after filtering: %d", filtered_result.number_tracks())
 
         else:
-            valid_mask = [True] * optimized_data.number_tracks()
+            postfilter_valid_mask = [True] * optimized_data.number_tracks()
             filtered_result = optimized_data
+
+        valid_mask = [False] * initial_data.number_tracks()
+        kept_track_indices = [track_idx for track_idx, is_valid in enumerate(gnc_valid_mask) if is_valid]
+        for track_idx, is_valid in zip(kept_track_indices, postfilter_valid_mask):
+            valid_mask[track_idx] = is_valid
         if self._compute_pose_covariances:
             filtered_pose_covariances = {
                 i: cov
@@ -725,7 +740,7 @@ class BundleAdjustmentOptimizer:
         absolute_pose_priors: List[Optional[PosePrior]],
         relative_pose_priors: Dict[Tuple[int, int], PosePrior],
         verbose: bool = True,
-    ) -> Tuple[Optional[GtsfmData], Optional[GtsfmData], Optional[List[bool]]]:
+    ) -> Tuple[Optional[GtsfmData], Optional[GtsfmData], Optional[List[bool]], List[float]]:
         """Runs bundle adjustment by forming a factor graph and optimizing it using Levenberg–Marquardt optimization.
 
         Args:
@@ -734,30 +749,60 @@ class BundleAdjustmentOptimizer:
             relative_pose_priors: Priors on the pose between two cameras.
             verbose: Boolean flag to print out additional info for debugging.
 
-        Results:
-            Optimized camera poses, 3D point w/ tracks, and error metrics, aligned to GT (if provided).
-            Optimized camera poses after filtering landmarks (and cameras with no remaining landmarks).
-            Valid mask as a list of booleans, indicating for each input track whether it was below the re-projection
-                threshold.
+        Returns:
+            Optimized cameras and tracks with error metrics, aligned to GT if provided.
+            Filtered result after removing high-reprojection-error landmarks and cameras with no remaining tracks.
+            Boolean mask over input tracks: True if the track survived all BA filtering steps.
+            Per-step wall-clock times for each BA iteration.
         """
         num_ba_steps = len(self._reproj_error_thresholds)
+        assert num_ba_steps > 0, "No BA steps to perform"
+
+        current_input = initial_data
+        active_track_indices = list(range(initial_data.number_tracks()))
+        cumulative_valid_mask = [True] * initial_data.number_tracks()
+        step_times: List[float] = []
+
         for step, reproj_error_thresh in enumerate(self._reproj_error_thresholds):
-            # Use intermediate result as initial condition for next step.
-            (optimized_data, filtered_result, valid_mask, final_error) = self.run_ba_stage_with_filtering(
-                initial_data,
+            step_start_time = time.time()
+            optimized_data, filtered_result, stage_valid_mask, final_error = self.run_ba_stage_with_filtering(
+                current_input,
                 absolute_pose_priors,
                 relative_pose_priors,
                 reproj_error_thresh,
                 verbose,
             )
-            # Print intermediate results.
-            if num_ba_steps > 1:
-                logger.info(
-                    "[BA Step %d/%d] Error: %.2f, Number of tracks: %d"
-                    % (step + 1, num_ba_steps, final_error, filtered_result.number_tracks())
+            step_times.append(time.time() - step_start_time)
+
+            if optimized_data is None or filtered_result is None or stage_valid_mask is None:
+                return optimized_data, filtered_result, stage_valid_mask, step_times  # type: ignore
+
+            if len(stage_valid_mask) != len(active_track_indices):
+                raise ValueError(
+                    "Bundle adjustment stage returned a validity mask whose length does not match the input tracks."
                 )
 
-        return optimized_data, filtered_result, valid_mask  # type: ignore
+            next_active_track_indices = []
+            for original_track_idx, is_valid in zip(active_track_indices, stage_valid_mask):
+                cumulative_valid_mask[original_track_idx] = is_valid
+                if is_valid:
+                    next_active_track_indices.append(original_track_idx)
+            active_track_indices = next_active_track_indices
+            current_input = filtered_result
+
+            if num_ba_steps > 1:
+                logger.info(
+                    "[BA Stage @ thresh=%.2f px %d/%d] Error: %.2f, Number of tracks: %d"
+                    % (
+                        reproj_error_thresh if reproj_error_thresh is not None else float("nan"),
+                        step + 1,
+                        num_ba_steps,
+                        final_error,
+                        filtered_result.number_tracks(),
+                    )
+                )
+
+        return optimized_data, filtered_result, cumulative_valid_mask, step_times  # type: ignore
 
     def _run_ba_and_evaluate(
         self,
@@ -783,35 +828,13 @@ class BundleAdjustmentOptimizer:
                 [False] * initial_data.number_tracks(),
                 GtsfmMetricsGroup(METRICS_GROUP, []),
             )
-        step_times = []
         start_time = time.time()
-
-        num_ba_steps = len(self._reproj_error_thresholds)
-        assert num_ba_steps > 0, "No BA steps to perform"
-
-        for step, reproj_error_thresh in enumerate(self._reproj_error_thresholds):
-            step_start_time = time.time()
-            (optimized_data, filtered_result, valid_mask, final_error) = self.run_ba_stage_with_filtering(
-                initial_data=initial_data,
-                absolute_pose_priors=absolute_pose_priors,
-                relative_pose_priors=relative_pose_priors,
-                reproj_error_thresh=reproj_error_thresh,
-                verbose=verbose,
-            )
-            step_times.append(time.time() - step_start_time)
-
-            # Print intermediate results.
-            if num_ba_steps > 1:
-                logger.info(
-                    "[BA Stage @ thresh=%.2f px %d/%d] Error: %.2f, Number of tracks: %d"
-                    % (
-                        reproj_error_thresh if reproj_error_thresh is not None else float("nan"),
-                        step + 1,
-                        num_ba_steps,
-                        final_error,
-                        filtered_result.number_tracks(),
-                    )
-                )
+        optimized_data, filtered_result, valid_mask, step_times = self.run_ba(
+            initial_data=initial_data,
+            absolute_pose_priors=absolute_pose_priors,
+            relative_pose_priors=relative_pose_priors,
+            verbose=verbose,
+        )
         total_time = time.time() - start_time
 
         metrics = self.evaluate(optimized_data, filtered_result, cameras_gt, save_dir)  # type: ignore
@@ -850,7 +873,10 @@ class BundleAdjustmentOptimizer:
         # Align the sparse multi-view estimate after BA to the ground truth pose graph.
         aligned_filtered_data = filtered_data.align_via_sim3_and_transform(poses_gt)
         ba_pose_error_metrics = metrics_utils.compute_ba_pose_metrics(
-            gt_wTi=poses_gt, computed_wTi=aligned_filtered_data.get_camera_poses(), save_dir=save_dir
+            gt_wTi=poses_gt,
+            computed_wTi=aligned_filtered_data.get_camera_poses(),
+            save_dir=save_dir,
+            metric_constructed_only=True,
         )
         ba_metrics.extend(metrics_group=ba_pose_error_metrics)
 

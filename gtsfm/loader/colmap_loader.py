@@ -7,9 +7,10 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
+from gtsam import Cal3Bundler, Pose3  # type:ignore
+
 import gtsfm.utils.io as io_utils
 import gtsfm.utils.logger as logger_utils
-from gtsam import Cal3Bundler, Pose3  # type:ignore
 from gtsfm.common.image import Image
 from gtsfm.loader.loader_base import LoaderBase
 
@@ -167,8 +168,10 @@ class ColmapLoader(LoaderBase):
             raise IndexError(f"Image index {index} is invalid. Valid indices are in [0,{len(self) - 1}].")
 
         if not self._use_gt_intrinsics:
-            # get intrinsics from exif
-            intrinsics = io_utils.load_image(self._image_paths[index]).get_intrinsics_from_exif()
+            # get intrinsics from exif, falling back to default focal length heuristic if exif is unavailable
+            intrinsics = io_utils.load_image(self._image_paths[index]).get_intrinsics(
+                default_focal_length_factor=self._default_focal_length_factor or 1.2
+            )
         else:
             intrinsics = self._calibrations[index]
             if self._default_focal_length_factor is not None and intrinsics.fx() <= 0:

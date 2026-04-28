@@ -316,6 +316,17 @@ class MergedNodeResult:
     pre_ba_metrics: GtsfmMetricsGroup
 
 
+@dataclass(frozen=True)
+class MergedNodeSummary:
+    """Lightweight summary of a merged node safe to return to the client."""
+
+    merge_success: bool
+    num_images: int
+    num_tracks: int
+    metrics: GtsfmMetricsGroup
+    pre_ba_metrics: GtsfmMetricsGroup
+
+
 def _sanitize_component(value: str, fallback: str) -> str:
     sanitized = re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").lower()
     return sanitized or fallback
@@ -634,6 +645,34 @@ def schedule_exports(
     export_payload_tree = Tree.zip(handles_tree, merged_future_tree).map_with_children(_to_payload_with_future)
 
     return submit_tree_map(client, export_payload_tree, _run_export_task, pure=False)
+
+
+def _summarize_merged_result(result: MergedNodeResult) -> MergedNodeSummary:
+    """Project a merged result down to the small client-facing payload."""
+    scene = result.scene
+    if scene is None:
+        return MergedNodeSummary(
+            merge_success=False,
+            num_images=0,
+            num_tracks=0,
+            metrics=result.metrics,
+            pre_ba_metrics=result.pre_ba_metrics,
+        )
+
+    return MergedNodeSummary(
+        merge_success=True,
+        num_images=scene.number_images(),
+        num_tracks=scene.number_tracks(),
+        metrics=result.metrics,
+        pre_ba_metrics=result.pre_ba_metrics,
+    )
+
+
+def schedule_summaries(client: Client, merged_future_tree: Tree[Future]) -> Tree[Future]:
+    """Schedule extraction of lightweight merge summaries for client-side reporting."""
+    return merged_future_tree.map(
+        lambda merged_future: client.submit(_summarize_merged_result, merged_future, pure=False)
+    )
 
 
 def _drop_outlier_tracks(scene: GtsfmData) -> GtsfmData:
@@ -956,8 +995,10 @@ def combine_results(
 __all__ = [
     "MergingOptions",
     "MergedNodeResult",
+    "MergedNodeSummary",
     "combine_results",
     "schedule_exports",
+    "schedule_summaries",
     "compute_merging_metrics",
     "annotate_scene_with_metadata",
 ]
