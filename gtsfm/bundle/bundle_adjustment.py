@@ -64,26 +64,27 @@ def multi_view_retriangulate_from_2d_tracks(
     triangulation_options: Optional[TriangulationOptions] = None,
     min_track_length: int = 3,
 ) -> GtsfmData:
-    """GLOMAP-style multi-view retriangulation against post-BA cameras.
+    """Re-triangulate the union-find 2D track set against post-BA cameras.
 
-    Re-triangulates the union-find 2D track set with the current (post-BA) cameras
-    via multi-view RANSAC (samples camera pairs, triangulates, scores by inlier
-    count over all track measurements). Recovers tracks that were dropped between
-    union-find and BA's filter passes — the cameras are now well-converged, so
-    triangulations that previously failed at intermediate camera estimates can
-    now succeed.
+    Each input track is solved by `Point3dInitializer.triangulate`: RANSAC samples
+    camera pairs, triangulates a candidate 3D point via 2-view DLT, scores by
+    counting inliers (measurements within `reproj_error_threshold`) across the
+    whole track, and picks the best sample. The final 3D point is then computed
+    by a multi-view DLT over the inlier measurements.
 
-    2-view tracks are filtered out by default (`min_track_length=3`) — they are
-    weak by construction (no consensus across views, single-pair baseline) and
-    add disproportionate cost to a downstream BA.
+    Recovers tracks that were dropped earlier in the pipeline when cameras
+    weren't yet converged — those triangulations can now succeed against the
+    refined cameras.
+
+    2-view tracks are excluded by default (`min_track_length=3`). They are weak
+    (no inlier consensus across views, single-pair baseline) and don't help BA.
 
     Args:
         gtsfm_data: Scene with optimized cameras (existing tracks ignored; cameras re-used).
         tracks_2d: Full 2D track set from `CppDsfTracksEstimator.run()`.
         triangulation_options: Per-track solve config. Defaults to RANSAC_SAMPLE_UNIFORM,
             reproj_error_threshold=10 px, max_num_hypotheses=100.
-        min_track_length: Drop tracks with fewer measurements than this. Default 3
-            keeps only multi-view tracks.
+        min_track_length: Drop tracks with fewer measurements than this.
 
     Returns:
         New GtsfmData with same cameras and an augmented track set.
