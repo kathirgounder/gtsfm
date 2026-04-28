@@ -137,6 +137,8 @@ def multi_view_retriangulate_from_2d_tracks(
         n_triangulation_failed, n_short_output,
     )
     return out
+
+
 @dataclass
 class BundleAdjustmentOptions:
     """Shared configuration for bundle adjustment across leaf BA, merging BA, etc.
