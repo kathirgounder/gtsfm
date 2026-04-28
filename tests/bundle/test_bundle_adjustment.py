@@ -165,7 +165,11 @@ class TestBundleAdjustmentOptimizer(unittest.TestCase):
 
     def test_stage_mask_maps_gnc_filtered_tracks_to_input_tracks(self):
         """Ensure GNC-pruned tracks are represented in the stage validity mask."""
-        ba = BundleAdjustmentOptimizer(reproj_error_thresholds=[5.0])
+        # min_tracks_per_camera=0 disables the insufficient-tracks check, so the BA
+        # path doesn't try to mutate optimized_data._cameras (which the MagicMock
+        # spec=GtsfmData wouldn't expose since it's set in __init__ rather than at
+        # class level).
+        ba = BundleAdjustmentOptimizer(reproj_error_thresholds=[5.0], min_tracks_per_camera=0)
 
         initial_data = MagicMock(spec=GtsfmData)
         initial_data.number_tracks.return_value = 4
@@ -180,7 +184,7 @@ class TestBundleAdjustmentOptimizer(unittest.TestCase):
         with patch.object(
             ba,
             "_BundleAdjustmentOptimizer__construct_factor_graph",
-            return_value=(MagicMock(), {}),
+            return_value=MagicMock(),
         ), patch.object(
             ba,
             "_BundleAdjustmentOptimizer__optimize_and_recover",
