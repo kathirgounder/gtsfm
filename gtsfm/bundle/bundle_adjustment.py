@@ -26,6 +26,12 @@ import gtsfm.utils.tracks as track_utils
 from gtsfm.common import gtsfm_data
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.common.pose_prior import PosePrior
+from gtsfm.common.sfm_track import SfmTrack2d
+from gtsfm.data_association.point3d_initializer import (
+    Point3dInitializer,
+    TriangulationOptions,
+    TriangulationSamplingMode,
+)
 from gtsfm.evaluation.metrics import GtsfmMetric, GtsfmMetricsGroup
 
 METRICS_GROUP = "bundle_adjustment_metrics"
@@ -50,6 +56,91 @@ class RobustBAMode(Enum):
     HUBER = "HUBER"
     GMC = "GMC"
     TLS = "TLS"
+
+
+def multi_view_retriangulate_from_2d_tracks(
+    gtsfm_data: GtsfmData,
+    tracks_2d: List["SfmTrack2d"],
+    triangulation_options: Optional[TriangulationOptions] = None,
+    min_track_length: int = 3,
+) -> GtsfmData:
+    """Re-triangulate the union-find 2D track set against post-BA cameras.
+
+    Each input track is solved by `Point3dInitializer.triangulate`: RANSAC samples
+    camera pairs, triangulates a candidate 3D point via 2-view DLT, scores by
+    counting inliers (measurements within `reproj_error_threshold`) across the
+    whole track, and picks the best sample. The final 3D point is then computed
+    by a multi-view DLT over the inlier measurements.
+
+    Recovers tracks that were dropped earlier in the pipeline when cameras
+    weren't yet converged — those triangulations can now succeed against the
+    refined cameras.
+
+    2-view tracks are excluded by default (`min_track_length=3`). They are weak
+    (no inlier consensus across views, single-pair baseline) and don't help BA.
+
+    Args:
+        gtsfm_data: Scene with optimized cameras (existing tracks ignored; cameras re-used).
+        tracks_2d: Full 2D track set from `CppDsfTracksEstimator.run()`.
+        triangulation_options: Per-track solve config. Defaults to RANSAC_SAMPLE_UNIFORM,
+            reproj_error_threshold=10 px, max_num_hypotheses=100. For tracks with
+            N measurements there are N*(N-1)/2 possible 2-view samples, so for
+            typical short tracks the cap is rarely binding; set lower if RANSAC
+            wall-time matters on long tracks.
+        min_track_length: Drop tracks with fewer measurements than this.
+
+    Returns:
+        New GtsfmData with same cameras and an augmented track set.
+    """
+    if triangulation_options is None:
+        triangulation_options = TriangulationOptions(
+            reproj_error_threshold=10.0,
+            mode=TriangulationSamplingMode.RANSAC_SAMPLE_UNIFORM,
+            max_num_hypotheses=100,
+        )
+
+    camera_dict = {i: cam for i, cam in gtsfm_data.cameras().items() if cam is not None}
+    initializer = Point3dInitializer(camera_dict, triangulation_options)
+
+    out = GtsfmData(gtsfm_data.number_images())
+    for cam_idx, camera in camera_dict.items():
+        out.add_camera(cam_idx, camera)
+        info = gtsfm_data.get_image_info(cam_idx)
+        out.set_image_info(cam_idx, name=info.name, shape=info.shape)
+
+    n_in = len(tracks_2d)
+    n_kept = 0
+    n_short_input = 0
+    n_no_cams = 0
+    n_short_output = 0
+    n_triangulation_failed = 0
+    for track_2d in tracks_2d:
+        if track_2d.number_measurements() < min_track_length:
+            n_short_input += 1
+            continue
+        valid_measurements = [m for m in track_2d.measurements if m.i in camera_dict]
+        if len(valid_measurements) < min_track_length:
+            n_no_cams += 1
+            continue
+        track_2d_filtered = SfmTrack2d(measurements=valid_measurements)
+
+        new_track, _, _ = initializer.triangulate(track_2d_filtered)
+        if new_track is None:
+            n_triangulation_failed += 1
+            continue
+        if new_track.numberMeasurements() < min_track_length:
+            n_short_output += 1
+            continue
+        out.add_track(new_track)
+        n_kept += 1
+
+    logger.info(
+        "Multi-view retriangulation: %d kept / %d input (min_len=%d): "
+        "%d short_in, %d no_cams, %d tri_failed, %d short_out.",
+        n_kept, n_in, min_track_length, n_short_input, n_no_cams,
+        n_triangulation_failed, n_short_output,
+    )
+    return out
 
 
 @dataclass
@@ -147,6 +238,17 @@ class BundleAdjustmentOptimizer:
         min_tracks_per_camera: int = 15,
         compute_pose_covariances: bool = False,
         optimizer_relative_cost_tol: float = 1e-5,
+        # ── Optional post-BA multi-view retriangulation (opt-in) ──
+        # When `use_multi_view_retriangulation=True`: after the existing BA loop
+        # converges, re-triangulate the union-find 2D tracks against the post-BA
+        # cameras (recovers tracks dropped between union-find and BA's filter
+        # passes) and run a final BA on the augmented set. Requires `tracks_2d` to
+        # be passed to `create_computation_graph` / `_run_ba_and_evaluate`. The
+        # final BA reuses the existing `reproj_error_thresholds[-1]` for filtering.
+        use_multi_view_retriangulation: bool = False,
+        mv_retri_min_track_length: int = 3,
+        mv_retri_reproj_error_thresh: float = 10.0,
+        mv_retri_max_num_hypotheses: int = 100,
     ) -> None:
         """Initializes the parameters for bundle adjustment module.
 
@@ -210,6 +312,12 @@ class BundleAdjustmentOptimizer:
         self._min_tracks_per_camera = min_tracks_per_camera
         self._compute_pose_covariances = compute_pose_covariances
         self._optimizer_relative_cost_tol = optimizer_relative_cost_tol
+
+        # Post-BA multi-view retriangulation (opt-in). See `__init__` docstring above.
+        self._use_multi_view_retriangulation = use_multi_view_retriangulation
+        self._mv_retri_min_track_length = mv_retri_min_track_length
+        self._mv_retri_reproj_error_thresh = mv_retri_reproj_error_thresh
+        self._mv_retri_max_num_hypotheses = mv_retri_max_num_hypotheses
 
     def __map_to_calibration_variable(self, camera_idx: int) -> int:
         return 0 if self._shared_calib else camera_idx
@@ -812,8 +920,15 @@ class BundleAdjustmentOptimizer:
         cameras_gt: List[Optional[gtsfm_types.CAMERA_TYPE]],
         save_dir: Optional[str] = None,
         verbose: bool = True,
+        tracks_2d: Optional[List["SfmTrack2d"]] = None,
     ) -> Tuple[GtsfmData, GtsfmData, List[bool], GtsfmMetricsGroup]:
-        """Runs the equivalent of `run_ba()` and `evaluate()` in a single function, to enable time profiling."""
+        """Runs the equivalent of `run_ba()` and `evaluate()` in a single function, to enable time profiling.
+
+        Args:
+            tracks_2d: (optional) Union-find 2D track set from `CppDsfTracksEstimator.run()`.
+                Required when `use_multi_view_retriangulation` is enabled — used by
+                the post-BA retriangulation stage.
+        """
         logger.info(
             "Input: %d tracks on %d cameras", initial_data.number_tracks(), len(initial_data.get_valid_camera_indices())
         )
@@ -835,6 +950,57 @@ class BundleAdjustmentOptimizer:
             relative_pose_priors=relative_pose_priors,
             verbose=verbose,
         )
+        total_time = time.time() - start_time
+
+        # ── Optional post-BA multi-view retriangulation stage ──
+        # Re-triangulate union-find tracks against the post-BA cameras (recovers
+        # tracks dropped between union-find and BA's filter passes), then run a
+        # final BA on the augmented set. The final BA reuses the existing tightest
+        # `reproj_error_thresholds[-1]` for inline filtering — same mechanism as
+        # the upstream BA loop.
+        if self._use_multi_view_retriangulation:
+            if tracks_2d is None:
+                logger.warning(
+                    "use_multi_view_retriangulation is True but tracks_2d was not "
+                    "passed to _run_ba_and_evaluate — skipping retri stage."
+                )
+            else:
+                retri_start = time.time()
+                retri_options = TriangulationOptions(
+                    reproj_error_threshold=self._mv_retri_reproj_error_thresh,
+                    mode=TriangulationSamplingMode.RANSAC_SAMPLE_UNIFORM,
+                    max_num_hypotheses=self._mv_retri_max_num_hypotheses,
+                )
+                logger.info(
+                    "[Retri] Multi-view retriangulation on %d 2D tracks "
+                    "(min_track_len=%d, reproj_error_thresh=%.1fpx)",
+                    len(tracks_2d), self._mv_retri_min_track_length,
+                    self._mv_retri_reproj_error_thresh,
+                )
+                retri_data = multi_view_retriangulate_from_2d_tracks(
+                    gtsfm_data=filtered_result,
+                    tracks_2d=tracks_2d,
+                    triangulation_options=retri_options,
+                    min_track_length=self._mv_retri_min_track_length,
+                )
+                if retri_data.number_tracks() > 0:
+                    # Final BA on the retri'd track set. No inline filter — pose AUC
+                    # is set by BA's converged cameras and is independent of any
+                    # downstream track filtering. Callers can filter the returned
+                    # GtsfmData themselves if they want.
+                    (optimized_data, filtered_result, valid_mask, _) = self.run_ba_stage_with_filtering(
+                        initial_data=retri_data,
+                        absolute_pose_priors=absolute_pose_priors,
+                        relative_pose_priors=relative_pose_priors,
+                        reproj_error_thresh=None,
+                        verbose=verbose,
+                    )
+                    logger.info(
+                        "[Retri] Stage complete: %d tracks, %.1fs",
+                        filtered_result.number_tracks(), time.time() - retri_start,
+                    )
+                step_times.append(time.time() - retri_start)
+
         total_time = time.time() - start_time
 
         metrics = self.evaluate(optimized_data, filtered_result, cameras_gt, save_dir)  # type: ignore
@@ -904,6 +1070,7 @@ class BundleAdjustmentOptimizer:
         relative_pose_priors: Dict[Tuple[int, int], PosePrior],
         cameras_gt: List[Optional[gtsfm_types.CAMERA_TYPE]],
         save_dir: Optional[str] = None,
+        tracks_2d: Optional[Delayed] = None,
     ) -> Tuple[Delayed, Delayed]:
         """Create the computation graph for performing bundle adjustment.
 
@@ -913,6 +1080,8 @@ class BundleAdjustmentOptimizer:
             relative_pose_priors: Priors on poses between cameras (not delayed).
             cameras_gt: Ground truth camera calibration & pose for each image/camera.
             save_dir: Directory where artifacts and plots should be saved to disk.
+            tracks_2d: (optional) Delayed list of 2D tracks from `CppDsfTracksEstimator`.
+                Required when `use_multi_view_retriangulation` is enabled.
 
         Returns:
             GtsfmData aligned to GT (if provided), wrapped up using dask.delayed
@@ -925,5 +1094,6 @@ class BundleAdjustmentOptimizer:
             relative_pose_priors,
             cameras_gt,
             save_dir=save_dir,
+            tracks_2d=tracks_2d,
         )
         return filtered_sfm_data, metrics_graph
