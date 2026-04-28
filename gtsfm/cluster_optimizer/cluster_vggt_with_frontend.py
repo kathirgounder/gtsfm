@@ -300,6 +300,10 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         # frontend's F-matrices before cluster BA. Off by default. Useful when the
         # input images are uncalibrated and VGGT's predicted focals are unreliable.
         use_view_graph_calibration: bool = False,
+        # Re-triangulate union-find 2D tracks against the post-BA cameras and run a
+        # second BA on the augmented set. Recovers tracks dropped earlier in the
+        # pipeline; mirrors the retri stage in BundleAdjustmentOptimizer.
+        use_multi_view_retriangulation: bool = False,
     ) -> None:
         super().__init__(
             correspondence_generator=correspondence_generator,
@@ -319,6 +323,7 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         self._input_mode = input_mode
         self._seed = seed
         self._use_view_graph_calibration = use_view_graph_calibration
+        self._use_multi_view_retriangulation = use_multi_view_retriangulation
 
         self._weights_path = Path(weights_path) if weights_path is not None else None
         self._loader_kwargs: dict[str, Any] = {}
@@ -427,6 +432,8 @@ class ClusterVGGTWithFrontend(ClusterMVO):
             drop_camera_with_no_track=self._drop_camera_with_no_track,
             min_track_length=self._min_track_length,
             cluster_label=context.label,
+            tracks_2d=tracks_2d_graph,
+            use_multi_view_retriangulation=self._use_multi_view_retriangulation,
         )
 
         # 7. Metrics + I/O.
