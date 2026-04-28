@@ -829,7 +829,7 @@ class BundleAdjustmentOptimizer:
                 GtsfmMetricsGroup(METRICS_GROUP, []),
             )
         start_time = time.time()
-        optimized_data, filtered_result, valid_mask, step_times = self._run_ba_stages(
+        optimized_data, filtered_result, valid_mask, step_times = self.run_ba(
             initial_data=initial_data,
             absolute_pose_priors=absolute_pose_priors,
             relative_pose_priors=relative_pose_priors,
