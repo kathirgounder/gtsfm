@@ -12,6 +12,7 @@ __all__ = [
     "FastVggt",
     "Anysplat",
     "Cacher",
+    "VggtWithFrontend",
     "logger",
     "save_metrics_reports",
 ]
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
     from .cluster_optimizer_cacher import ClusterOptimizerCacher as Cacher
     from .cluster_vggt import ClusterVGGT as Vggt
     from .cluster_fast_vggt import ClusterFastVGGT as FastVggt
+    from .cluster_vggt_with_frontend import ClusterVGGTWithFrontend as VggtWithFrontend
 
 # Short name → (module, class) for lazy attribute access.
 _MOD_MAP = {
@@ -33,6 +35,7 @@ _MOD_MAP = {
     "FastVggt": ("gtsfm.cluster_optimizer.cluster_fast_vggt", "ClusterFastVGGT"),
     "Anysplat": ("gtsfm.cluster_optimizer.cluster_anysplat", "ClusterAnySplat"),
     "Cacher": ("gtsfm.cluster_optimizer.cluster_optimizer_cacher", "ClusterOptimizerCacher"),
+    "VggtWithFrontend": ("gtsfm.cluster_optimizer.cluster_vggt_with_frontend", "ClusterVGGTWithFrontend"),
 }
 
 
