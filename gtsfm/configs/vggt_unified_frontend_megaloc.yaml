@@ -92,6 +92,8 @@ cluster_optimizer:
     input_mode: crop
     seed: 42
     model_cache_key: null
+    # Refine VGGT predicted intrinsics via Fetzer joint optimization on F-matrices.
+    use_view_graph_calibration: false
 
 # --- Merging options ---
 merging_options:
