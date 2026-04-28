@@ -944,34 +944,13 @@ class BundleAdjustmentOptimizer:
                 GtsfmMetricsGroup(METRICS_GROUP, []),
             )
         start_time = time.time()
-
-        num_ba_steps = len(self._reproj_error_thresholds)
-        assert num_ba_steps > 0, "No BA steps to perform"
-
-        for step, reproj_error_thresh in enumerate(self._reproj_error_thresholds):
-            step_start_time = time.time()
-            optimized_data = initial_data
-            (optimized_data, filtered_result, valid_mask, final_error) = self.run_ba_stage_with_filtering(
-                initial_data=optimized_data,
-                absolute_pose_priors=absolute_pose_priors,
-                relative_pose_priors=relative_pose_priors,
-                reproj_error_thresh=reproj_error_thresh,
-                verbose=verbose,
-            )
-            step_times.append(time.time() - step_start_time)
-
-            # Print intermediate results.
-            if num_ba_steps > 1:
-                logger.info(
-                    "[BA Stage @ thresh=%.2f px %d/%d] Error: %.2f, Number of tracks: %d"
-                    % (
-                        reproj_error_thresh if reproj_error_thresh is not None else float("nan"),
-                        step + 1,
-                        num_ba_steps,
-                        final_error,
-                        filtered_result.number_tracks(),
-                    )
-                )
+        optimized_data, filtered_result, valid_mask, step_times = self.run_ba(
+            initial_data=initial_data,
+            absolute_pose_priors=absolute_pose_priors,
+            relative_pose_priors=relative_pose_priors,
+            verbose=verbose,
+        )
+        total_time = time.time() - start_time
 
         # ── Optional post-BA multi-view retriangulation stage ──
         # Re-triangulate union-find tracks against the post-BA cameras (recovers
