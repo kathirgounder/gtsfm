@@ -133,7 +133,7 @@ def _build_gtsfm_data_from_vggt_depth(
     image_indices: tuple[int, ...],
     num_images: int,
     min_track_length: int = 2,
-    refined_intrinsics: Optional[list[gtsfm_types.CALIBRATION_TYPE]] = None,
+    refined_intrinsics: Optional[dict[int, gtsfm_types.CALIBRATION_TYPE]] = None,
 ) -> GtsfmData:
     """Build GtsfmData using VGGT cameras (rescaled to original resolution) and frontend 2D tracks.
 
@@ -233,8 +233,7 @@ def _refine_vggt_intrinsics_via_view_graph(
     keypoints_list: list,
     image_shapes: dict[int, tuple[int, int]],
     image_indices: tuple[int, ...],
-    num_images: int,
-) -> list[gtsfm_types.CALIBRATION_TYPE]:
+) -> dict[int, gtsfm_types.CALIBRATION_TYPE]:
     """Refine focal lengths via Fetzer joint optimization over F-matrix edges.
 
     Returns intrinsics in ORIGINAL image coordinates (suitable for use with the
@@ -242,26 +241,20 @@ def _refine_vggt_intrinsics_via_view_graph(
     image coords first, then handed to `calibrate_view_graph` as the initial
     estimate. VGGT's predicted poses are unchanged — only intrinsics are refined.
     """
-    initial_intrinsics: list[gtsfm_types.CALIBRATION_TYPE] = []
-    global_to_local = {gidx: lidx for lidx, gidx in enumerate(image_indices)}
-    for global_idx in range(num_images):
+    initial_intrinsics: dict[int, gtsfm_types.CALIBRATION_TYPE] = {}
+    for local_idx, global_idx in enumerate(image_indices):
         if global_idx in vggt_result.cameras and global_idx in image_shapes:
-            local_idx = global_to_local[global_idx]
             _, orig_W = image_shapes[global_idx]
             scaled_W = float(vggt_result.original_coords[local_idx, 4])
             scale = orig_W / scaled_W if scaled_W > 0 else 1.0
             scaled_cam = _scale_camera_intrinsics(vggt_result.cameras[global_idx], scale=scale)
-            initial_intrinsics.append(scaled_cam.calibration())
-        else:
-            # Placeholder for images outside this cluster; calibrate_view_graph won't touch
-            # cameras with no edges, so the placeholder value never reaches the BA solve.
-            initial_intrinsics.append(gtsam.Cal3Bundler(1.0, 0.0, 0.0, 0.0, 0.0))
+            initial_intrinsics[global_idx] = scaled_cam.calibration()
 
+    keypoints = {gidx: keypoints_list[gidx] for gidx in image_indices}
     refined, _edges_to_remove = calibrate_view_graph(
         v_corr_idxs_dict=v_corr_idxs,
-        keypoints_list=keypoints_list,
+        keypoints=keypoints,
         initial_intrinsics=initial_intrinsics,
-        num_images=num_images,
     )
     return refined
 
@@ -296,13 +289,7 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         save_two_view_viz: bool = False,
         pose_angular_error_thresh: float = 3,
         output_worker: Optional[str] = None,
-        # Refine VGGT's predicted intrinsics via joint Fetzer optimization over the
-        # frontend's F-matrices before cluster BA. Off by default. Useful when the
-        # input images are uncalibrated and VGGT's predicted focals are unreliable.
         use_view_graph_calibration: bool = False,
-        # Re-triangulate union-find 2D tracks against the post-BA cameras and run a
-        # second BA on the augmented set. Recovers tracks dropped earlier in the
-        # pipeline; mirrors the retri stage in BundleAdjustmentOptimizer.
         use_multi_view_retriangulation: bool = False,
     ) -> None:
         super().__init__(
@@ -409,7 +396,6 @@ class ClusterVGGTWithFrontend(ClusterMVO):
                 frontend_graphs.padded_keypoints,
                 image_shapes_graph,
                 global_indices,
-                context.num_images,
             )
 
         # 5. Build GtsfmData: lift 2D tracks to 3D using VGGT depth map.
