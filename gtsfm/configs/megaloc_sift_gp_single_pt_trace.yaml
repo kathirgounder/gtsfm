@@ -15,11 +15,10 @@
 # lower AUC@5 than the peak yaml because the tracing BA wrapper alters the BA
 # execution path. For benchmark numbers, run megaloc_sift_gp_single_pt.yaml.
 #
-# REQUIRED ENV VAR for colored point trails in the visualizer:
-#   export GTSFM_PIPELINE_TRACE_IMAGES_DIR=benchmarks/<scene>/images
-# Without it, points render gray. Must be set BEFORE launching gtsfm so dask
-# workers inherit it at fork time (they pickle BA's _dump_trace calls onto
-# subprocesses; the color sampler reads the env var).
+# Image colors for the visualizer are auto-detected from --images_dir or
+# --dataset_dir CLI args (runner sets GTSFM_PIPELINE_TRACE_IMAGES_DIR in __init__,
+# before dask workers fork). Override manually if needed:
+#   export GTSFM_PIPELINE_TRACE_IMAGES_DIR=/path/to/images
 
 # @package _global_
 _target_: gtsfm.scene_optimizer.SceneOptimizer

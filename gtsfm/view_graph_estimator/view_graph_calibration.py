@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 from gtsam import Cal3Bundler
 from scipy.optimize import least_squares
+from scipy.sparse import csr_matrix
 
 import gtsfm.common.types as gtsfm_types
 from gtsfm.common.keypoints import Keypoints
@@ -198,6 +199,21 @@ def calibrate_view_graph(
         "pp2_stack": np.array([e[4] for e in edges]),  # (n, 2)
     }
 
+    # Each residual i depends only on focals at idx1[i] and idx2[i], so the
+    # Jacobian is super sparse (2 nonzeros per row). Telling scipy this lets
+    # the finite-difference Jacobian be built via graph coloring instead of
+    # perturbing every variable for every iteration.
+    rows = np.repeat(np.arange(2 * n), 2)
+    cols = np.empty(4 * n, dtype=np.int64)
+    cols[0::4] = precomputed["idx1"]
+    cols[1::4] = precomputed["idx2"]
+    cols[2::4] = precomputed["idx1"]
+    cols[3::4] = precomputed["idx2"]
+    jac_sparsity = csr_matrix(
+        (np.ones(4 * n, dtype=np.int8), (rows, cols)),
+        shape=(2 * n, len(sorted_cameras)),
+    )
+
     # Step 3: Joint optimization with Cauchy robust loss.
     result = least_squares(
         _fetzer_residuals,
@@ -207,6 +223,7 @@ def calibrate_view_graph(
         f_scale=0.1,
         bounds=(100.0, np.inf),
         max_nfev=200,
+        jac_sparsity=jac_sparsity,
     )
 
     optimized_focals = result.x

@@ -4,7 +4,7 @@ import argparse
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, Optional
+from typing import TYPE_CHECKING, List, cast, Optional
 
 import hydra
 from dask import config as dask_config
@@ -43,6 +43,34 @@ class GtsfmRunner:
         # chances of creating CUDA contexts in the parent process before workers spawn.
         self.scene_optimizer: Optional["SceneOptimizer"] = None
         self._io_worker: Optional[str] = None
+
+        # Register images_dir for the pipeline-trace color sampler. Called from __init__
+        # so the env var is set BEFORE any dask client / worker fork — workers inherit it
+        # at fork and the per-worker color sampler can find images on disk. No-op for
+        # peak runs (peak BA/GP don't read this env var).
+        self._maybe_register_pipeline_trace_images_dir()
+
+    def _maybe_register_pipeline_trace_images_dir(self) -> None:
+        """Auto-detect the loader's image directory from CLI args and set
+        ``GTSFM_PIPELINE_TRACE_IMAGES_DIR`` so the trace color sampler can find images.
+
+        Pure env-var write; doesn't load anything heavy or import torch. Skipped if
+        the user already set the env var (manual override wins).
+        """
+        if os.environ.get("GTSFM_PIPELINE_TRACE_IMAGES_DIR"):
+            return
+        candidates: List[str] = []
+        explicit = getattr(self.parsed_args, "images_dir", None)
+        if explicit:
+            candidates.append(explicit)
+        dataset_dir = getattr(self.parsed_args, "dataset_dir", None)
+        if dataset_dir:
+            candidates.append(os.path.join(dataset_dir, "images"))
+        for candidate in candidates:
+            if candidate and os.path.isdir(candidate):
+                os.environ["GTSFM_PIPELINE_TRACE_IMAGES_DIR"] = candidate
+                logger.info("🌟 GTSFM: registered pipeline-trace images_dir: %s", candidate)
+                return
 
     def construct_argparser(self) -> argparse.ArgumentParser:
         parser = argparse.ArgumentParser(description="GTSFM Runner")

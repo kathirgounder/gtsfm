@@ -520,33 +520,56 @@ class BundleAdjustmentOptimizer:
         relative_pose_priors: Dict[Tuple[int, int], PosePrior],
         reproj_error_thresh: Optional[float] = None,
         verbose: bool = False,
-        max_dump_frames: int = 12,  # kept for back-compat; unused under endpoint-only mode.
+        max_dump_frames: int = 6,  # 5 head LM iters + final = the "5+1" mental model.
         **extra_kwargs,
     ) -> Tuple[GtsfmData, GtsfmData, List[bool], float]:
-        """Run BA, dump start+end snapshots into the pipeline_trace (endpoint-only mode).
+        """Run BA + capture per-LM-iter snapshots into the pipeline_trace.
 
-        Earlier per-LM-iter capture (flipping save_iteration_visualization=True →
-        manual lm.iterate() loop) cost ~3 AUC@5 on Brussels regardless of how the
-        Python convergence check was wired — irreducible drift vs vanilla
-        lm.optimize(). Endpoint-only dumps preserve peak accuracy and Babylon's
-        lerp produces smooth animation between the two snapshots anyway.
+        TRADE-OFF: this enables save_iteration_visualization=True which forces BA
+        through the manual lm.iterate() loop (vs vanilla lm.optimize). On Brussels
+        that costs ~3 AUC@5 because LM lambda dynamics differ subtly. Acceptable
+        in trace mode — the F yaml is the canonical benchmark, Ft is just for viz.
+
+        Sampling: first `max_dump_frames - 1` LM iters one-for-one (where the most
+        dramatic motion happens) plus the absolute final iter for a clean handoff.
+        Default 5+1 matches the user's "5 head + final" mental model and keeps the
+        animation length proportional to the GP convergence segment.
         """
         capture = bool(self._save_pipeline_trace and self._save_pipeline_trace_dir)
+        prev = self._save_iteration_visualization
         if capture:
-            self._dump_trace(initial_data, f"{prefix}_pre",
-                             num_tracks=initial_data.number_tracks())
-        result = self.run_ba_stage_with_filtering(
-            initial_data=initial_data,
-            absolute_pose_priors=absolute_pose_priors,
-            relative_pose_priors=relative_pose_priors,
-            reproj_error_thresh=reproj_error_thresh,
-            verbose=verbose,
-            **extra_kwargs,
-        )
-        if capture:
-            optimized_data = result[0]
-            self._dump_trace(optimized_data, f"{prefix}_post",
-                             num_tracks=optimized_data.number_tracks())
+            self._save_iteration_visualization = True
+        try:
+            result = self.run_ba_stage_with_filtering(
+                initial_data=initial_data,
+                absolute_pose_priors=absolute_pose_priors,
+                relative_pose_priors=relative_pose_priors,
+                reproj_error_thresh=reproj_error_thresh,
+                verbose=verbose,
+                **extra_kwargs,
+            )
+        finally:
+            self._save_iteration_visualization = prev
+
+        if capture and getattr(self, "_last_values_trace", None):
+            trace = self._last_values_trace
+            head = list(range(min(max_dump_frames - 1, len(trace))))
+            last_idx = len(trace) - 1
+            if last_idx not in head:
+                head.append(last_idx)
+            n_dumped = 0
+            for k in head:
+                try:
+                    iter_data = GtsfmData.from_values(trace[k], initial_data, self._shared_calib)
+                    self._dump_trace(iter_data, f"{prefix}_iter_{k:03d}",
+                                     num_tracks=iter_data.number_tracks(),
+                                     lm_iter=k, total_iters=len(trace))
+                    n_dumped += 1
+                except Exception as e:
+                    logger.warning("[pipeline_trace] %s iter %d dump failed: %s", prefix, k, e)
+            logger.info("[pipeline_trace] dumped %d/%d %s LM iter snapshots (5 head + final)",
+                        n_dumped, len(trace), prefix)
+            self._last_values_trace = None
         return result
 
     def __map_to_calibration_variable(self, camera_idx: int) -> int:
@@ -1271,14 +1294,16 @@ class BundleAdjustmentOptimizer:
                 )
                 self._dump_trace(retri_data, "retri", num_tracks=retri_data.number_tracks())
 
-                # Final BA on the retri'd track set (no inner outer-loop here — single pass).
-                # Uses 4bf2e98c-style filter (in-BA `filter_landmarks(3px)`); the 13ada7fc
-                # post-BA per-obs filter + densify chain is NOT wired here — it regressed
-                # Brussels by ~2.5 AUC@5. Kept simple for top accuracy.
+                # Final BA on the retri'd track set. Routed through _ba_with_iter_capture
+                # so the visualizer gets per-LM-iter snapshots of the final refining stage
+                # (5 head iters + final). In trace mode we've already accepted the manual
+                # lm.iterate() drift on outer BAs — keeping retri-final consistent here
+                # since this yaml is for viz, not benchmark numbers.
                 if retri_data.number_tracks() > 0:
                     final_ba_start = time.time()
                     final_thresh = self._reproj_error_thresholds[-1] or 3.0
-                    (optimized_data, filtered_result, valid_mask, _) = self.run_ba_stage_with_filtering(
+                    (optimized_data, filtered_result, valid_mask, _) = self._ba_with_iter_capture(
+                        prefix="retri_final_ba",
                         initial_data=retri_data,
                         absolute_pose_priors=absolute_pose_priors,
                         relative_pose_priors=relative_pose_priors,

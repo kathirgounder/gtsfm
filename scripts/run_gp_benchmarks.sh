@@ -121,6 +121,17 @@ run_all_configs_pt() {
                 "$dataset_name" "$loader" "$dataset_dir" "$images_dir" "$max_res" "false"
     fi
 
+    # Ft: F + pipeline visualizer trace dumps. Same back-end as F but uses
+    # bundle_adjustment_tracing + global_positioner_tracing → COLMAP-format
+    # snapshots at every pipeline stage land in
+    # <output_dir>/results/plots/pipeline_trace/. AUC@5 ~1-3 lower than F because
+    # the tracing BA has different LM execution path. Use F for headline numbers,
+    # Ft for visualizer data.
+    if [ "$FILTER_CONFIG" = "Ft" ]; then
+        run_one "Ft" "GP + Single (PT) [TRACE]" "megaloc_sift_gp_single_pt_trace" \
+                "$dataset_name" "$loader" "$dataset_dir" "$images_dir" "$max_res" "false"
+    fi
+
     # G: Baseline + METIS (phototourism)
     if [ -z "$FILTER_CONFIG" ] || [ "$FILTER_CONFIG" = "G" ]; then
         run_one "G" "Baseline + METIS (PT)" "megaloc_sift_baseline_metis_pt" \
