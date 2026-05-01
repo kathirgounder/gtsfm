@@ -1,5 +1,10 @@
-# MegaLoc + SIFT + Global Positioner with Single partition.
-# Based on unified_megaloc.yaml with SIFT detector/matcher swap + GP.
+# MegaLoc + SIFT + Global Positioner with Single partition + PIPELINE TRACE.
+# Mirror of megaloc_sift_gp_single_pt.yaml but uses bundle_adjustment_tracing
+# (dumps start/end snapshots per outer BA + retri stages → COLMAP trace folders
+# for the visualizer). Use this config ONLY when generating viz data — it's
+# expected to score slightly lower AUC@5 than the peak yaml on Brussels because
+# the trace wrapper alters the BA execution path. For benchmark numbers, run
+# megaloc_sift_gp_single_pt.yaml instead.
 
 # @package _global_
 _target_: gtsfm.scene_optimizer.SceneOptimizer
@@ -119,7 +124,7 @@ cluster_optimizer:
     rotation_outlier_threshold_deg: 0
 
     bundle_adjustment_module:
-      _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptimizer
+      _target_: gtsfm.bundle.bundle_adjustment_tracing.BundleAdjustmentOptimizer
       # We use the LAST element as base; earlier elements ignored under the
       # GLOMAP outer-loop scheme. Filter threshold = scaling * last value.
       reproj_error_thresholds: [3]
@@ -154,6 +159,10 @@ cluster_optimizer:
       # colonnade, Pantheon columns). Default false — flip to true to test.
       mv_retri_use_recursive_splitter: false
       mv_retri_recursive_max_depth: 5
+      # Trace dumps to <save_dir>/pipeline_trace/ as COLMAP-format folders for
+      # the visualizer. Endpoint-only mode: per-outer-BA pre/post snapshots +
+      # retri input/output (no per-LM-iter capture — that path costs ~3 AUC@5).
+      save_pipeline_trace: true
 
   dense_multiview_optimizer: null
   gaussian_splatting_optimizer: null
