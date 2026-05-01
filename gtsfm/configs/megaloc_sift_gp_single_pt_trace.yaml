@@ -1,10 +1,25 @@
 # MegaLoc + SIFT + Global Positioner with Single partition + PIPELINE TRACE.
-# Mirror of megaloc_sift_gp_single_pt.yaml but uses bundle_adjustment_tracing
-# (dumps start/end snapshots per outer BA + retri stages → COLMAP trace folders
-# for the visualizer). Use this config ONLY when generating viz data — it's
-# expected to score slightly lower AUC@5 than the peak yaml on Brussels because
-# the trace wrapper alters the BA execution path. For benchmark numbers, run
-# megaloc_sift_gp_single_pt.yaml instead.
+# Mirror of megaloc_sift_gp_single_pt.yaml but swaps two modules to their tracing
+# variants so the visualizer gets COLMAP-format snapshots at every pipeline stage:
+#
+#   bundle_adjustment_tracing.BundleAdjustmentOptimizer
+#     → dumps ba_input / outer_ba_N (pre+post) / retri / retri_final_ba
+#       (endpoint-only — per-LM-iter dumps cost ~3 AUC@5 from manual lm.iterate()
+#        drift vs vanilla lm.optimize(), not worth the visualizer fidelity)
+#
+#   global_positioner_tracing.GlobalPositioner
+#     → dumps first 20 GP LM iters one-for-one + the final iter (this is where the
+#       dramatic random-init → emerging-structure motion happens)
+#
+# Use this config ONLY when generating data for the visualizer. Expect slightly
+# lower AUC@5 than the peak yaml because the tracing BA wrapper alters the BA
+# execution path. For benchmark numbers, run megaloc_sift_gp_single_pt.yaml.
+#
+# REQUIRED ENV VAR for colored point trails in the visualizer:
+#   export GTSFM_PIPELINE_TRACE_IMAGES_DIR=benchmarks/<scene>/images
+# Without it, points render gray. Must be set BEFORE launching gtsfm so dask
+# workers inherit it at fork time (they pickle BA's _dump_trace calls onto
+# subprocesses; the color sampler reads the env var).
 
 # @package _global_
 _target_: gtsfm.scene_optimizer.SceneOptimizer
@@ -112,7 +127,7 @@ cluster_optimizer:
       save_track_patches_viz: False
 
     global_positioner:
-      _target_: gtsfm.global_positioner.global_positioner.GlobalPositioner
+      _target_: gtsfm.global_positioner.global_positioner_tracing.GlobalPositioner
       noise_sigma: 0.01
       huber_loss_scale: 0.1
       max_iterations: 50
