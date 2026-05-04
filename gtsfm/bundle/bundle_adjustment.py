@@ -953,12 +953,6 @@ class BundleAdjustmentOptimizer:
         )
         total_time = time.time() - start_time
 
-        # ── Optional post-BA multi-view retriangulation stage ──
-        # Re-triangulate union-find tracks against the post-BA cameras (recovers
-        # tracks dropped between union-find and BA's filter passes), then run a
-        # final BA on the augmented set. The final BA reuses the existing tightest
-        # `reproj_error_thresholds[-1]` for inline filtering — same mechanism as
-        # the upstream BA loop.
         if self._use_multi_view_retriangulation:
             if tracks_2d is None:
                 logger.warning(
@@ -985,10 +979,6 @@ class BundleAdjustmentOptimizer:
                     min_track_length=self._mv_retri_min_track_length,
                 )
                 if retri_data.number_tracks() > 0:
-                    # Final BA on the retri'd track set. No inline filter — pose AUC
-                    # is set by BA's converged cameras and is independent of any
-                    # downstream track filtering. Callers can filter the returned
-                    # GtsfmData themselves if they want.
                     (optimized_data, filtered_result, valid_mask, _) = self.run_ba_stage_with_filtering(
                         initial_data=retri_data,
                         absolute_pose_priors=absolute_pose_priors,
