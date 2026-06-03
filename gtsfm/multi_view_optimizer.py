@@ -82,6 +82,8 @@ class MultiViewOptimizer:
         global_positioner: Optional[GlobalPositioner] = None,
         run_view_graph_calibration: bool = False,
         rotation_outlier_threshold_deg: float = 0.0,
+        enable_double_ra_filter: bool = False,
+        ra_filter_threshold_deg: float = 10.0,
     ) -> None:
         self.view_graph_estimator = view_graph_estimator
         self.rot_avg_module = rot_avg_module
@@ -92,6 +94,17 @@ class MultiViewOptimizer:
         self._run_view_graph_estimator: bool = self.view_graph_estimator is not None
         self._run_view_graph_calibration = run_view_graph_calibration
         self._rotation_outlier_threshold_deg = rotation_outlier_threshold_deg
+        # GLOMAP-style two-pass RA with per-edge residual filtering between passes.
+        # After RA pass 1, drops edges whose observed relative rotation deviates by
+        # more than `ra_filter_threshold_deg` from the global solution; re-runs RA
+        # on the cleaned set; filters again. Drops bad pairs from BOTH the
+        # rotation/translation dicts AND the v_corr_idxs (so 2D tracks don't
+        # absorb correspondences from symmetric-feature false matches), then
+        # propagates the cleaned tracks to GP. On Thanjavur, GLOMAP drops ~2K
+        # edges this way and disconnects ~18 marginal cameras whose rotation
+        # estimates were dragged into the doubled-structure basin.
+        self._enable_double_ra_filter = enable_double_ra_filter
+        self._ra_filter_threshold_deg = ra_filter_threshold_deg
 
 
     def __repr__(self) -> str:
@@ -198,14 +211,66 @@ class MultiViewOptimizer:
             viewgraph_i2Ri1_graph, viewgraph_i2Ui1_graph, pose_priors_graph
         )
 
-        # Single rotation averaging pass.
-        delayed_wRi, rot_avg_metrics = self.rot_avg_module.create_computation_graph(
-            num_images,
-            pruned_i2Ri1_graph,
-            i1Ti2_priors=pose_priors_graph,
-            gt_wTi_list=gt_wTi_list,
-            v_corr_idxs=viewgraph_v_corr_idxs_graph,
-        )
+        if self._enable_double_ra_filter:
+            # ── GLOMAP-style two-pass RA + 10° per-edge residual filter + re-prune ──
+            # Pass 1: RA on the cycle-consistency-filtered viewgraph.
+            wRi_pass1, _ = self.rot_avg_module.create_computation_graph(
+                num_images,
+                pruned_i2Ri1_graph,
+                i1Ti2_priors=pose_priors_graph,
+                gt_wTi_list=gt_wTi_list,
+                v_corr_idxs=viewgraph_v_corr_idxs_graph,
+            )
+            # Drop pairs whose observed relative rotation deviates >threshold from the
+            # global solution. Filters BOTH (i2Ri1, i2Ui1) AND v_corr_idxs so the bad
+            # pairs' feature correspondences DON'T enter union-find tracks downstream.
+            filtered_i2Ri1_pass1, filtered_i2Ui1_pass1 = delayed(filter_edges_by_rotation, nout=2)(
+                wRi_pass1, pruned_i2Ri1_graph, pruned_i2Ui1_graph,
+                max_rotation_error_deg=self._ra_filter_threshold_deg,
+            )
+            # Re-prune to LCC after filter — drops cameras that lost all edges.
+            # GLOMAP does this and reports e.g. "511 / 529 images are within the connected
+            # component". Without re-pruning, disconnected cameras stay in RA pass 2 input
+            # with no constraints → bad rotations → poison GP.
+            filtered_i2Ri1_pass1, filtered_i2Ui1_pass1 = delayed(
+                graph_utils.prune_to_largest_connected_component, nout=2
+            )(filtered_i2Ri1_pass1, filtered_i2Ui1_pass1, pose_priors_graph)
+            v_corr_idxs_pass1 = delayed(_filter_v_corr_idxs_by_pair_set)(
+                viewgraph_v_corr_idxs_graph, filtered_i2Ri1_pass1
+            )
+            # Pass 2: RA on the cleaned + re-pruned viewgraph.
+            delayed_wRi, rot_avg_metrics = self.rot_avg_module.create_computation_graph(
+                num_images,
+                filtered_i2Ri1_pass1,
+                i1Ti2_priors=pose_priors_graph,
+                gt_wTi_list=gt_wTi_list,
+                v_corr_idxs=v_corr_idxs_pass1,
+            )
+            # Final filter on pass-2 result, then re-prune again.
+            filtered_i2Ri1_final, filtered_i2Ui1_final = delayed(filter_edges_by_rotation, nout=2)(
+                delayed_wRi, filtered_i2Ri1_pass1, filtered_i2Ui1_pass1,
+                max_rotation_error_deg=self._ra_filter_threshold_deg,
+            )
+            filtered_i2Ri1_final, filtered_i2Ui1_final = delayed(
+                graph_utils.prune_to_largest_connected_component, nout=2
+            )(filtered_i2Ri1_final, filtered_i2Ui1_final, pose_priors_graph)
+            v_corr_idxs_final = delayed(_filter_v_corr_idxs_by_pair_set)(
+                v_corr_idxs_pass1, filtered_i2Ri1_final
+            )
+            # Use the cleaned versions for everything downstream.
+            pruned_i2Ri1_graph = filtered_i2Ri1_final
+            pruned_i2Ui1_graph = filtered_i2Ui1_final
+            viewgraph_v_corr_idxs_graph = v_corr_idxs_final
+        else:
+            # Single rotation averaging pass.
+            delayed_wRi, rot_avg_metrics = self.rot_avg_module.create_computation_graph(
+                num_images,
+                pruned_i2Ri1_graph,
+                i1Ti2_priors=pose_priors_graph,
+                gt_wTi_list=gt_wTi_list,
+                v_corr_idxs=viewgraph_v_corr_idxs_graph,
+            )
+
         # Optional: prune cameras with globally inconsistent rotations (off by default).
         if self._rotation_outlier_threshold_deg > 0:
             delayed_wRi = delayed(prune_rotation_outliers)(
@@ -292,8 +357,15 @@ def filter_edges_by_rotation(
 ) -> Tuple[Dict[Tuple[int, int], Rot3], Dict[Tuple[int, int], Unit3]]:
     """Filter edges whose relative rotation is inconsistent with global rotations (GLOMAP FilterRotations).
 
-    For each edge (i1, i2), compares the measured i2Ri1 with the expected wRi2 * wRi1^T.
-    Removes edges where the angular error exceeds the threshold.
+    For each edge (i1, i2), compares the measured i2Ri1 with the expected
+    wRi2.inverse() * wRi1 (NOT wRi2 * wRi1.inverse() — that was a bug in the
+    earlier draft that gave a 92% false-positive drop rate on Thanjavur).
+
+    Convention: `i2Ri1` rotates a point from camera-1 frame to camera-2 frame.
+    Since `point_cam_i = wR_i.inverse() * point_world`:
+      point_cam2 = wR_i2.inverse() * wR_i1 * point_cam1 = i2Ri1 * point_cam1
+    Therefore the correct expected formula is:
+      i2Ri1 = wR_i2.inverse() * wR_i1
 
     Args:
         wRi_list: Global rotations from rotation averaging.
@@ -318,8 +390,8 @@ def filter_edges_by_rotation(
             if (i1, i2) in i2Ui1_dict:
                 filtered_U[(i1, i2)] = i2Ui1_dict[(i1, i2)]
             continue
-        # Expected relative rotation from global estimates.
-        i2Ri1_expected = wRi2.compose(wRi1.inverse())
+        # Expected relative rotation from global estimates: i2Ri1 = wRi2.inverse() * wRi1.
+        i2Ri1_expected = wRi2.inverse().compose(wRi1)
         error_rot = i2Ri1_expected.compose(i2Ri1.inverse())
         error_deg = abs(error_rot.axisAngle()[1]) * 180.0 / np.pi
         if error_deg <= max_rotation_error_deg:
@@ -746,3 +818,18 @@ def filter_corr_by_idx(correspondences: AnnotatedGraph[np.ndarray], idxs: List[T
         Filtered correspondences.
     """
     return {k: v for k, v in correspondences.items() if k in idxs}
+
+
+def _filter_v_corr_idxs_by_pair_set(
+    correspondences: AnnotatedGraph[np.ndarray],
+    allowed_pairs_dict: Dict[Tuple[int, int], object],
+) -> AnnotatedGraph[np.ndarray]:
+    """Drop correspondences whose pair_id isn't in `allowed_pairs_dict`'s keys.
+
+    Used by the GLOMAP-style two-pass RA + filter: after RA filters out bad rotation
+    edges, this drops the same pairs from the v_corr_idxs so their feature
+    correspondences don't enter union-find tracks downstream. O(N) instead of O(N²)
+    by using a dict's O(1) `in` check on its keyset.
+    """
+    allowed_keys = allowed_pairs_dict.keys()  # dict_keys supports O(1) `in`
+    return {k: v for k, v in correspondences.items() if k in allowed_keys}

@@ -1,5 +1,24 @@
-# MegaLoc + SIFT + Global Positioner with Single partition.
-# Based on unified_megaloc.yaml with SIFT detector/matcher swap + GP.
+# MegaLoc + SIFT + Global Positioner with Single partition + PIPELINE TRACE.
+# Mirror of megaloc_sift_gp_single_pt.yaml but swaps two modules to their tracing
+# variants so the visualizer gets COLMAP-format snapshots at every pipeline stage:
+#
+#   bundle_adjustment_tracing.BundleAdjustmentOptimizer
+#     → dumps ba_input / outer_ba_N (pre+post) / retri / retri_final_ba
+#       (endpoint-only — per-LM-iter dumps cost ~3 AUC@5 from manual lm.iterate()
+#        drift vs vanilla lm.optimize(), not worth the visualizer fidelity)
+#
+#   global_positioner_tracing.GlobalPositioner
+#     → dumps first 20 GP LM iters one-for-one + the final iter (this is where the
+#       dramatic random-init → emerging-structure motion happens)
+#
+# Use this config ONLY when generating data for the visualizer. Expect slightly
+# lower AUC@5 than the peak yaml because the tracing BA wrapper alters the BA
+# execution path. For benchmark numbers, run megaloc_sift_gp_single_pt.yaml.
+#
+# Image colors for the visualizer are auto-detected from --images_dir or
+# --dataset_dir CLI args (runner sets GTSFM_PIPELINE_TRACE_IMAGES_DIR in __init__,
+# before dask workers fork). Override manually if needed:
+#   export GTSFM_PIPELINE_TRACE_IMAGES_DIR=/path/to/images
 
 # @package _global_
 _target_: gtsfm.scene_optimizer.SceneOptimizer
@@ -8,17 +27,15 @@ loader:
   _target_: gtsfm.loader.Olsson
 
 image_pairs_generator:
+  # Skip MegaLoc + similarity matrix entirely. The COLMAP shared DB already has
+  # the verified pair set from exhaustive matching — recomputing descriptors to
+  # re-derive a less-complete subset wastes ~5 min per run AND constructs a
+  # bigger Dask graph than needed (139K candidate edges → 22K survive).
   _target_: gtsfm.retriever.image_pairs_generator.ImagePairsGenerator
-  global_descriptor:
-    _target_: gtsfm.frontend.cacher.global_descriptor_cacher.GlobalDescriptorCacher
-    global_descriptor_obj:
-      _target_: gtsfm.frontend.global_descriptor.MegaLoc
+  global_descriptor: null  # not needed; pairs come straight from DB
   retriever:
-    _target_: gtsfm.retriever.Similarity
-    num_matched: 75
-    min_score: 0.30
-    use_diffusion_preprocessing: false
-    use_mst_augmentation: false
+    _target_: gtsfm.retriever.colmap_db_pairs_retriever.ColmapDbPairsRetriever
+    database_path: /Users/kathir/Desktop/gtsfm/benchmarks/thanjavur/colmap_shared_threshold_0.800.db
   batch_size: 16
 
 graph_partitioner:
@@ -27,20 +44,13 @@ graph_partitioner:
 cluster_optimizer:
   _target_: gtsfm.cluster_optimizer.Multiview
 
+  # ColmapCorrespondenceGenerator reads keypoints + verified matches directly
+  # from the COLMAP shared DB built earlier — skips SIFT extraction + matching
+  # (saves ~1 hr on 529-image Thanjavur). Same two-view input as GLOMAP for
+  # apples-to-apples back-end comparison.
   correspondence_generator:
-    _target_: gtsfm.frontend.correspondence_generator.det_desc_correspondence_generator.DetDescCorrespondenceGenerator
-
-    detector_descriptor:
-      _target_: gtsfm.frontend.cacher.detector_descriptor_cacher.DetectorDescriptorCacher
-      detector_descriptor_obj:
-        _target_: gtsfm.frontend.detector_descriptor.colmap_sift.ColmapSIFTDetectorDescriptor
-        max_keypoints: 8192
-
-    matcher:
-      _target_: gtsfm.frontend.cacher.matcher_cacher.MatcherCacher
-      matcher_obj:
-        _target_: gtsfm.frontend.matcher.twoway_matcher.TwoWayMatcher
-        ratio_test_threshold: 0.8
+    _target_: gtsfm.frontend.correspondence_generator.colmap_correspondence_generator.ColmapCorrespondenceGenerator
+    database_path: /Users/kathir/Desktop/gtsfm/benchmarks/thanjavur/colmap_shared_threshold_0.800.db
 
   two_view_estimator:
     _target_: gtsfm.two_view_estimator_cacher.TwoViewEstimatorCacher
@@ -64,7 +74,7 @@ cluster_optimizer:
       inlier_support_processor:
         _target_: gtsfm.two_view_estimator.InlierSupportProcessor
         min_num_inliers_est_model: 30
-        min_inlier_ratio_est_model: 0.15
+        min_inlier_ratio_est_model: 0.25  # GLOMAP-matched (was 0.15)
   save_gtsfm_data: True
   save_3d_viz: False
   save_two_view_viz: False
@@ -80,10 +90,6 @@ cluster_optimizer:
     rot_avg_module:
       _target_: gtsfm.averaging.rotation.shonan.ShonanRotationAveraging
       weight_by_inliers: True
-      # Set to true ONLY when Shonan hangs (e.g., Pantheon's repetitive colonnade
-      # causes rank escalation). Skips Shonan's SDP iteration; uses chordal init
-      # + Geman-McClure LM refinement (GLOMAP-style: weight_type=GEMAN_MCCLURE,
-      # irls_loss_parameter_sigma=5°, max_num_irls_iterations=100).
       chordal_only: true
 
     trans_avg_module:
@@ -117,6 +123,13 @@ cluster_optimizer:
 
     run_view_graph_calibration: true
     rotation_outlier_threshold_deg: 0
+    # GLOMAP-style 2-pass RA + 10° per-edge residual filter between passes.
+    # Drops bad rotation edges from BOTH (i2Ri1, i2Ui1) AND v_corr_idxs so the
+    # filtered pairs' feature correspondences don't leak into union-find tracks.
+    # Final cleaned tracks feed GP. On Thanjavur this should drop ~2K edges +
+    # disconnect ~18 marginal cameras, matching GLOMAP's behavior.
+    enable_double_ra_filter: true
+    ra_filter_threshold_deg: 10.0
 
     bundle_adjustment_module:
       _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptimizer
@@ -154,6 +167,9 @@ cluster_optimizer:
       # colonnade, Pantheon columns). Default false — flip to true to test.
       mv_retri_use_recursive_splitter: false
       mv_retri_recursive_max_depth: 5
+      # Trace dumps to <save_dir>/pipeline_trace/ as COLMAP-format folders for
+      # the visualizer. Endpoint-only mode: per-outer-BA pre/post snapshots +
+      # retri input/output (no per-LM-iter capture — that path costs ~3 AUC@5).
 
   dense_multiview_optimizer: null
   gaussian_splatting_optimizer: null

@@ -82,8 +82,23 @@ class ColmapLoader(LoaderBase):
             else self._dataset_dir
         )
 
-        wTi_list, img_fnames, calibrations, _, _, _ = io_utils.read_scene_data_from_colmap_format(colmap_data_dir)
-        # TODO in future PR: if img_fnames is None, default to using everything inside image directory
+        # Try to load a COLMAP-format reconstruction; fall back to enumerating the
+        # raw images directory when none is present. The fallback path supports the
+        # crowdsourced-phototourism case (raw image dump, no prior reconstruction):
+        # intrinsics come from EXIF or default_focal_length_factor (handled in
+        # get_camera_intrinsics_full_res below), Fetzer + GP recover the rest.
+        try:
+            wTi_list, img_fnames, calibrations, _, _, _ = io_utils.read_scene_data_from_colmap_format(colmap_data_dir)
+        except (ValueError, RuntimeError) as e:
+            logger.info("No COLMAP reconstruction at %s (%s); enumerating images_dir for raw-input mode.",
+                        colmap_data_dir, e)
+            img_fnames = sorted(
+                p.name for p in Path(self._images_dir).iterdir()
+                if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+            )
+            wTi_list = [None] * len(img_fnames)
+            calibrations = None
+            self._use_gt_extrinsics = False  # no GT poses available either
 
         if calibrations is None:
             self._use_gt_intrinsics = False
