@@ -836,12 +836,21 @@ class BundleAdjustmentOptimizer:
             values_trace = None
         else:
             values_trace = [initial_values]
+            # Hard cap manual-loop iters in trace mode. GTSAM's default is 100 but the
+            # convergence check rarely fires on dense problems (Brussels: 101/101 every
+            # outer BA; Pantheon retri-final: 100 iters × ~12s = ~20 min). Visualizer
+            # only samples 5 head + final per BA anyway, so iters past ~30 add zero
+            # visual info and just burn wall time. 30 keeps total per-BA wall time
+            # under ~5 min on Pantheon-scale (300+ cams, 30K+ tracks).
+            TRACE_MODE_MAX_ITERS = 30
             max_iters = self._max_iterations
             if max_iters is None:
                 try:
-                    max_iters = int(params.getMaxIterations())
+                    max_iters = min(int(params.getMaxIterations()), TRACE_MODE_MAX_ITERS)
                 except Exception:
-                    max_iters = 100
+                    max_iters = TRACE_MODE_MAX_ITERS
+            else:
+                max_iters = min(max_iters, TRACE_MODE_MAX_ITERS)
 
             abs_tol = float(params.getAbsoluteErrorTol())
             rel_tol = float(params.getRelativeErrorTol())

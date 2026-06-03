@@ -48,7 +48,14 @@ class ImageColorSampler:
     def __init__(self, images_dir: str | Path):
         self.images_dir = Path(images_dir)
         self._images: dict[int, np.ndarray] = {}
-        self._scale: Optional[tuple[float, float]] = None
+        # Per-image scale: keypoints from different pipelines (COLMAP DB at
+        # max_image_size=1600 vs GTSFM SIFT at max_resolution=760) and across
+        # crowdsourced datasets with mixed image dimensions all need their OWN
+        # uv → image-pixel scale factor. A single global scale gives blue-sky
+        # bleed when applied to images with different dims (e.g. Thanjavur
+        # ranges from 2256×1504 to 6000×4000).
+        self._scale_per_image: dict[int, tuple[float, float]] = {}
+        self._max_uv_per_image: dict[int, tuple[float, float]] = {}
         try:
             from PIL import Image as PILImage
             files = sorted(
@@ -64,51 +71,58 @@ class ImageColorSampler:
         except Exception as e:
             logger.warning("[pipeline_trace] image loading failed: %s", e)
 
-    def _detect_scale(self, sample_track):
-        # One-track fallback if prime_scale wasn't called. Less accurate.
-        if self._scale is not None or not self._images:
-            self._scale = self._scale or (1.0, 1.0)
+    def prime_scale(self, tracks, max_tracks: int = 5000):
+        """Compute per-image UV→image scale by aggregating max-uv per camera index
+        across many tracks. Each image gets its own scale factor based on the keypoint
+        coordinate range observed in tracks that include that image."""
+        if not self._images:
             return
-        self.prime_scale([sample_track])
-
-    def prime_scale(self, tracks, max_tracks: int = 200):
-        """Compute UV→image scale from up to N tracks' max-uv. Same approach as
-        scripts/visualize_gp_convergence.py — averaging across many tracks gives a
-        reliable max-uv estimate vs. a single-track sample."""
-        if self._scale is not None or not self._images:
-            self._scale = self._scale or (1.0, 1.0)
-            return
-        first_img = next(iter(self._images.values()))
-        h, w = first_img.shape[:2]
-        max_u, max_v = 0.0, 0.0
         n_seen = 0
         for t in tracks:
             for k in range(t.numberMeasurements()):
-                _, uv = t.measurement(k)
-                max_u = max(max_u, float(uv[0]))
-                max_v = max(max_v, float(uv[1]))
+                i, uv = t.measurement(k)
+                cam_idx = int(i)
+                cur_u, cur_v = self._max_uv_per_image.get(cam_idx, (0.0, 0.0))
+                self._max_uv_per_image[cam_idx] = (
+                    max(cur_u, float(uv[0])),
+                    max(cur_v, float(uv[1])),
+                )
             n_seen += 1
             if n_seen >= max_tracks:
                 break
-        scale_u = w / max(max_u, 1) if max_u < w * 0.8 else 1.0
-        scale_v = h / max(max_v, 1) if max_v < h * 0.8 else 1.0
-        if scale_u < 1.5 and scale_v < 1.5:
-            scale_u, scale_v = 1.0, 1.0
-        self._scale = (scale_u, scale_v)
-        logger.info("[pipeline_trace] uv→image scale detected: (%.2f, %.2f) from %d tracks (image %dx%d, max_uv %.0fx%.0f)",
-                    scale_u, scale_v, n_seen, w, h, max_u, max_v)
+        # Compute per-image scale: image_dim / max_uv_for_that_image (clamp to 1.0
+        # if uvs already span >80% of image — already in pixel coords).
+        for cam_idx, (max_u, max_v) in self._max_uv_per_image.items():
+            img = self._images.get(cam_idx)
+            if img is None:
+                continue
+            h, w = img.shape[:2]
+            scale_u = w / max(max_u, 1) if max_u < w * 0.8 else 1.0
+            scale_v = h / max(max_v, 1) if max_v < h * 0.8 else 1.0
+            # If uvs already roughly match image dims, no scaling needed.
+            if scale_u < 1.5 and scale_v < 1.5:
+                scale_u, scale_v = 1.0, 1.0
+            self._scale_per_image[cam_idx] = (scale_u, scale_v)
+        logger.info(
+            "[pipeline_trace] per-image uv→image scale primed for %d images (sampled %d tracks). "
+            "Scale range: u=[%.2f, %.2f], v=[%.2f, %.2f]",
+            len(self._scale_per_image), n_seen,
+            min(s[0] for s in self._scale_per_image.values()) if self._scale_per_image else 0,
+            max(s[0] for s in self._scale_per_image.values()) if self._scale_per_image else 0,
+            min(s[1] for s in self._scale_per_image.values()) if self._scale_per_image else 0,
+            max(s[1] for s in self._scale_per_image.values()) if self._scale_per_image else 0,
+        )
 
     def sample_track(self, track) -> list[int]:
         """Median RGB (0-255 ints) across all measurements. Grey if no samples."""
-        if self._scale is None:
-            self._detect_scale(track)
-        scale_u, scale_v = self._scale
         colors = []
         for k in range(track.numberMeasurements()):
             i, uv = track.measurement(k)
-            img = self._images.get(int(i))
+            cam_idx = int(i)
+            img = self._images.get(cam_idx)
             if img is None:
                 continue
+            scale_u, scale_v = self._scale_per_image.get(cam_idx, (1.0, 1.0))
             u = int(round(float(uv[0]) * scale_u))
             v = int(round(float(uv[1]) * scale_v))
             if 0 <= v < img.shape[0] and 0 <= u < img.shape[1]:
@@ -205,7 +219,7 @@ def dump_stage(
     # median RGB from images; otherwise default grey.
     sampler = get_default_sampler()
     # Prime UV→image scale on first stage if not already done (uses up to 200 tracks).
-    if sampler is not None and sampler._scale is None and gtsfm_data.number_tracks() > 0:
+    if sampler is not None and not sampler._scale_per_image and gtsfm_data.number_tracks() > 0:
         sampler.prime_scale((gtsfm_data.get_track(j) for j in range(gtsfm_data.number_tracks())))
     for j in range(gtsfm_data.number_tracks()):
         track = gtsfm_data.get_track(j)

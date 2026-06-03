@@ -27,17 +27,15 @@ loader:
   _target_: gtsfm.loader.Olsson
 
 image_pairs_generator:
+  # Skip MegaLoc + similarity matrix entirely. The COLMAP shared DB has the verified
+  # pair set from exhaustive matching — recomputing descriptors to re-derive a less-
+  # complete subset wastes ~5 min per run AND constructs a bigger Dask graph than
+  # needed. Same approach validated on the peak yaml.
   _target_: gtsfm.retriever.image_pairs_generator.ImagePairsGenerator
-  global_descriptor:
-    _target_: gtsfm.frontend.cacher.global_descriptor_cacher.GlobalDescriptorCacher
-    global_descriptor_obj:
-      _target_: gtsfm.frontend.global_descriptor.MegaLoc
+  global_descriptor: null
   retriever:
-    _target_: gtsfm.retriever.Similarity
-    num_matched: 75
-    min_score: 0.30
-    use_diffusion_preprocessing: false
-    use_mst_augmentation: false
+    _target_: gtsfm.retriever.colmap_db_pairs_retriever.ColmapDbPairsRetriever
+    database_path: /Users/kathir/Desktop/gtsfm/benchmarks/thanjavur/colmap_shared_threshold_0.800.db
   batch_size: 16
 
 graph_partitioner:
@@ -46,20 +44,13 @@ graph_partitioner:
 cluster_optimizer:
   _target_: gtsfm.cluster_optimizer.Multiview
 
+  # ColmapCorrespondenceGenerator reads keypoints + verified matches directly
+  # from the COLMAP shared DB built earlier — skips SIFT extraction + matching
+  # (saves ~1 hr on 529-image Thanjavur). Same two-view input as GLOMAP for
+  # apples-to-apples back-end comparison.
   correspondence_generator:
-    _target_: gtsfm.frontend.correspondence_generator.det_desc_correspondence_generator.DetDescCorrespondenceGenerator
-
-    detector_descriptor:
-      _target_: gtsfm.frontend.cacher.detector_descriptor_cacher.DetectorDescriptorCacher
-      detector_descriptor_obj:
-        _target_: gtsfm.frontend.detector_descriptor.colmap_sift.ColmapSIFTDetectorDescriptor
-        max_keypoints: 8192
-
-    matcher:
-      _target_: gtsfm.frontend.cacher.matcher_cacher.MatcherCacher
-      matcher_obj:
-        _target_: gtsfm.frontend.matcher.twoway_matcher.TwoWayMatcher
-        ratio_test_threshold: 0.8
+    _target_: gtsfm.frontend.correspondence_generator.colmap_correspondence_generator.ColmapCorrespondenceGenerator
+    database_path: /Users/kathir/Desktop/gtsfm/benchmarks/thanjavur/colmap_shared_threshold_0.800.db
 
   two_view_estimator:
     _target_: gtsfm.two_view_estimator_cacher.TwoViewEstimatorCacher
@@ -83,7 +74,7 @@ cluster_optimizer:
       inlier_support_processor:
         _target_: gtsfm.two_view_estimator.InlierSupportProcessor
         min_num_inliers_est_model: 30
-        min_inlier_ratio_est_model: 0.15
+        min_inlier_ratio_est_model: 0.25  # GLOMAP-matched (was 0.15)
   save_gtsfm_data: True
   save_3d_viz: False
   save_two_view_viz: False
@@ -136,6 +127,12 @@ cluster_optimizer:
 
     run_view_graph_calibration: true
     rotation_outlier_threshold_deg: 0
+    # GLOMAP-style 2-pass RA + 10° per-edge filter + LCC re-prune. Validated on
+    # peak yaml — got us from 519 cams (doubled gopuram) to 514 cams (single
+    # pyramid, GLOMAP parity at 511). Drops bad rotations from BOTH RA input
+    # AND v_corr_idxs so symmetric-feature false matches don't enter union-find.
+    enable_double_ra_filter: true
+    ra_filter_threshold_deg: 10.0
 
     bundle_adjustment_module:
       _target_: gtsfm.bundle.bundle_adjustment_tracing.BundleAdjustmentOptimizer
@@ -171,8 +168,17 @@ cluster_optimizer:
       # may produce multiple 3D points if union-find falsely merged independent
       # observations. Targets repetitive-feature scenes (Brussels bimodal, BM
       # colonnade, Pantheon columns). Default false — flip to true to test.
+      # Splitter OFF — caused doubled-gopuram in earlier runs by over-splitting
+      # symmetric tier carvings. Peak run with splitter off matched GLOMAP cleanly.
       mv_retri_use_recursive_splitter: false
       mv_retri_recursive_max_depth: 5
+      # Post-retri-BA filter for cleaner viz cloud. Drops tracks with high reproj
+      # error OR low triangulation angle (parallel-ray points → "comet streak"
+      # artifacts). GLOMAP defaults: 4px / 1.5°. Bumped tri-angle to 2° on Thanjavur
+      # since the temple's small lateral baseline produces lots of low-tri-angle
+      # background points that visually clutter the gopuram silhouette.
+      filter_max_reproj_error_px: 3.0
+      filter_min_tri_angle_deg: 2.0
       # Trace dumps to <save_dir>/pipeline_trace/ as COLMAP-format folders for
       # the visualizer. Endpoint-only mode: per-outer-BA pre/post snapshots +
       # retri input/output (no per-LM-iter capture — that path costs ~3 AUC@5).
