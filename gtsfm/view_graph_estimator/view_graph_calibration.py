@@ -171,7 +171,10 @@ def calibrate_view_graph(
 
     if not edges:
         logger.info("View graph calibration: no valid edges, skipping.")
-        return list(initial_intrinsics), set()
+        # Return the intrinsics UNCHANGED (as a dict). `list(initial_intrinsics)` would return the
+        # camera-index KEYS, which downstream code then indexes as if it were the intrinsics dict
+        # -> Cal3Bundler(pose, <int>) crash for any cluster with no F-edges.
+        return dict(initial_intrinsics), set()
 
     # Step 2: Set up optimization variables.
     sorted_cameras = sorted(cameras_in_edges)
