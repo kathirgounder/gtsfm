@@ -19,14 +19,14 @@ image_pairs_generator:
       _target_: gtsfm.frontend.global_descriptor.MegaLoc
   retriever:
     _target_: gtsfm.retriever.Similarity
-    num_matched: 15
-    min_score: 0.5
+    num_matched: 100
+    min_score: 0.15
   batch_size: 16
 
 graph_partitioner:
   _target_: gtsfm.graph_partitioner.Metis
-  min_cameras_to_partition: 12
-  max_cameras: 40
+  min_cameras_to_partition: 30
+  max_cameras: 70
   split_oversized_nodes: true
 
 cluster_optimizer:
@@ -39,7 +39,7 @@ cluster_optimizer:
       detector_descriptor:
         _target_: gtsfm.frontend.cacher.detector_descriptor_cacher.DetectorDescriptorCacher
         detector_descriptor_obj:
-          _target_: gtsfm.frontend.detector_descriptor.sift.SIFTDetectorDescriptor
+          _target_: gtsfm.frontend.detector_descriptor.colmap_sift.ColmapSIFTDetectorDescriptor
           max_keypoints: 5000
 
       matcher:
@@ -125,7 +125,7 @@ merging_options:
     _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptions
     shared_calib: false
     use_calibration_prior: false
-    use_pose_prior: true
+    use_pose_prior_all_cameras: true
     use_gnc: false
     gnc_loss: TLS
     factor_weight_outlier_threshold: 1e-6
