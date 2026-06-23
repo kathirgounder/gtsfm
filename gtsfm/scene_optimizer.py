@@ -301,13 +301,15 @@ class SceneOptimizer:
             global_tracks_2d = get_2d_tracks(v_corr_idxs_dict, padded_keypoints_list)
             logger.info("🔎 Built %d global 2D tracks from verified correspondences.", len(global_tracks_2d))
 
-            # Scatter once (broadcast to all workers) and plumb into every cluster so cluster BAs
-            # reuse the global SIFT tracks + verified two-view instead of re-running a per-cluster
-            # frontend. The 3D structure is triangulated from VGGT poses downstream.
+            # Scatter once and plumb into every cluster so cluster BAs reuse the global SIFT tracks +
+            # verified two-view instead of re-running a per-cluster frontend (3D structure is
+            # triangulated from VGGT poses downstream). NOTE: broadcast=False — these are large
+            # (tracks ~80 MiB); replicating them onto every worker (broadcast=True) OOMs the node.
+            # Workers fetch on demand; the holding worker serves them.
             precomputed_global_frontend = PrecomputedGlobalFrontend(
-                padded_keypoints=client.scatter(padded_keypoints_list, broadcast=True),
-                valid_two_view_results=client.scatter(valid_two_view_results, broadcast=True),
-                tracks_2d=client.scatter(global_tracks_2d, broadcast=True),
+                padded_keypoints=client.scatter(padded_keypoints_list, broadcast=False),
+                valid_two_view_results=client.scatter(valid_two_view_results, broadcast=False),
+                tracks_2d=client.scatter(global_tracks_2d, broadcast=False),
             )
 
         # Bridge reconnection: add cross-component edges to reconnect island components.
