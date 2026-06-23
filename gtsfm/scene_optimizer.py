@@ -97,6 +97,33 @@ def _finalize_io_tasks(*_args: object) -> None:
     return None
 
 
+def _run_post_merge_retriangulation(
+    scene: GtsfmData,
+    tracks_2d: list,
+    options: MergingOptions,
+) -> GtsfmData:
+    """Re-triangulate verified multiview 2D tracks against the merged cameras, then bundle-adjust.
+
+    Mirrors the cluster-level retri stage (`_run_cluster_ba`): builds a fresh sparse structure from
+    the verified correspondences (discarding the VGGT-depth points), runs BA -- which jointly refines
+    structure AND the merged (VGGT-predicted -> per-cluster-BA'd -> merged -> merge-BA'd) poses -- then
+    filters by reprojection error. Designed to run as a single dask task on a worker.
+    """
+    from gtsfm.bundle.bundle_adjustment import multi_view_retriangulate_from_2d_tracks
+
+    retri = multi_view_retriangulate_from_2d_tracks(scene, tracks_2d)
+    if retri.number_tracks() == 0:
+        logger.warning("Post-merge retriangulation produced no tracks; keeping merged scene unchanged.")
+        return scene
+    optimizer = options.ba_options.to_optimizer(min_track_length=options.min_track_length)
+    refined, _ = optimizer.run_simple_ba(retri)
+    return refined.filter_landmark_measurements(
+        options.post_ba_max_reproj_error,
+        options.min_track_length,
+        retain_cameras_without_tracks=options.keep_all_cameras,
+    )
+
+
 class SceneOptimizer:
     """Wrapper combining different modules to run the whole pipeline on a
     loader."""
@@ -114,6 +141,8 @@ class SceneOptimizer:
         bridge_min_similarity: float = 0.0,
         bridge_top_k: int = 10,
         bridge_min_component_size: int = 3,
+        # --- Verified-viewgraph pipeline: verified-graph partition + post-merge retriangulation ---
+        use_verified_pipeline: bool = False,
     ) -> None:
         self.loader = loader
         self.image_pairs_generator = image_pairs_generator
@@ -123,6 +152,7 @@ class SceneOptimizer:
         self._bridge_min_similarity = bridge_min_similarity
         self._bridge_top_k = bridge_top_k
         self._bridge_min_component_size = bridge_min_component_size
+        self._use_verified_pipeline = use_verified_pipeline
         # Propagate metric_constructed_only to the cluster optimizer if it supports it.
         if hasattr(self.cluster_optimizer, "_metric_constructed_only"):
             setattr(self.cluster_optimizer, "_metric_constructed_only", self._merging_options.metric_constructed_only)
@@ -208,6 +238,61 @@ class SceneOptimizer:
         retriever_metrics, visibility_graph, similarity_matrix = self._run_retriever(client, base_output_paths)
         base_metrics_groups.append(retriever_metrics)
         image_future_map = self.loader.get_image_futures(client)
+        one_view_data_dict = self.loader.get_one_view_data_dict()
+
+        # Optional verified-viewgraph pipeline: globally verify the retrieval graph, then
+        # (a) partition on the verified subgraph and (b) keep global 2D tracks for post-merge retriangulation.
+        global_tracks_2d: Optional[list] = None
+        if self._use_verified_pipeline:
+            from gtsfm.cluster_optimizer.cluster_mvo import ClusterMVO, _pad_keypoints_list
+            from gtsfm.multi_view_optimizer import get_2d_tracks
+            from gtsfm.products.visibility_graph import visibility_graph_keys
+            from gtsfm.utils.graph import get_nodes_in_largest_connected_component
+
+            logger.info("🔎 GTSFM: Global two-view verification over %d retrieval edges...", len(visibility_graph))
+            num_images = len(self.loader)
+            retrieval_edge_count = len(visibility_graph)
+            image_future_keys = [image_future_map[idx].key for idx in range(num_images)]
+
+            # Reuse the per-cluster frontend chain over the FULL retrieval graph (populates per-pair
+            # caches, so subsequent per-cluster frontends cache-hit). _run_two_view_estimation already
+            # filters to result.valid().
+            keypoints_graph, putative_graph, _ = delayed(ClusterMVO._run_correspondence_generator, nout=3)(
+                self.cluster_optimizer.correspondence_generator, list(visibility_graph), image_future_keys
+            )
+            padded_keypoints_graph = delayed(_pad_keypoints_list)(keypoints_graph, num_images)
+            relative_pose_priors = self.loader.get_relative_pose_priors(visibility_graph) or {}
+            gt_scene_mesh = self.loader.get_gt_scene_trimesh()
+            two_view_results_graph, _ = delayed(ClusterMVO._run_two_view_estimation, nout=2)(
+                self.cluster_optimizer.two_view_estimator,
+                padded_keypoints_graph,
+                putative_graph,
+                relative_pose_priors,
+                gt_scene_mesh,
+                one_view_data_dict,
+            )
+            # Compute keypoints and verified results together so the shared correspondence stage runs once.
+            padded_keypoints_list, valid_two_view_results = client.gather(
+                client.compute([padded_keypoints_graph, two_view_results_graph])
+            )
+
+            verified_graph = sorted(valid_two_view_results.keys())
+            all_nodes = visibility_graph_keys(verified_graph)
+            largest_cc = set(get_nodes_in_largest_connected_component(verified_graph)) if verified_graph else set()
+            logger.info(
+                "🔎 Verified graph: %d/%d edges; nodes=%d, largest_cc=%d, dropped_by_partition=%d",
+                len(verified_graph),
+                retrieval_edge_count,
+                len(all_nodes),
+                len(largest_cc),
+                len(all_nodes) - len(largest_cc),
+            )
+            visibility_graph = verified_graph
+
+            # Build global 2D tracks (verified correspondences -> union-find tracks) for post-merge retriangulation.
+            v_corr_idxs_dict = {ij: r.v_corr_idxs for ij, r in valid_two_view_results.items()}
+            global_tracks_2d = get_2d_tracks(v_corr_idxs_dict, padded_keypoints_list)
+            logger.info("🔎 Built %d global 2D tracks from verified correspondences.", len(global_tracks_2d))
 
         # Bridge reconnection: add cross-component edges to reconnect island components.
         if similarity_matrix is not None and self._bridge_min_similarity > 0:
@@ -240,7 +325,6 @@ class SceneOptimizer:
         save_retrieval_two_view_metrics(base_output_paths)
 
         logger.info("🔥 GTSFM: Scheduling cluster optimizations...")
-        one_view_data_dict = self.loader.get_one_view_data_dict()
         merged_scene: Optional[cluster_merging.MergedNodeSummary] = None
 
         with performance_report(filename="dask_reports/scene-optimizer.html"):
@@ -288,10 +372,12 @@ class SceneOptimizer:
                 export_tree = cluster_merging.schedule_exports(client, handles_tree, merged_future_tree)
                 summary_tree = cluster_merging.schedule_summaries(client, merged_future_tree)
                 root_merge_summary: Optional[cluster_merging.MergedNodeSummary] = None
-                for handle_node, summary_node, export_node in zip(
+                root_merged_result: Optional[cluster_merging.MergedNodeResult] = None
+                for handle_node, summary_node, export_node, merged_node in zip(
                     PreOrderIter(handles_tree),
                     PreOrderIter(summary_tree),
                     PreOrderIter(export_tree),
+                    PreOrderIter(merged_future_tree),
                 ):
                     handle = handle_node.value
                     summary_future = summary_node.value
@@ -306,6 +392,9 @@ class SceneOptimizer:
                         base_metrics_groups.append(merged_summary.metrics)
                         base_metrics_groups.append(merged_summary.pre_ba_metrics)
                         root_merge_summary = merged_summary
+                        if self._use_verified_pipeline:
+                            # Materialize the full root reconstruction (idempotent; already computed for the summary).
+                            root_merged_result = merged_node.value.result()
                     else:
                         merged_summary = summary_future.result()
                         metrics_groups.append(merged_summary.metrics)
@@ -314,6 +403,43 @@ class SceneOptimizer:
                 if root_merge_summary is not None:
                     logger.info("🔥 GTSFM: Running cluster optimization and merging...")
                     merged_scene = root_merge_summary
+
+                # Post-merge retriangulation (structure refinement): rebuild sparse structure from the
+                # globally-verified tracks against the merged poses, then BA. Written as a separate output.
+                if (
+                    self._use_verified_pipeline
+                    and global_tracks_2d
+                    and root_merged_result is not None
+                    and root_merged_result.scene is not None
+                ):
+                    logger.info(
+                        "🔧 GTSFM: Post-merge retriangulation on %d global 2D tracks vs merged poses...",
+                        len(global_tracks_2d),
+                    )
+                    refined: GtsfmData = client.submit(
+                        _run_post_merge_retriangulation,
+                        root_merged_result.scene,
+                        global_tracks_2d,
+                        self._merging_options,
+                        pure=False,
+                    ).result()
+                    retri_dir = base_output_paths.results / "merged_retriangulated"
+                    retri_dir.mkdir(parents=True, exist_ok=True)
+                    refined.export_as_colmap_text(retri_dir)
+                    logger.info(
+                        "🔧 Retriangulated scene: %d images, %d tracks → %s",
+                        refined.number_images(),
+                        refined.number_tracks(),
+                        retri_dir,
+                    )
+                    base_metrics_groups.append(
+                        cluster_merging.compute_merging_metrics(
+                            refined,
+                            cameras_gt=cameras_gt,
+                            metric_constructed_only=self._merging_options.metric_constructed_only,
+                            suffix="_retriangulated",
+                        )
+                    )
 
         if merged_scene is not None and merged_scene.merge_success:
             logger.info(
