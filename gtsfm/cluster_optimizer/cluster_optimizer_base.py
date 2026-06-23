@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Mapping, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple
 
 from dask.base import annotate
 from dask.delayed import Delayed, delayed
@@ -37,6 +37,19 @@ class ClusterComputationGraph:
 
 
 @dataclass(frozen=True)
+class PrecomputedGlobalFrontend:
+    """Globally-computed verified frontend, plumbed into clusters so they reuse it instead of
+    re-running a per-cluster frontend. Each field is a dask Future (scattered) or concrete object:
+    padded keypoints per image, the verified two-view results (valid edges only), and the global
+    union-find 2D tracks.
+    """
+
+    padded_keypoints: Any
+    valid_two_view_results: Any
+    tracks_2d: Any
+
+
+@dataclass(frozen=True)
 class ClusterContext:
     """Static metadata describing a cluster tree node."""
 
@@ -49,6 +62,9 @@ class ClusterContext:
     cluster_path: tuple[int, ...]
     label: str
     visibility_graph: VisibilityGraph
+    # Set only by the verified pipeline: lets clusters reuse the global SIFT tracks + verified
+    # two-view instead of re-deriving them per cluster (see ClusterVGGTWithFrontend).
+    precomputed_global_frontend: Optional[PrecomputedGlobalFrontend] = None
 
     @property
     def is_root(self) -> bool:

@@ -117,11 +117,16 @@ def _run_post_merge_retriangulation(
         return scene
     optimizer = options.ba_options.to_optimizer(min_track_length=options.min_track_length)
     refined, _ = optimizer.run_simple_ba(retri)
-    return refined.filter_landmark_measurements(
+    refined = refined.filter_landmark_measurements(
         options.post_ba_max_reproj_error,
         options.min_track_length,
         retain_cameras_without_tracks=options.keep_all_cameras,
     )
+    # Carry the merged scene's full image set (incl. unregistered images) so the retri pose metrics
+    # use the SAME all-images GT denominator as the merged metrics; otherwise the retri "overall" AUC
+    # is computed over only its registered cameras and collapses into "constructed-only".
+    refined._image_info = scene._clone_image_info()
+    return refined
 
 
 class SceneOptimizer:
@@ -243,8 +248,10 @@ class SceneOptimizer:
         # Optional verified-viewgraph pipeline: globally verify the retrieval graph, then
         # (a) partition on the verified subgraph and (b) keep global 2D tracks for post-merge retriangulation.
         global_tracks_2d: Optional[list] = None
+        precomputed_global_frontend = None
         if self._use_verified_pipeline:
             from gtsfm.cluster_optimizer.cluster_mvo import ClusterMVO, _pad_keypoints_list
+            from gtsfm.cluster_optimizer.cluster_optimizer_base import PrecomputedGlobalFrontend
             from gtsfm.multi_view_optimizer import get_2d_tracks
             from gtsfm.products.visibility_graph import visibility_graph_keys
             from gtsfm.utils.graph import get_nodes_in_largest_connected_component
@@ -293,6 +300,15 @@ class SceneOptimizer:
             v_corr_idxs_dict = {ij: r.v_corr_idxs for ij, r in valid_two_view_results.items()}
             global_tracks_2d = get_2d_tracks(v_corr_idxs_dict, padded_keypoints_list)
             logger.info("🔎 Built %d global 2D tracks from verified correspondences.", len(global_tracks_2d))
+
+            # Scatter once (broadcast to all workers) and plumb into every cluster so cluster BAs
+            # reuse the global SIFT tracks + verified two-view instead of re-running a per-cluster
+            # frontend. The 3D structure is triangulated from VGGT poses downstream.
+            precomputed_global_frontend = PrecomputedGlobalFrontend(
+                padded_keypoints=client.scatter(padded_keypoints_list, broadcast=True),
+                valid_two_view_results=client.scatter(valid_two_view_results, broadcast=True),
+                tracks_2d=client.scatter(global_tracks_2d, broadcast=True),
+            )
 
         # Bridge reconnection: add cross-component edges to reconnect island components.
         if similarity_matrix is not None and self._bridge_min_similarity > 0:
@@ -345,6 +361,7 @@ class SceneOptimizer:
                         cluster_path=path,
                         label=cluster_label(path),
                         visibility_graph=visibility_graph,
+                        precomputed_global_frontend=precomputed_global_frontend,
                     )
 
                 context_tree = cluster_tree.map_with_path(to_context)
@@ -419,7 +436,9 @@ class SceneOptimizer:
                     refined: GtsfmData = client.submit(
                         _run_post_merge_retriangulation,
                         root_merged_result.scene,
-                        global_tracks_2d,
+                        # Reuse the already-scattered tracks (Future) instead of re-embedding the
+                        # full ~80 MiB track list into the task graph.
+                        precomputed_global_frontend.tracks_2d,
                         self._merging_options,
                         pure=False,
                     ).result()
