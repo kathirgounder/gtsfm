@@ -101,6 +101,9 @@ cluster_optimizer:
     use_view_graph_calibration: true
     # Re-triangulate union-find 2D tracks against post-BA cameras and run another BA.
     use_multi_view_retriangulation: false
+    # Build cluster BA structure by triangulating SIFT tracks against VGGT poses (multi-view
+    # consistent) instead of lifting per-pixel VGGT depth — fixes pre-BA reproj track loss.
+    use_triangulated_structure: true
 
 # --- Merging options ---
 merging_options:

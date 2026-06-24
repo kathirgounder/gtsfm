@@ -248,10 +248,8 @@ class SceneOptimizer:
         # Optional verified-viewgraph pipeline: globally verify the retrieval graph, then
         # (a) partition on the verified subgraph and (b) keep global 2D tracks for post-merge retriangulation.
         global_tracks_2d: Optional[list] = None
-        precomputed_global_frontend = None
         if self._use_verified_pipeline:
             from gtsfm.cluster_optimizer.cluster_mvo import ClusterMVO, _pad_keypoints_list
-            from gtsfm.cluster_optimizer.cluster_optimizer_base import PrecomputedGlobalFrontend
             from gtsfm.multi_view_optimizer import get_2d_tracks
             from gtsfm.products.visibility_graph import visibility_graph_keys
             from gtsfm.utils.graph import get_nodes_in_largest_connected_component
@@ -300,17 +298,6 @@ class SceneOptimizer:
             v_corr_idxs_dict = {ij: r.v_corr_idxs for ij, r in valid_two_view_results.items()}
             global_tracks_2d = get_2d_tracks(v_corr_idxs_dict, padded_keypoints_list)
             logger.info("🔎 Built %d global 2D tracks from verified correspondences.", len(global_tracks_2d))
-
-            # Scatter once and plumb into every cluster so cluster BAs reuse the global SIFT tracks +
-            # verified two-view instead of re-running a per-cluster frontend (3D structure is
-            # triangulated from VGGT poses downstream). NOTE: broadcast=False — these are large
-            # (tracks ~80 MiB); replicating them onto every worker (broadcast=True) OOMs the node.
-            # Workers fetch on demand; the holding worker serves them.
-            precomputed_global_frontend = PrecomputedGlobalFrontend(
-                padded_keypoints=client.scatter(padded_keypoints_list, broadcast=False),
-                valid_two_view_results=client.scatter(valid_two_view_results, broadcast=False),
-                tracks_2d=client.scatter(global_tracks_2d, broadcast=False),
-            )
 
         # Bridge reconnection: add cross-component edges to reconnect island components.
         if similarity_matrix is not None and self._bridge_min_similarity > 0:
@@ -363,7 +350,6 @@ class SceneOptimizer:
                         cluster_path=path,
                         label=cluster_label(path),
                         visibility_graph=visibility_graph,
-                        precomputed_global_frontend=precomputed_global_frontend,
                     )
 
                 context_tree = cluster_tree.map_with_path(to_context)
@@ -438,9 +424,7 @@ class SceneOptimizer:
                     refined: GtsfmData = client.submit(
                         _run_post_merge_retriangulation,
                         root_merged_result.scene,
-                        # Reuse the already-scattered tracks (Future) instead of re-embedding the
-                        # full ~80 MiB track list into the task graph.
-                        precomputed_global_frontend.tracks_2d,
+                        global_tracks_2d,
                         self._merging_options,
                         pure=False,
                     ).result()

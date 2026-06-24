@@ -259,27 +259,6 @@ def _refine_vggt_intrinsics_via_view_graph(
     return refined
 
 
-def _filter_tracks_to_cameras(
-    tracks_2d: list[SfmTrack2d], cluster_cameras: set[int], min_track_length: int
-) -> list[SfmTrack2d]:
-    """Restrict each global 2D track to the cluster's cameras; keep tracks with ≥ min_track_length left."""
-    filtered: list[SfmTrack2d] = []
-    for track in tracks_2d:
-        measurements = [m for m in track.measurements if m.i in cluster_cameras]
-        if len(measurements) >= min_track_length:
-            filtered.append(SfmTrack2d(measurements=measurements))
-    return filtered
-
-
-def _filter_two_view_to_cameras(valid_two_view_results: dict, cluster_cameras: set[int]) -> dict:
-    """Verified correspondence indices for every edge whose BOTH endpoints lie in the cluster."""
-    return {
-        (i, j): result.v_corr_idxs
-        for (i, j), result in valid_two_view_results.items()
-        if i in cluster_cameras and j in cluster_cameras
-    }
-
-
 def _build_gtsfm_data_via_triangulation(
     vggt_result: VggtGeometryResult,
     tracks_2d: list[SfmTrack2d],
@@ -352,6 +331,9 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         output_worker: Optional[str] = None,
         use_view_graph_calibration: bool = False,
         use_multi_view_retriangulation: bool = False,
+        # Build cluster BA structure by triangulating the SIFT tracks against the VGGT poses
+        # (multi-view-consistent) instead of lifting per-pixel VGGT depth.
+        use_triangulated_structure: bool = False,
     ) -> None:
         super().__init__(
             correspondence_generator=correspondence_generator,
@@ -372,6 +354,7 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         self._seed = seed
         self._use_view_graph_calibration = use_view_graph_calibration
         self._use_multi_view_retriangulation = use_multi_view_retriangulation
+        self._use_triangulated_structure = use_triangulated_structure
 
         self._weights_path = Path(weights_path) if weights_path is not None else None
         self._loader_kwargs: dict[str, Any] = {}
@@ -416,23 +399,13 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         image_filenames = context.loader.image_filenames()
         image_names = tuple(str(image_filenames[idx]) for idx in keys)
 
-        # Frontend. Verified pipeline: reuse the GLOBAL verified two-view + SIFT tracks (filtered to
-        # this cluster) instead of re-running a per-cluster correspondence + two-view pass.
-        global_fe = context.precomputed_global_frontend
-        if global_fe is not None:
-            io_tasks, metrics = [], []
-            cluster_cameras = set(global_indices)
-            tracks_2d_graph = delayed(_filter_tracks_to_cameras)(
-                global_fe.tracks_2d, cluster_cameras, self._min_track_length
-            )
-            v_corr_idxs_graph = delayed(_filter_two_view_to_cameras)(global_fe.valid_two_view_results, cluster_cameras)
-            padded_keypoints_graph = global_fe.padded_keypoints
-        else:
-            frontend_graphs = self._build_frontend_graphs(context)
-            io_tasks, metrics = self._build_frontend_output_graphs(context, frontend_graphs)
-            v_corr_idxs_graph = delayed(_extract_v_corr_idxs)(frontend_graphs.two_view_results)
-            tracks_2d_graph = delayed(get_2d_tracks)(v_corr_idxs_graph, frontend_graphs.padded_keypoints)
-            padded_keypoints_graph = frontend_graphs.padded_keypoints
+        # Per-cluster frontend (correspondence + two-view; cache-hit from the global verification pass).
+        # The cluster BA only uses within-cluster measurements, so cluster-local SIFT tracks suffice.
+        frontend_graphs = self._build_frontend_graphs(context)
+        io_tasks, metrics = self._build_frontend_output_graphs(context, frontend_graphs)
+        v_corr_idxs_graph = delayed(_extract_v_corr_idxs)(frontend_graphs.two_view_results)
+        tracks_2d_graph = delayed(get_2d_tracks)(v_corr_idxs_graph, frontend_graphs.padded_keypoints)
+        padded_keypoints_graph = frontend_graphs.padded_keypoints
 
         # VGGT geometry prediction → cameras + dense 3D points.
         image_batch_graph, original_coords_graph = delayed(_load_vggt_inputs, nout=2)(
@@ -469,9 +442,13 @@ class ClusterVGGTWithFrontend(ClusterMVO):
                 global_indices,
             )
 
-        # Build BA input. Verified pipeline: VGGT poses + SIFT tracks TRIANGULATED against those poses
-        # (consistent structure). Otherwise: lift the 2D tracks to 3D via the VGGT dense depth map.
-        build_ba_input = _build_gtsfm_data_via_triangulation if global_fe is not None else _build_gtsfm_data_from_vggt_depth
+        # Build BA input. use_triangulated_structure: VGGT poses + SIFT tracks TRIANGULATED against
+        # those poses (consistent structure). Otherwise: lift the 2D tracks to 3D via the VGGT depth map.
+        build_ba_input = (
+            _build_gtsfm_data_via_triangulation
+            if self._use_triangulated_structure
+            else _build_gtsfm_data_from_vggt_depth
+        )
         ba_input_graph = delayed(build_ba_input)(
             vggt_result_graph,
             tracks_2d_graph,
