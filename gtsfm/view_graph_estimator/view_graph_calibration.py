@@ -8,7 +8,6 @@ Reference: Fetzer et al., "Stable Intrinsic Auto-Calibration from Fundamental Ma
 of Devices with Uncorrelated Camera Parameters", WACV 2020.
 """
 
-import logging
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -18,8 +17,9 @@ from scipy.optimize import least_squares
 
 import gtsfm.common.types as gtsfm_types
 from gtsfm.common.keypoints import Keypoints
+from gtsfm.utils.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 def estimate_fundamental_from_correspondences(
@@ -288,3 +288,33 @@ def calibrate_view_graph(
     )
 
     return refined, edges_to_remove
+
+
+def compute_global_view_graph_intrinsics(
+    v_corr_idxs_dict: Dict[Tuple[int, int], np.ndarray],
+    keypoints_list: List[Keypoints],
+    one_view_data_dict: dict,
+) -> Dict[int, gtsfm_types.CALIBRATION_TYPE]:
+    """Estimate every camera's focal ONCE on the full verified view graph (global Fetzer).
+
+    Unlike the per-cluster calibration -- which only sees a single cluster's edges and falls back to
+    the VGGT-predicted focal for cameras lacking in-cluster F-edges -- this runs over ALL verified
+    correspondences, giving the global estimation strength that pins focals close to GT. Initial focals
+    come from the loader intrinsics (the EXIF-free 1.2*maxdim heuristic) converted to Cal3Bundler; VGGT
+    focals are never used. Cameras with no qualifying F-edge keep the heuristic focal (still not VGGT).
+
+    Returns Cal3Bundler intrinsics (matching the VGGT PinholeCameraCal3Bundler type used downstream),
+    keyed by global camera index, covering every camera in one_view_data_dict.
+    """
+    initial_intrinsics: Dict[int, gtsfm_types.CALIBRATION_TYPE] = {}
+    for idx, one_view_data in one_view_data_dict.items():
+        K = one_view_data.intrinsics.K()
+        initial_intrinsics[idx] = Cal3Bundler(float(K[0, 0]), 0.0, 0.0, float(K[0, 2]), float(K[1, 2]))
+
+    keypoints = {idx: keypoints_list[idx] for idx in range(len(keypoints_list))}
+    refined, _edges_to_remove = calibrate_view_graph(
+        v_corr_idxs_dict=v_corr_idxs_dict,
+        keypoints=keypoints,
+        initial_intrinsics=initial_intrinsics,
+    )
+    return refined

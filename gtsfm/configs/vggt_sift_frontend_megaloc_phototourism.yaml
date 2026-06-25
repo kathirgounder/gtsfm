@@ -85,7 +85,14 @@ cluster_optimizer:
     ba_options:
       _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptions
       shared_calib: false
-      use_calibration_prior: false
+      # Anchor each focal at its (per-cluster-)Fetzer value so the per-cluster BA optimizes POSES, not
+      # focals. Without this, each cluster's BA drifts the same camera's focal differently (focal/depth
+      # ambiguity), so parent and child versions of a separator camera diverge -> noisier Sim3 merge.
+      # Pinned tighter (5px) than the merge BA (10px) since focals should stay at Fetzer upstream.
+      # NOTE: no global Fetzer here, so cameras with few F-edges anchor at the per-cluster VGGT fallback;
+      # the soft prior keeps that low-risk.
+      use_calibration_prior: true
+      calibration_prior_focal_sigma: 5.0
       use_gnc: true
       gnc_loss: TLS
       factor_weight_outlier_threshold: 1e-6
@@ -127,7 +134,10 @@ merging_options:
   ba_options:
     _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptions
     shared_calib: false
-    use_calibration_prior: false
+    # Anchor focals at their (good) per-cluster-BA / Fetzer values so the merge + post-merge-retri BA
+    # optimize POSES, not focals (prevents free-focal BA from distorting good focals to absorb Sim3 pose error).
+    use_calibration_prior: true
+    calibration_prior_focal_sigma: 10.0
     use_pose_prior_all_cameras: true
     use_gnc: false
     gnc_loss: TLS

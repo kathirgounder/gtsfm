@@ -248,6 +248,7 @@ class SceneOptimizer:
         # Optional verified-viewgraph pipeline: globally verify the retrieval graph, then
         # (a) partition on the verified subgraph and (b) keep global 2D tracks for post-merge retriangulation.
         global_tracks_2d: Optional[list] = None
+        global_refined_intrinsics: Optional[dict] = None
         if self._use_verified_pipeline:
             from gtsfm.cluster_optimizer.cluster_mvo import ClusterMVO, _pad_keypoints_list
             from gtsfm.multi_view_optimizer import get_2d_tracks
@@ -298,6 +299,24 @@ class SceneOptimizer:
             v_corr_idxs_dict = {ij: r.v_corr_idxs for ij, r in valid_two_view_results.items()}
             global_tracks_2d = get_2d_tracks(v_corr_idxs_dict, padded_keypoints_list)
             logger.info("🔎 Built %d global 2D tracks from verified correspondences.", len(global_tracks_2d))
+
+            # Global Fetzer calibration: estimate every camera's focal ONCE over the full verified view
+            # graph (heuristic init, never VGGT focals), supplied to clusters via ClusterContext. Replaces
+            # the per-cluster calibration, which falls back to VGGT focals for sparsely-connected cameras.
+            if getattr(self.cluster_optimizer, "uses_global_view_graph_calibration", False):
+                from gtsfm.view_graph_estimator.view_graph_calibration import compute_global_view_graph_intrinsics
+
+                global_refined_intrinsics = client.gather(
+                    client.compute(
+                        delayed(compute_global_view_graph_intrinsics)(
+                            v_corr_idxs_dict, padded_keypoints_list, one_view_data_dict
+                        )
+                    )
+                )
+                logger.info(
+                    "🔭 Global Fetzer calibration: refined %d focals over the full verified view graph.",
+                    len(global_refined_intrinsics),
+                )
 
         # Bridge reconnection: add cross-component edges to reconnect island components.
         if similarity_matrix is not None and self._bridge_min_similarity > 0:
@@ -350,6 +369,7 @@ class SceneOptimizer:
                         cluster_path=path,
                         label=cluster_label(path),
                         visibility_graph=visibility_graph,
+                        global_refined_intrinsics=global_refined_intrinsics,
                     )
 
                 context_tree = cluster_tree.map_with_path(to_context)

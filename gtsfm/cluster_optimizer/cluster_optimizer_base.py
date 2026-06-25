@@ -49,6 +49,10 @@ class ClusterContext:
     cluster_path: tuple[int, ...]
     label: str
     visibility_graph: VisibilityGraph
+    # Global Fetzer focals (cam idx -> calibration), computed once over the full verified view graph.
+    # Used by ClusterVGGTWithFrontend when use_global_view_graph_calibration is set, in place of the
+    # per-cluster calibration (which falls back to VGGT focals for cameras with few in-cluster F-edges).
+    global_refined_intrinsics: dict | None = None
 
     @property
     def is_root(self) -> bool:

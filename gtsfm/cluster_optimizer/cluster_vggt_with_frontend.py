@@ -330,6 +330,12 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         pose_angular_error_thresh: float = 3,
         output_worker: Optional[str] = None,
         use_view_graph_calibration: bool = False,
+        # Use a single GLOBAL Fetzer calibration (estimated once over the full verified view graph in
+        # the SceneOptimizer and supplied via ClusterContext) instead of the per-cluster calibration.
+        # Per-cluster calibration falls back to VGGT focals for cameras with few in-cluster F-edges;
+        # the global one never uses VGGT focals (heuristic init, refined over all edges). Requires the
+        # verified pipeline. Takes precedence over use_view_graph_calibration when set.
+        use_global_view_graph_calibration: bool = False,
         use_multi_view_retriangulation: bool = False,
         # Build cluster BA structure by triangulating the SIFT tracks against the VGGT poses
         # (multi-view-consistent) instead of lifting per-pixel VGGT depth.
@@ -353,6 +359,7 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         self._input_mode = input_mode
         self._seed = seed
         self._use_view_graph_calibration = use_view_graph_calibration
+        self._use_global_view_graph_calibration = use_global_view_graph_calibration
         self._use_multi_view_retriangulation = use_multi_view_retriangulation
         self._use_triangulated_structure = use_triangulated_structure
 
@@ -378,8 +385,17 @@ class ClusterVGGTWithFrontend(ClusterMVO):
             f"two_view_estimator={self.two_view_estimator}",
             f"geometry_transformer={self.geometry_transformer.config}",
             f"ba_options={self.ba_options}",
+            # Calibration/structure flags change the reconstruction, so include them in the repr that
+            # seeds the per-cluster cache key (ClusterOptimizerCacher hashes repr(optimizer)).
+            f"calib=(vgc={self._use_view_graph_calibration},global={self._use_global_view_graph_calibration},"
+            f"tri={self._use_triangulated_structure},mvr={self._use_multi_view_retriangulation})",
         ]
         return "ClusterVGGTWithFrontend(\n  " + ",\n  ".join(components) + "\n)"
+
+    @property
+    def uses_global_view_graph_calibration(self) -> bool:
+        """Whether this optimizer expects global Fetzer focals from the SceneOptimizer via ClusterContext."""
+        return self._use_global_view_graph_calibration
 
     @staticmethod
     def get_ui_metadata() -> UiMetadata:
@@ -430,10 +446,19 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         # Original image shapes (map keypoints → VGGT pixel coords / rescale intrinsics to original res).
         image_shapes_graph = delayed(_get_image_shapes)(context.loader, global_indices)
 
-        # Optional: refine VGGT's predicted intrinsics via the scipy view-graph (Fetzer) calibration
-        # over the verified F-matrices (keeps VGGT's predicted poses).
+        # Intrinsics for the BA cameras (VGGT poses are always kept). Preference order:
+        #   1. GLOBAL Fetzer focals (estimated once over the full verified graph; never VGGT) if enabled
+        #      and supplied via ClusterContext -- subset to this cluster's cameras.
+        #   2. PER-CLUSTER Fetzer (refines VGGT focals on this cluster's F-edges; VGGT fallback otherwise).
+        #   3. None -> the build fn rescales the raw VGGT focal.
         refined_intrinsics_graph = None
-        if self._use_view_graph_calibration:
+        if self._use_global_view_graph_calibration and context.global_refined_intrinsics is not None:
+            refined_intrinsics_graph = {
+                idx: context.global_refined_intrinsics[idx]
+                for idx in global_indices
+                if idx in context.global_refined_intrinsics
+            }
+        elif self._use_view_graph_calibration:
             refined_intrinsics_graph = delayed(_refine_vggt_intrinsics_via_view_graph)(
                 vggt_result_graph,
                 v_corr_idxs_graph,
