@@ -258,13 +258,14 @@ class SceneOptimizer:
             logger.info("🔎 GTSFM: Global two-view verification over %d retrieval edges...", len(visibility_graph))
             num_images = len(self.loader)
             retrieval_edge_count = len(visibility_graph)
-            image_future_keys = [image_future_map[idx].key for idx in range(num_images)]
+            # Pass image futures directly; Dask materializes them as a dependency (no nested gather).
+            image_futures = [image_future_map[idx] for idx in range(num_images)]
 
             # Reuse the per-cluster frontend chain over the FULL retrieval graph (populates per-pair
             # caches, so subsequent per-cluster frontends cache-hit). _run_two_view_estimation already
             # filters to result.valid().
             keypoints_graph, putative_graph, _ = delayed(ClusterMVO._run_correspondence_generator, nout=3)(
-                self.cluster_optimizer.correspondence_generator, list(visibility_graph), image_future_keys
+                self.cluster_optimizer.correspondence_generator, list(visibility_graph), image_futures
             )
             padded_keypoints_graph = delayed(_pad_keypoints_list)(keypoints_graph, num_images)
             relative_pose_priors = self.loader.get_relative_pose_priors(visibility_graph) or {}

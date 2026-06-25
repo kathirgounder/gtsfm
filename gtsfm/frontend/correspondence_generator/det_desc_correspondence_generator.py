@@ -85,3 +85,43 @@ class DetDescCorrespondenceGenerator(CorrespondenceGeneratorBase):
         keypoints_list = client.gather(keypoints_futures)
 
         return keypoints_list, putative_corr_idxs_dict
+
+    def generate_correspondences_inline(
+        self,
+        images: List[Image],
+        visibility_graph: VisibilityGraph,
+    ) -> Tuple[List[Keypoints], Dict[Tuple[int, int], np.ndarray]]:
+        """Inline, no-Dask variant of ``generate_correspondences``.
+
+        Detection runs once per image and matching once per pair, in plain Python loops calling the
+        (cache-backed) detector-descriptor and matcher directly. Computed-and-discarded item by item, so
+        peak memory is bounded to one cluster's features rather than a worker-resident pile of every
+        feature/correspondence future. Mirrors the synchronous style of ``ColmapCorrespondenceGenerator``.
+
+        Args:
+            images: Materialized images indexed by position (``images[i]`` is image ``i``).
+            visibility_graph: Image pairs ``(i1, i2)`` to match; indices reference ``images``.
+
+        Returns:
+            keypoints_list: one ``Keypoints`` per image, in index order.
+            putative_corr_idxs_dict: per-pair putative correspondence indices.
+        """
+        features: List[Tuple[Keypoints, np.ndarray]] = [
+            self._detector_descriptor.detect_and_describe(image) for image in images
+        ]
+        keypoints_list = [keypoints for keypoints, _ in features]
+
+        putative_corr_idxs_dict: Dict[Tuple[int, int], np.ndarray] = {}
+        for i1, i2 in visibility_graph:
+            keypoints_i1, descriptors_i1 = features[i1]
+            keypoints_i2, descriptors_i2 = features[i2]
+            putative_corr_idxs_dict[(i1, i2)] = self._matcher.match(
+                keypoints_i1,
+                keypoints_i2,
+                descriptors_i1,
+                descriptors_i2,
+                im_shape_i1=images[i1].shape,
+                im_shape_i2=images[i2].shape,
+            )
+
+        return keypoints_list, putative_corr_idxs_dict

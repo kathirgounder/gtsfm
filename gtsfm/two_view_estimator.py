@@ -891,6 +891,39 @@ def create_two_view_estimator_futures(
     return two_view_result_futures
 
 
+def create_two_view_results_inline(
+    two_view_estimator: TwoViewEstimator,
+    keypoints_list: List[Keypoints],
+    putative_corr_idxs_dict: AnnotatedGraph[np.ndarray],
+    relative_pose_priors: Dict[Tuple[int, int], PosePrior],
+    gt_scene_mesh: Optional[Any],
+    one_view_data_dict: Dict[int, OneViewData],
+) -> AnnotatedGraph[TwoViewResult]:
+    """Inline (no-Dask) variant of ``create_two_view_estimator_futures``.
+
+    Runs ``run_2view`` for every pair in a plain loop instead of scattering the estimator and submitting a
+    per-pair task to a nested client. Used by the cluster frontend to avoid the ``worker_client()``
+    tasks-launching-tasks pattern. Kwargs mirror ``create_two_view_estimator_futures`` exactly.
+    """
+    two_view_results: AnnotatedGraph[TwoViewResult] = {}
+    for (i1, i2), putative_corr_idxs in putative_corr_idxs_dict.items():
+        view1, view2 = one_view_data_dict[i1], one_view_data_dict[i2]
+        two_view_results[(i1, i2)] = two_view_estimator.run_2view(
+            keypoints_i1=keypoints_list[i1],
+            keypoints_i2=keypoints_list[i2],
+            putative_corr_idxs=putative_corr_idxs,
+            camera_intrinsics_i1=view1.intrinsics,
+            camera_intrinsics_i2=view2.intrinsics,
+            i2Ti1_prior=relative_pose_priors.get((i1, i2)),
+            gt_camera_i1=view1.camera_gt,
+            gt_camera_i2=view2.camera_gt,
+            gt_scene_mesh=gt_scene_mesh,
+            i1=i1,
+            i2=i2,
+        )
+    return two_view_results
+
+
 def get_two_view_reports_summary(
     two_view_report_dict: AnnotatedGraph[TwoViewEstimationReport],
     one_view_data_dict: Dict[int, OneViewData],
