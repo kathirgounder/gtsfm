@@ -317,4 +317,9 @@ def compute_global_view_graph_intrinsics(
         keypoints=keypoints,
         initial_intrinsics=initial_intrinsics,
     )
+    # NOTE: cameras Fetzer cannot refine (no qualifying F-edge, or a focal-ratio/calibration-error
+    # rejection) keep their 1.2*maxdim heuristic focal. A median-fill of those was TRIED and REVERTED:
+    # the unrefined cameras skew high-focal (narrow-FOV/telephoto, few correspondences), and for those
+    # the 1.2 heuristic is actually accurate (Brussels cams 12/39/68 true f/maxdim ~1.19-1.23) — filling
+    # them to the dataset median (~1.025) hurt 3 cameras (~14% each) to help 1 (215). Keep the heuristic.
     return refined
