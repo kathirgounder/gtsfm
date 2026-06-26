@@ -249,6 +249,8 @@ class SceneOptimizer:
         # (a) partition on the verified subgraph and (b) keep global 2D tracks for post-merge retriangulation.
         global_tracks_2d: Optional[list] = None
         global_refined_intrinsics: Optional[dict] = None
+        global_v_corr_idxs_dict: Optional[dict] = None
+        global_keypoints: Optional[list] = None
         if self._use_verified_pipeline:
             from gtsfm.cluster_optimizer.cluster_mvo import ClusterMVO, _pad_keypoints_list
             from gtsfm.multi_view_optimizer import get_2d_tracks
@@ -300,6 +302,13 @@ class SceneOptimizer:
             v_corr_idxs_dict = {ij: r.v_corr_idxs for ij, r in valid_two_view_results.items()}
             global_tracks_2d = get_2d_tracks(v_corr_idxs_dict, padded_keypoints_list)
             logger.info("🔎 Built %d global 2D tracks from verified correspondences.", len(global_tracks_2d))
+
+            # Reuse the global verified correspondences + keypoints per cluster (skip the per-cluster
+            # frontend). Plumbed via ClusterContext; clusters subset by their edges and build tracks_2d
+            # eagerly in the main process (no scatter, no per-cluster two-view re-estimation).
+            if getattr(self.cluster_optimizer, "reuses_global_correspondences", False):
+                global_v_corr_idxs_dict = v_corr_idxs_dict
+                global_keypoints = padded_keypoints_list
 
             # Global Fetzer calibration: estimate every camera's focal ONCE over the full verified view
             # graph (heuristic init, never VGGT focals), supplied to clusters via ClusterContext. Replaces
@@ -371,6 +380,8 @@ class SceneOptimizer:
                         label=cluster_label(path),
                         visibility_graph=visibility_graph,
                         global_refined_intrinsics=global_refined_intrinsics,
+                        global_v_corr_idxs_dict=global_v_corr_idxs_dict,
+                        global_keypoints=global_keypoints,
                     )
 
                 context_tree = cluster_tree.map_with_path(to_context)

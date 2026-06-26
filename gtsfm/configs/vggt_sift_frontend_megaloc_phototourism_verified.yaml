@@ -118,6 +118,11 @@ cluster_optimizer:
     # tracks → 85-200s BAs → worker OOM / dask FutureCancelledError, with no proven gain over 219. Reverted
     # to VGGT depth; the focal-flow fix (global Fetzer + calibration priors) still applies on this path.
     use_triangulated_structure: false
+    # Reuse the global verified correspondences (computed once over the full verified view graph) to build
+    # each cluster's 2D tracks, instead of re-running the per-cluster correspondence generation + two-view
+    # estimation (which only cache-reads the same data, serially + redundantly across overlapping clusters).
+    # Pure speedup: per-edge v_corr is identical. Requires use_verified_pipeline.
+    reuse_global_correspondences: true
 
 # --- Merging options ---
 merging_options:

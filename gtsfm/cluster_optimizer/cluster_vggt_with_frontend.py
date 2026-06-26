@@ -53,6 +53,11 @@ def _extract_v_corr_idxs(two_view_results) -> dict:
     return {ij: result.v_corr_idxs for ij, result in two_view_results.items()}
 
 
+def _identity(x):
+    """Wrap an eager value as a single delayed node (so it is embedded once, not per consumer)."""
+    return x
+
+
 def _get_image_shapes(loader, image_indices: tuple[int, ...]) -> dict[int, tuple[int, int]]:
     """Return original (height, width) for each requested image index."""
     return {idx: loader.get_image(idx).value_array.shape[:2] for idx in image_indices}
@@ -348,6 +353,12 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         # Build cluster BA structure by triangulating the SIFT tracks against the VGGT poses
         # (multi-view-consistent) instead of lifting per-pixel VGGT depth.
         use_triangulated_structure: bool = False,
+        # Reuse the global verified correspondences (computed once in the SceneOptimizer over the full
+        # verified view graph, supplied via ClusterContext) to build this cluster's 2D tracks, instead of
+        # re-running the per-cluster correspondence generation + two-view estimation. Per-edge v_corr is
+        # identical, so it is a pure speedup. Requires the verified pipeline; falls back to the per-cluster
+        # frontend when the globals are absent.
+        reuse_global_correspondences: bool = False,
     ) -> None:
         super().__init__(
             correspondence_generator=correspondence_generator,
@@ -370,6 +381,7 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         self._use_global_view_graph_calibration = use_global_view_graph_calibration
         self._use_multi_view_retriangulation = use_multi_view_retriangulation
         self._use_triangulated_structure = use_triangulated_structure
+        self._reuse_global_correspondences = reuse_global_correspondences
 
         self._weights_path = Path(weights_path) if weights_path is not None else None
         self._loader_kwargs: dict[str, Any] = {}
@@ -395,12 +407,14 @@ class ClusterVGGTWithFrontend(ClusterMVO):
             f"ba_options={self.ba_options}",
             # Calibration/structure flags change the reconstruction, so include them in the repr that
             # seeds the per-cluster cache key (ClusterOptimizerCacher hashes repr(optimizer)).
-            # Cache-key bump token for a build change whose effect isn't otherwise reflected in the repr:
+            # Cache-key bump tokens for build changes whose effect isn't otherwise reflected in the repr:
             #  /allkpts -> VGGT-depth build adds all verified SIFT measurements, not only conf>0 keypoints
+            #  /gcorr   -> tracks built from the reused global correspondences (skips per-cluster frontend)
             f"calib=(vgc={self._use_view_graph_calibration},"
             f"global={self._use_global_view_graph_calibration},"
             f"tri={self._use_triangulated_structure}"
-            f"{'/allkpts' if not self._use_triangulated_structure else ''},"
+            f"{'/allkpts' if not self._use_triangulated_structure else ''}"
+            f"{'/gcorr' if self._reuse_global_correspondences else ''},"
             f"mvr={self._use_multi_view_retriangulation})",
         ]
         return "ClusterVGGTWithFrontend(\n  " + ",\n  ".join(components) + "\n)"
@@ -409,6 +423,11 @@ class ClusterVGGTWithFrontend(ClusterMVO):
     def uses_global_view_graph_calibration(self) -> bool:
         """Whether this optimizer expects global Fetzer focals from the SceneOptimizer via ClusterContext."""
         return self._use_global_view_graph_calibration
+
+    @property
+    def reuses_global_correspondences(self) -> bool:
+        """Whether this optimizer reuses the SceneOptimizer's global correspondences (via ClusterContext)."""
+        return self._reuse_global_correspondences
 
     @staticmethod
     def get_ui_metadata() -> UiMetadata:
@@ -428,13 +447,37 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         image_filenames = context.loader.image_filenames()
         image_names = tuple(str(image_filenames[idx]) for idx in keys)
 
-        # Per-cluster frontend (correspondence + two-view; cache-hit from the global verification pass).
-        # The cluster BA only uses within-cluster measurements, so cluster-local SIFT tracks suffice.
-        frontend_graphs = self._build_frontend_graphs(context)
-        io_tasks, metrics = self._build_frontend_output_graphs(context, frontend_graphs)
-        v_corr_idxs_graph = delayed(_extract_v_corr_idxs)(frontend_graphs.two_view_results)
-        tracks_2d_graph = delayed(get_2d_tracks)(v_corr_idxs_graph, frontend_graphs.padded_keypoints)
-        padded_keypoints_graph = frontend_graphs.padded_keypoints
+        # Build this cluster's 2D tracks. Two paths:
+        #  (A) reuse: subset the SceneOptimizer's global verified correspondences to this cluster's edges
+        #      and build the tracks EAGERLY in the main process — no per-cluster frontend, no scatter. The
+        #      per-edge v_corr is identical to the per-cluster frontend output (same edges, same two-view),
+        #      so this is a pure speedup. (Edges not in the global v_corr -- e.g. bridge edges added after
+        #      verification -- are skipped; with bridge_min_similarity=0 none exist. Verify track parity.)
+        #  (B) per-cluster frontend (correspondence + two-view; cache-hit from the global verification pass).
+        if self._reuse_global_correspondences and context.global_v_corr_idxs_dict is not None:
+            cluster_v_corr = {
+                ij: context.global_v_corr_idxs_dict[ij]
+                for ij in context.visibility_graph
+                if ij in context.global_v_corr_idxs_dict
+            }
+            tracks_2d = get_2d_tracks(cluster_v_corr, context.global_keypoints)  # eager, main process
+            logger.info(
+                "♻️  [%s] Reusing global correspondences: %d/%d cluster edges → %d tracks (frontend skipped).",
+                context.label,
+                len(cluster_v_corr),
+                len(context.visibility_graph),
+                len(tracks_2d),
+            )
+            tracks_2d_graph = delayed(_identity)(tracks_2d)
+            v_corr_idxs_graph = delayed(_identity)(cluster_v_corr)
+            padded_keypoints_graph = delayed(_identity)(context.global_keypoints)
+            io_tasks, metrics = [], []
+        else:
+            frontend_graphs = self._build_frontend_graphs(context)
+            io_tasks, metrics = self._build_frontend_output_graphs(context, frontend_graphs)
+            v_corr_idxs_graph = delayed(_extract_v_corr_idxs)(frontend_graphs.two_view_results)
+            tracks_2d_graph = delayed(get_2d_tracks)(v_corr_idxs_graph, frontend_graphs.padded_keypoints)
+            padded_keypoints_graph = frontend_graphs.padded_keypoints
 
         # VGGT geometry prediction → cameras + dense 3D points.
         image_batch_graph, original_coords_graph = delayed(_load_vggt_inputs, nout=2)(
