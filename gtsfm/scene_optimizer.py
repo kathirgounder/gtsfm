@@ -101,6 +101,7 @@ def _run_post_merge_retriangulation(
     scene: GtsfmData,
     tracks_2d: list,
     options: MergingOptions,
+    trackless_cameras: Optional[dict] = None,
 ) -> GtsfmData:
     """Re-triangulate verified multiview 2D tracks against the merged cameras, then bundle-adjust.
 
@@ -108,8 +109,25 @@ def _run_post_merge_retriangulation(
     the verified correspondences (discarding the VGGT-depth points), runs BA -- which jointly refines
     structure AND the merged (VGGT-predicted -> per-cluster-BA'd -> merged -> merge-BA'd) poses -- then
     filters by reprojection error. Designed to run as a single dask task on a worker.
+
+    If `trackless_cameras` is provided (good-pose cameras the merge dropped for lack of a VGGT-depth
+    track), their merged poses are injected so the geometric retriangulation -- which is depth-confidence
+    INDEPENDENT -- can re-triangulate their existing global 2D tracks and recover them. Cameras that
+    still fail to gain a >=3-view track are excluded from BA and dropped by the final filter.
     """
     from gtsfm.bundle.bundle_adjustment import multi_view_retriangulate_from_2d_tracks
+
+    if trackless_cameras:
+        injected = []
+        for i, cam in trackless_cameras.items():
+            if cam is not None and scene.get_camera(i) is None:
+                scene.add_camera(i, cam)  # local op on this worker's copy of the merged scene
+                injected.append(i)
+        logger.info(
+            "♻️  Post-merge retri: injected %d trackless good-pose camera(s) for geometric recovery: %s",
+            len(injected),
+            sorted(injected),
+        )
 
     retri = multi_view_retriangulate_from_2d_tracks(scene, tracks_2d)
     if retri.number_tracks() == 0:
@@ -120,12 +138,31 @@ def _run_post_merge_retriangulation(
     refined = refined.filter_landmark_measurements(
         options.post_ba_max_reproj_error,
         options.min_track_length,
-        retain_cameras_without_tracks=options.keep_all_cameras,
+        # When recovering trackless cameras, force-drop any that still fail to triangulate (decoupled
+        # from keep_all_cameras) so unrecovered cams don't linger as pose-only and skew the AUC denom.
+        retain_cameras_without_tracks=(False if trackless_cameras else options.keep_all_cameras),
     )
     # Carry the merged scene's full image set (incl. unregistered images) so the retri pose metrics
     # use the SAME all-images GT denominator as the merged metrics; otherwise the retri "overall" AUC
     # is computed over only its registered cameras and collapses into "constructed-only".
     refined._image_info = scene._clone_image_info()
+
+    if trackless_cameras:
+        recovered_set = set(refined.get_valid_camera_indices())
+        for i in sorted(trackless_cameras):
+            touching = [t for t in tracks_2d if any(m.i == i for m in t.measurements)]
+            max_views = max((t.number_measurements() for t in touching), default=0)
+            n_retri = len(refined.get_measurements_for_camera(i))  # 0 if dropped; <15 keeps the merged pose
+            logger.info(
+                "♻️  Retri recovery [cam %d]: recovered=%s, retri_tracks=%d (global tracks touching=%d, "
+                "max track views=%d) [<15 retri_tracks => kept merged pose, excluded from retri BA]",
+                i,
+                i in recovered_set,
+                n_retri,
+                len(touching),
+                max_views,
+            )
+
     return refined
 
 
@@ -458,6 +495,7 @@ class SceneOptimizer:
                         root_merged_result.scene,
                         global_tracks_2d,
                         self._merging_options,
+                        root_merged_result.trackless_cameras,
                         pure=False,
                     ).result()
                     retri_dir = base_output_paths.results / "merged_retriangulated"

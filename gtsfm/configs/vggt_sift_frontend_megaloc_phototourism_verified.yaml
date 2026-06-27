@@ -143,6 +143,11 @@ merging_options:
   min_track_length: 3
   allow_post_ba_reproj_filtering: true
   metric_constructed_only: true
+  # Recover good-pose / no-VGGT-depth cameras (left track-less at construction, e.g. Brussels 104/207)
+  # by injecting their merged poses into the post-merge retriangulation, which geometrically re-triangulates
+  # their global 2D tracks (depth-confidence independent). Cameras that still fail to triangulate are
+  # cleanly dropped. Orthogonal to the per-cluster depth gate; the constructed 229 are untouched.
+  recover_trackless_cameras_in_retriangulation: true
   ba_options:
     _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptions
     shared_calib: false
