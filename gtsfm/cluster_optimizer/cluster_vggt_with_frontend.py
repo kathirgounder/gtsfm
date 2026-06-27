@@ -387,7 +387,10 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         self._loader_kwargs: dict[str, Any] = {}
         if self._weights_path is not None:
             self._loader_kwargs["weights_path"] = self._weights_path
-        model_kwargs = self.geometry_transformer.config.model_ctor_kwargs
+        # Geometry transformers may not expose a `config` (e.g. VggtOmegaGeometryTransformer);
+        # treat a missing config as "no extra model ctor kwargs".
+        _geom_config = getattr(self.geometry_transformer, "config", None)
+        model_kwargs = _geom_config.model_ctor_kwargs if _geom_config is not None else None
         if model_kwargs:
             self._loader_kwargs["model_kwargs"] = model_kwargs
 
@@ -403,7 +406,10 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         components = [
             f"correspondence_generator={self.correspondence_generator}",
             f"two_view_estimator={self.two_view_estimator}",
-            f"geometry_transformer={self.geometry_transformer.config}",
+            # Transformers without a `config` (e.g. VggtOmegaGeometryTransformer) contribute their class
+            # name to the cache key instead — stable across runs, and distinct from the VGGT config repr.
+            f"geometry_transformer="
+            f"{getattr(self.geometry_transformer, 'config', None) or type(self.geometry_transformer).__name__}",
             f"ba_options={self.ba_options}",
             # Calibration/structure flags change the reconstruction, so include them in the repr that
             # seeds the per-cluster cache key (ClusterOptimizerCacher hashes repr(optimizer)).
