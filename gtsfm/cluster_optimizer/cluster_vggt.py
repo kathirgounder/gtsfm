@@ -136,12 +136,22 @@ def _load_vggt_inputs(
     indices: list[int],
     mode: str,
     *,
+    transformer=None,
     save_processed_image: bool = False,
     output_root: Optional[str] = None,
     image_names: Optional[tuple[str, ...]] = None,
 ):
-    """Load and preprocess a batch of images for VGGT."""
-    image_batch, original_coords = load_image_batch_vggt_loader(loader, indices, mode=mode)
+    """Load and preprocess a batch of images for the geometry model.
+
+    Preprocessing follows the geometry transformer: VGGT and VGGT-Omega differ in resolution / patch
+    alignment / cropping, and the per-pixel depth lookup downstream indexes the model's depth map using
+    `original_coords` from here — so the loader must match the model. `transformer=None` keeps the legacy
+    VGGT loader (back-compat).
+    """
+    if transformer is not None:
+        image_batch, original_coords = transformer.load_image_batch(loader, indices, mode=mode)
+    else:
+        image_batch, original_coords = load_image_batch_vggt_loader(loader, indices, mode=mode)
     if not save_processed_image or output_root is None or image_names is None:
         return image_batch, original_coords
     if len(image_names) != image_batch.shape[0]:
@@ -487,6 +497,7 @@ class ClusterVGGT(ClusterOptimizerBase):
             context.loader,
             global_indices,
             mode=self._input_mode,
+            transformer=self.geometry_transformer,
             save_processed_image=self._save_processed_image,
             output_root=str(context.output_paths.results),
             image_names=image_names,

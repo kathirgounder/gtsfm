@@ -490,6 +490,7 @@ class ClusterVGGTWithFrontend(ClusterMVO):
             context.loader,
             global_indices,
             mode=self._input_mode,
+            transformer=self.geometry_transformer,
             output_root=str(context.output_paths.results),
             image_names=image_names,
         )

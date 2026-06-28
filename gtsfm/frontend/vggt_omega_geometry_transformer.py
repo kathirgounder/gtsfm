@@ -262,6 +262,18 @@ class VggtOmegaGeometryTransformer(GeometryTransformer):
     def __init__(self):
         self.resolved_dtype = torch.float32
 
+    def load_image_batch(self, loader, indices, mode: str = "balanced"):
+        """Preprocess images with VGGT-Omega's own loader (512px, 16-patch aligned, aspect-cropped).
+
+        Omega's modes are ``balanced``/``max_size`` (not VGGT's ``crop``/``pad``), so the optimizer's
+        ``input_mode`` does not apply here — anything other than a valid omega mode falls back to
+        ``balanced``. The ``original_coords`` returned match the build's keypoint->depth mapping, so the
+        depth lookup stays consistent with omega's depth-map output resolution.
+        """
+        if mode not in ("balanced", "max_size"):
+            mode = "balanced"
+        return load_image_batch_vggt_omega_loader(loader, indices, mode=mode)
+
     def predict(
         self,
         images: torch.Tensor,
