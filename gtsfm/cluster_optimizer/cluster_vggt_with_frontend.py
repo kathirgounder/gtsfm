@@ -209,10 +209,16 @@ def _build_gtsfm_data_from_vggt_depth(
             scaled_W, scaled_H = original_coords[local_idx, 4], original_coords[local_idx, 5]
             u_scale = scaled_W / orig_W if orig_W > 0 else 0.0
             v_scale = scaled_H / orig_H if orig_H > 0 else 0.0
-            u_c = int(np.clip(round(m.uv[0] * u_scale - left), 0, W_vggt - 1))
-            v_c = int(np.clip(round(m.uv[1] * v_scale - top), 0, H_vggt - 1))
-
             all_measurements.append((global_idx, m.uv))  # original keypoint coords; always a BA constraint
+
+            u_c = int(round(m.uv[0] * u_scale - left))
+            v_c = int(round(m.uv[1] * v_scale - top))
+            # Skip the depth anchor for keypoints that map OUTSIDE the VGGT dense map (e.g. the cropped-away
+            # margins under crop / aspect-crop input modes). Clamping to the border pixel (the old behavior)
+            # would anchor the track's 3D point from an unrelated edge location. The measurement is still
+            # kept as a BA constraint (appended above) — only the depth anchor is dropped.
+            if not (0 <= u_c < W_vggt and 0 <= v_c < H_vggt):
+                continue
 
             pt3d = dense_points[local_idx, v_c, u_c]
             conf = float(depth_confidence[local_idx, v_c, u_c])
