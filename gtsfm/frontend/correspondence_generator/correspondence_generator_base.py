@@ -17,6 +17,12 @@ from gtsfm.products.visibility_graph import VisibilityGraph
 class CorrespondenceGeneratorBase:
     """Base class for correspondence generators."""
 
+    # Whether generate_correspondences() returns ALREADY-VERIFIED correspondences (e.g. read from a COLMAP
+    # database's two_view_geometries). When True, the verified pipeline reads them directly in the main
+    # process and skips its Dask two-view estimation + the all-results gather (which OOMs at scale).
+    # Default False: correspondences are putative and must be geometrically verified downstream.
+    produces_verified_correspondences: bool = False
+
     @abstractmethod
     def generate_correspondences(
         self,

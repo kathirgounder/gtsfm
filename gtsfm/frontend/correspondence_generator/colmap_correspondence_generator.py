@@ -28,6 +28,10 @@ logger = logger_utils.get_logger()
 class ColmapCorrespondenceGenerator(CorrespondenceGeneratorBase):
     """Load correspondences from Colmap DB."""
 
+    # The matches read from `two_view_geometries` are already geometrically verified, so the verified
+    # pipeline can use them directly and skip its Dask two-view estimation + gather.
+    produces_verified_correspondences: bool = True
+
     def __init__(self, database_path: str) -> None:
         """Initialize the correspondence generator with the Colmap DB.
 

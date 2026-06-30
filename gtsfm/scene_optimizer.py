@@ -303,26 +303,38 @@ class SceneOptimizer:
             # Reuse the per-cluster frontend chain over the FULL retrieval graph (populates per-pair
             # caches, so subsequent per-cluster frontends cache-hit). _run_two_view_estimation already
             # filters to result.valid().
-            keypoints_graph, putative_graph, _ = delayed(ClusterMVO._run_correspondence_generator, nout=3)(
-                self.cluster_optimizer.correspondence_generator, list(visibility_graph), image_futures
-            )
-            padded_keypoints_graph = delayed(_pad_keypoints_list)(keypoints_graph, num_images)
-            relative_pose_priors = self.loader.get_relative_pose_priors(visibility_graph) or {}
-            gt_scene_mesh = self.loader.get_gt_scene_trimesh()
-            two_view_results_graph, _ = delayed(ClusterMVO._run_two_view_estimation, nout=2)(
-                self.cluster_optimizer.two_view_estimator,
-                padded_keypoints_graph,
-                putative_graph,
-                relative_pose_priors,
-                gt_scene_mesh,
-                one_view_data_dict,
-            )
-            # Compute keypoints and verified results together so the shared correspondence stage runs once.
-            padded_keypoints_list, valid_two_view_results = client.gather(
-                client.compute([padded_keypoints_graph, two_view_results_graph])
-            )
+            corr_gen = self.cluster_optimizer.correspondence_generator
+            if getattr(corr_gen, "produces_verified_correspondences", False):
+                # COLMAP-DB frontend: read the already-verified keypoints + matches straight from the
+                # database in the main process. No Dask two-view estimation and — crucially — no
+                # client.gather of all per-edge results, the step that OOM-killed workers at scale.
+                logger.info("🗄️  Reading verified correspondences from the COLMAP database (Dask frontend skipped).")
+                keypoints_list, v_corr_idxs_dict = corr_gen.generate_correspondences(
+                    client, image_futures, list(visibility_graph)
+                )
+                padded_keypoints_list = _pad_keypoints_list(keypoints_list, num_images)
+            else:
+                keypoints_graph, putative_graph, _ = delayed(ClusterMVO._run_correspondence_generator, nout=3)(
+                    self.cluster_optimizer.correspondence_generator, list(visibility_graph), image_futures
+                )
+                padded_keypoints_graph = delayed(_pad_keypoints_list)(keypoints_graph, num_images)
+                relative_pose_priors = self.loader.get_relative_pose_priors(visibility_graph) or {}
+                gt_scene_mesh = self.loader.get_gt_scene_trimesh()
+                two_view_results_graph, _ = delayed(ClusterMVO._run_two_view_estimation, nout=2)(
+                    self.cluster_optimizer.two_view_estimator,
+                    padded_keypoints_graph,
+                    putative_graph,
+                    relative_pose_priors,
+                    gt_scene_mesh,
+                    one_view_data_dict,
+                )
+                # Compute keypoints and verified results together so the shared correspondence stage runs once.
+                padded_keypoints_list, valid_two_view_results = client.gather(
+                    client.compute([padded_keypoints_graph, two_view_results_graph])
+                )
+                v_corr_idxs_dict = {ij: r.v_corr_idxs for ij, r in valid_two_view_results.items()}
 
-            verified_graph = sorted(valid_two_view_results.keys())
+            verified_graph = sorted(v_corr_idxs_dict.keys())
             all_nodes = visibility_graph_keys(verified_graph)
             largest_cc = set(get_nodes_in_largest_connected_component(verified_graph)) if verified_graph else set()
             logger.info(
@@ -336,7 +348,6 @@ class SceneOptimizer:
             visibility_graph = verified_graph
 
             # Build global 2D tracks (verified correspondences -> union-find tracks) for post-merge retriangulation.
-            v_corr_idxs_dict = {ij: r.v_corr_idxs for ij, r in valid_two_view_results.items()}
             global_tracks_2d = get_2d_tracks(v_corr_idxs_dict, padded_keypoints_list)
             logger.info("🔎 Built %d global 2D tracks from verified correspondences.", len(global_tracks_2d))
 
