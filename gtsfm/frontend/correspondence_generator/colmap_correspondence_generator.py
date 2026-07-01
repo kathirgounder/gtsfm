@@ -38,9 +38,14 @@ class ColmapCorrespondenceGenerator(CorrespondenceGeneratorBase):
         Args:
             database_path: path of the Colmap DB.
         """
-        self._pycolmap_db = pycolmap.Database(database_path)
+        self._database_path = database_path
+        self._open_db()
+
+    def _open_db(self) -> None:
+        """Open the pycolmap db handle and load all keypoints (on construction and after unpickle)."""
+        self._pycolmap_db = pycolmap.Database(self._database_path)
         # Note(Ayush): using SQLite3 to load keypoints because PyColmap does not expose bindings.
-        raw_db = sqlite3.connect(database_path)
+        raw_db = sqlite3.connect(self._database_path)
         self._keypoints_dict: Dict[int, np.ndarray] = {
             image_id: np.frombuffer(data, dtype=np.float32).reshape(rows, -1)
             for image_id, rows, data in raw_db.execute("SELECT image_id, rows, data FROM keypoints")
@@ -53,6 +58,21 @@ class ColmapCorrespondenceGenerator(CorrespondenceGeneratorBase):
             self._pycolmap_db.num_keypoints,
             self._pycolmap_db.num_verified_image_pairs,
         )
+
+    def __getstate__(self) -> dict:
+        """Drop the unpicklable pycolmap.Database (and the large, re-derivable keypoints cache) so this
+        generator can be embedded in a Dask task graph. The colmap-db frontend runs in the MAIN process
+        (reuse_global_correspondences), so a worker copy never touches the db; _ensure_db re-opens it
+        lazily if a method is ever actually called on a worker."""
+        state = self.__dict__.copy()
+        state["_pycolmap_db"] = None
+        state["_keypoints_dict"] = None
+        return state
+
+    def _ensure_db(self) -> None:
+        """Re-open the db if this instance was unpickled (e.g. shipped to a Dask worker) with no handle."""
+        if getattr(self, "_pycolmap_db", None) is None:
+            self._open_db()
 
     def _read_keypoints(self, image: Image) -> Keypoints:
         """
@@ -141,6 +161,7 @@ class ColmapCorrespondenceGenerator(CorrespondenceGeneratorBase):
             List of keypoints, one entry for each input images.
             Putative correspondence as indices of keypoints, for pairs of images.
         """
+        self._ensure_db()  # re-open the db if this generator was unpickled onto a worker
         # Note: we will end up reading verified correspondences from the colmap DB.
         images_actual = client.gather(images)
 
