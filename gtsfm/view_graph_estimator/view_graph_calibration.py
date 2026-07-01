@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 from gtsam import Cal3Bundler, Cal3_S2, Cal3DS2
 from scipy.optimize import least_squares
+from scipy.sparse import coo_matrix
 
 import gtsfm.common.types as gtsfm_types
 from gtsfm.common.keypoints import Keypoints
@@ -199,11 +200,30 @@ def calibrate_view_graph(
         "pp2_stack": np.array([e[4] for e in edges]),  # (n, 2)
     }
 
+    # Jacobian sparsity: each edge's two residual rows depend ONLY on that edge's two camera focals
+    # (idx1, idx2) out of all N cameras — a 99.9%-sparse Jacobian. Without this, least_squares builds a
+    # DENSE numerical Jacobian, perturbing every one of the N focals per iteration (N x batched-SVD),
+    # which hangs at scale (e.g. 2504 cameras x 117k edges). Passing jac_sparsity lets scipy estimate the
+    # numerical Jacobian with graph-colored group perturbations + solve it sparsely -> seconds, not hours.
+    n_edges = len(edges)
+    n_cams = len(initial_focals)
+    sparsity_rows = np.repeat(np.arange(2 * n_edges), 2)  # rows: [2k, 2k, 2k+1, 2k+1] per edge k
+    sparsity_cols = np.empty(4 * n_edges, dtype=int)
+    sparsity_cols[0::4] = precomputed["idx1"]  # residual 2k   depends on focal idx1
+    sparsity_cols[1::4] = precomputed["idx2"]  # residual 2k   depends on focal idx2
+    sparsity_cols[2::4] = precomputed["idx1"]  # residual 2k+1 depends on focal idx1
+    sparsity_cols[3::4] = precomputed["idx2"]  # residual 2k+1 depends on focal idx2
+    jac_sparsity = coo_matrix(
+        (np.ones(4 * n_edges), (sparsity_rows, sparsity_cols)),
+        shape=(2 * n_edges, n_cams),
+    )
+
     # Step 3: Joint optimization with Cauchy robust loss.
     result = least_squares(
         _fetzer_residuals,
         x0=initial_focals,
         args=(edges, cam_idx_to_var_idx, precomputed),
+        jac_sparsity=jac_sparsity,
         loss="cauchy",
         f_scale=0.1,
         bounds=(100.0, np.inf),
