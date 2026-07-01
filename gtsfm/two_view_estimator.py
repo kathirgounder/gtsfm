@@ -924,6 +924,46 @@ def create_two_view_results_inline(
     return two_view_results
 
 
+def create_v_corr_idxs_inline(
+    two_view_estimator: TwoViewEstimator,
+    keypoints_list: List[Keypoints],
+    putative_corr_idxs_dict: AnnotatedGraph[np.ndarray],
+    relative_pose_priors: Dict[Tuple[int, int], PosePrior],
+    gt_scene_mesh: Optional[Any],
+    one_view_data_dict: Dict[int, OneViewData],
+) -> AnnotatedGraph[np.ndarray]:
+    """Memory-bounded variant of ``create_two_view_results_inline`` that retains only ``v_corr_idxs``.
+
+    Runs ``run_2view`` for every pair exactly as the full-result variant, but keeps ONLY the
+    verified-correspondence index array of each VALID result and drops the full ``TwoViewResult``
+    (three ``TwoViewEstimationReport``s + ``putative_corr_idxs``) as soon as its ``v_corr_idxs`` is
+    extracted. The worker therefore never accumulates all N heavy results at once — the payload that
+    OOM-killed the global verified-pipeline worker on large scenes. Side effects are identical to the
+    full variant: ``run_2view`` (and thus the ``TwoViewEstimatorCacher`` / DB writes) still executes
+    per pair; the ``valid()`` filter mirrors ``ClusterMVO._run_two_view_estimation``.
+    """
+    v_corr_idxs_dict: AnnotatedGraph[np.ndarray] = {}
+    for (i1, i2), putative_corr_idxs in putative_corr_idxs_dict.items():
+        view1, view2 = one_view_data_dict[i1], one_view_data_dict[i2]
+        result = two_view_estimator.run_2view(
+            keypoints_i1=keypoints_list[i1],
+            keypoints_i2=keypoints_list[i2],
+            putative_corr_idxs=putative_corr_idxs,
+            camera_intrinsics_i1=view1.intrinsics,
+            camera_intrinsics_i2=view2.intrinsics,
+            i2Ti1_prior=relative_pose_priors.get((i1, i2)),
+            gt_camera_i1=view1.camera_gt,
+            gt_camera_i2=view2.camera_gt,
+            gt_scene_mesh=gt_scene_mesh,
+            i1=i1,
+            i2=i2,
+        )
+        if result.valid():
+            v_corr_idxs_dict[(i1, i2)] = result.v_corr_idxs
+        # `result` (with its reports + putative idxs) goes out of scope each iteration -> not retained.
+    return v_corr_idxs_dict
+
+
 def get_two_view_reports_summary(
     two_view_report_dict: AnnotatedGraph[TwoViewEstimationReport],
     one_view_data_dict: Dict[int, OneViewData],

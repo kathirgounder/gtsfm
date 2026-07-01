@@ -32,7 +32,11 @@ from gtsfm.multi_view_optimizer import MultiViewOptimizer
 from gtsfm.products.one_view_data import OneViewData
 from gtsfm.products.two_view_result import TwoViewResult
 from gtsfm.products.visibility_graph import AnnotatedGraph, VisibilityGraph
-from gtsfm.two_view_estimator import TwoViewEstimator, create_two_view_results_inline
+from gtsfm.two_view_estimator import (
+    TwoViewEstimator,
+    create_two_view_results_inline,
+    create_v_corr_idxs_inline,
+)
 from gtsfm.ui.gtsfm_process import UiMetadata
 from gtsfm.utils import transform
 
@@ -168,6 +172,46 @@ class ClusterMVO(ClusterOptimizerBase):
             logger.warning("🔵 ClusterMVO: Skipping cluster as it has no valid two-view results.")
 
         return valid_two_view_results, duration_sec
+
+    @staticmethod
+    def _run_two_view_v_corr_idxs(
+        two_view_estimator: TwoViewEstimator,
+        keypoints_list: list[Keypoints],
+        putative_corr_idxs_dict: AnnotatedGraph[np.ndarray],
+        relative_pose_priors: AnnotatedGraph[PosePrior],
+        gt_scene_mesh: Optional[Any],
+        one_view_data_dict: dict[int, OneViewData],
+    ) -> tuple[AnnotatedGraph[np.ndarray], float]:
+        """Streaming two-view estimation returning only valid edges' v_corr_idxs (memory-bounded).
+
+        Same computation as ``_run_two_view_estimation`` but keeps only the verified-correspondence
+        indices, dropping each heavy ``TwoViewResult`` as it goes so the worker never accumulates all
+        results. Used by the global verified-pipeline pass, where only ``v_corr_idxs`` is consumed
+        (relative poses come from VGGT per cluster). run_2view side effects (cacher/DB) are unchanged.
+        """
+        logger.info(
+            "🔵 Running streaming two-view estimation for %d pairs (v_corr_idxs only).",
+            len(putative_corr_idxs_dict),
+        )
+
+        start_time = time.time()
+        v_corr_idxs_dict = create_v_corr_idxs_inline(
+            two_view_estimator=two_view_estimator,
+            keypoints_list=keypoints_list,
+            putative_corr_idxs_dict=putative_corr_idxs_dict,
+            relative_pose_priors=relative_pose_priors,
+            gt_scene_mesh=gt_scene_mesh,
+            one_view_data_dict=one_view_data_dict,
+        )
+        duration_sec = time.time() - start_time
+
+        logger.info(
+            "Streaming two-view estimation: %d/%d pairs valid.",
+            len(v_corr_idxs_dict),
+            len(putative_corr_idxs_dict),
+        )
+
+        return v_corr_idxs_dict, duration_sec
 
     @staticmethod
     def _save_two_view_visualizations(
