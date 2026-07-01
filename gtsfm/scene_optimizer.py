@@ -314,29 +314,28 @@ class SceneOptimizer:
                 )
                 padded_keypoints_list = _pad_keypoints_list(keypoints_list, num_images)
             else:
-                keypoints_graph, putative_graph, _ = delayed(ClusterMVO._run_correspondence_generator, nout=3)(
-                    self.cluster_optimizer.correspondence_generator, list(visibility_graph), image_futures
+                # Run the global frontend INLINE in the main process (mirroring the COLMAP-DB branch
+                # above). Routing the whole multi-hour frontend through a single monolithic delayed
+                # task on one worker + a giant blocking client.gather is fragile: over hours the
+                # scheduler<->worker/client comm hiccups, the worker is dropped, and every task dies
+                # with "lost dependencies" (NOT a memory issue — the footprint is ~15-20GB on a 2TB
+                # node). In-process there is no worker to lose, so that failure surface is gone.
+                # run_2view still runs identically (TwoViewEstimatorCacher / DB writes unaffected) and
+                # _run_two_view_v_corr_idxs keeps only v_corr_idxs, so nothing heavy is retained.
+                images = client.gather(image_futures)
+                keypoints_list, putative_corr_idxs_dict, _ = ClusterMVO._run_correspondence_generator(
+                    self.cluster_optimizer.correspondence_generator, list(visibility_graph), images
                 )
-                padded_keypoints_graph = delayed(_pad_keypoints_list)(keypoints_graph, num_images)
+                padded_keypoints_list = _pad_keypoints_list(keypoints_list, num_images)
                 relative_pose_priors = self.loader.get_relative_pose_priors(visibility_graph) or {}
                 gt_scene_mesh = self.loader.get_gt_scene_trimesh()
-                # Streaming two-view: keep only v_corr_idxs on the worker, dropping each heavy
-                # TwoViewResult (three per-point BA reports + putative idxs) the instant it is
-                # reduced. The worker never accumulates all ~N results (the term that OOM-killed it
-                # on large scenes), and the client gathers only the small {(i1, i2): np.ndarray}
-                # dict. run_2view still runs identically, so per-pair cache/DB writes are unaffected.
-                v_corr_idxs_graph, _ = delayed(ClusterMVO._run_two_view_v_corr_idxs, nout=2)(
+                v_corr_idxs_dict, _ = ClusterMVO._run_two_view_v_corr_idxs(
                     self.cluster_optimizer.two_view_estimator,
-                    padded_keypoints_graph,
-                    putative_graph,
+                    padded_keypoints_list,
+                    putative_corr_idxs_dict,
                     relative_pose_priors,
                     gt_scene_mesh,
                     one_view_data_dict,
-                )
-                # Compute keypoints and verified correspondences together so the shared correspondence
-                # stage runs once.
-                padded_keypoints_list, v_corr_idxs_dict = client.gather(
-                    client.compute([padded_keypoints_graph, v_corr_idxs_graph])
                 )
 
             verified_graph = sorted(v_corr_idxs_dict.keys())
