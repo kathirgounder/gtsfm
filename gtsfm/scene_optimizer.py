@@ -60,6 +60,19 @@ def _identity(value: T) -> T:
     return value
 
 
+def _extract_v_corr_idxs_dict(two_view_results: dict) -> dict:
+    """Reduce two-view results to their verified-correspondence index arrays ON THE WORKER.
+
+    Each full TwoViewResult carries three TwoViewEstimationReports (per-point reproj-error and
+    inlier-mask arrays) plus putative_corr_idxs, but only ``v_corr_idxs`` is consumed downstream on
+    the verified pipeline (poses come from VGGT per cluster). Running this reduction inside the
+    delayed graph means the client gathers a small ``{(i1, i2): np.ndarray}`` dict instead of every
+    heavy result — the payload that previously OOM-killed the client at scale. The input is already
+    ``valid()``-filtered by ``ClusterMVO._run_two_view_estimation``, so keys are unchanged.
+    """
+    return {ij: result.v_corr_idxs for ij, result in two_view_results.items()}
+
+
 def _empty_cluster_handles(context: ClusterContext, edge_count: int) -> ClusterExecutionHandles:
     """Create placeholder futures for clusters that were skipped."""
     client = context.client
@@ -328,11 +341,18 @@ class SceneOptimizer:
                     gt_scene_mesh,
                     one_view_data_dict,
                 )
-                # Compute keypoints and verified results together so the shared correspondence stage runs once.
-                padded_keypoints_list, valid_two_view_results = client.gather(
-                    client.compute([padded_keypoints_graph, two_view_results_graph])
+                # Lean gather: reduce the (already valid()-filtered) two-view results to their verified
+                # correspondence index arrays ON THE WORKER, so the client only ever receives the small
+                # {(i1, i2): np.ndarray} dict — never the ~N heavy TwoViewResults (three reports +
+                # putative idxs each), the payload that previously OOM-killed the client at scale.
+                # run_2view still executes identically inside the graph above, so per-pair cache/DB
+                # writes are unaffected.
+                v_corr_idxs_graph = delayed(_extract_v_corr_idxs_dict)(two_view_results_graph)
+                # Compute keypoints and verified correspondences together so the shared correspondence
+                # stage runs once.
+                padded_keypoints_list, v_corr_idxs_dict = client.gather(
+                    client.compute([padded_keypoints_graph, v_corr_idxs_graph])
                 )
-                v_corr_idxs_dict = {ij: r.v_corr_idxs for ij, r in valid_two_view_results.items()}
 
             verified_graph = sorted(v_corr_idxs_dict.keys())
             all_nodes = visibility_graph_keys(verified_graph)
