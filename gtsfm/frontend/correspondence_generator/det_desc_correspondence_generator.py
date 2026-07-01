@@ -3,17 +3,21 @@
 Authors: John Lambert
 """
 
+import time
 from typing import Dict, List, Tuple
 
 import numpy as np
 from dask.distributed import Client, Future
 
+import gtsfm.utils.logger as logger_utils
 from gtsfm.common.image import Image
 from gtsfm.common.keypoints import Keypoints
 from gtsfm.frontend.correspondence_generator.correspondence_generator_base import CorrespondenceGeneratorBase
 from gtsfm.frontend.detector_descriptor.detector_descriptor_base import DetectorDescriptorBase
 from gtsfm.frontend.matcher.matcher_base import MatcherBase
 from gtsfm.products.visibility_graph import VisibilityGraph
+
+logger = logger_utils.get_logger()
 
 
 class DetDescCorrespondenceGenerator(CorrespondenceGeneratorBase):
@@ -106,13 +110,21 @@ class DetDescCorrespondenceGenerator(CorrespondenceGeneratorBase):
             keypoints_list: one ``Keypoints`` per image, in index order.
             putative_corr_idxs_dict: per-pair putative correspondence indices.
         """
-        features: List[Tuple[Keypoints, np.ndarray]] = [
-            self._detector_descriptor.detect_and_describe(image) for image in images
-        ]
+        num_images = len(images)
+        logger.info("🔵 [frontend] Detecting + describing features on %d images...", num_images)
+        det_start = time.time()
+        features: List[Tuple[Keypoints, np.ndarray]] = []
+        for i, image in enumerate(images):
+            features.append(self._detector_descriptor.detect_and_describe(image))
+            if (i + 1) % 250 == 0 or (i + 1) == num_images:
+                logger.info("🔵 [frontend] detection %d/%d images (%.0fs)", i + 1, num_images, time.time() - det_start)
         keypoints_list = [keypoints for keypoints, _ in features]
 
+        num_pairs = len(visibility_graph)
+        logger.info("🔵 [frontend] Matching %d pairs...", num_pairs)
+        match_start = time.time()
         putative_corr_idxs_dict: Dict[Tuple[int, int], np.ndarray] = {}
-        for i1, i2 in visibility_graph:
+        for p, (i1, i2) in enumerate(visibility_graph):
             keypoints_i1, descriptors_i1 = features[i1]
             keypoints_i2, descriptors_i2 = features[i2]
             putative_corr_idxs_dict[(i1, i2)] = self._matcher.match(
@@ -123,5 +135,13 @@ class DetDescCorrespondenceGenerator(CorrespondenceGeneratorBase):
                 im_shape_i1=images[i1].shape,
                 im_shape_i2=images[i2].shape,
             )
+            if (p + 1) % 5000 == 0 or (p + 1) == num_pairs:
+                elapsed = time.time() - match_start
+                rate = (p + 1) / elapsed if elapsed > 0 else 0.0
+                eta = (num_pairs - (p + 1)) / rate if rate > 0 else 0.0
+                logger.info(
+                    "🔵 [frontend] matching %d/%d pairs (%.0fs, %.0f pair/s, ETA %.0fs)",
+                    p + 1, num_pairs, elapsed, rate, eta,
+                )
 
         return keypoints_list, putative_corr_idxs_dict

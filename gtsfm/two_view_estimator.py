@@ -943,7 +943,9 @@ def create_v_corr_idxs_inline(
     per pair; the ``valid()`` filter mirrors ``ClusterMVO._run_two_view_estimation``.
     """
     v_corr_idxs_dict: AnnotatedGraph[np.ndarray] = {}
-    for (i1, i2), putative_corr_idxs in putative_corr_idxs_dict.items():
+    num_pairs = len(putative_corr_idxs_dict)
+    start_time = time.time()
+    for p, ((i1, i2), putative_corr_idxs) in enumerate(putative_corr_idxs_dict.items()):
         view1, view2 = one_view_data_dict[i1], one_view_data_dict[i2]
         result = two_view_estimator.run_2view(
             keypoints_i1=keypoints_list[i1],
@@ -961,6 +963,14 @@ def create_v_corr_idxs_inline(
         if result.valid():
             v_corr_idxs_dict[(i1, i2)] = result.v_corr_idxs
         # `result` (with its reports + putative idxs) goes out of scope each iteration -> not retained.
+        if (p + 1) % 2000 == 0 or (p + 1) == num_pairs:
+            elapsed = time.time() - start_time
+            rate = (p + 1) / elapsed if elapsed > 0 else 0.0
+            eta = (num_pairs - (p + 1)) / rate if rate > 0 else 0.0
+            logger.info(
+                "🔵 [two-view] %d/%d pairs (%d valid, %.0fs, %.1f pair/s, ETA %.0fs)",
+                p + 1, num_pairs, len(v_corr_idxs_dict), elapsed, rate, eta,
+            )
     return v_corr_idxs_dict
 
 
