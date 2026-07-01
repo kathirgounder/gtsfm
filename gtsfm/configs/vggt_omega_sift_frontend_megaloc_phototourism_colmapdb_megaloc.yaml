@@ -19,7 +19,9 @@ loader:
 image_pairs_generator:
   _target_: gtsfm.retriever.image_pairs_generator.ImagePairsGenerator
   # MegaLoc similarity is (re)enabled here purely to SPARSIFY the COLMAP view graph. The hybrid retriever
-  # intersects COLMAP-verified pairs with MegaLoc's top-K; correspondences still come from the db.
+  # keeps each image's top-`num_matched` COLMAP-verified neighbors RANKED by MegaLoc similarity (not a
+  # strict intersection — that collapsed to a fragmented graph). min_score=0.0 = rank-only (COLMAP already
+  # gates geometric quality). correspondences still come from the db.
   global_descriptor:
     _target_: gtsfm.frontend.cacher.global_descriptor_cacher.GlobalDescriptorCacher
     global_descriptor_obj:
@@ -28,7 +30,7 @@ image_pairs_generator:
     _target_: gtsfm.retriever.ColmapDBMegaLoc
     database_path: ${loader.dataset_dir}/database.db
     num_matched: 20
-    min_score: 0.40
+    min_score: 0.0
   batch_size: 16
 
 graph_partitioner:

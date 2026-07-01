@@ -1,11 +1,12 @@
-"""Hybrid retriever: COLMAP-verified pairs intersected with MegaLoc top-K similarity.
+"""Hybrid retriever: keep each image's top-K COLMAP-verified neighbors, ranked by MegaLoc similarity.
 
-Returns the image pairs that are BOTH geometrically verified by COLMAP (so verified correspondences
-exist in the database) AND selected by MegaLoc similarity (each image's top-K most-similar neighbors
-above ``min_score``). This keeps COLMAP's fast, robust verified correspondences while sparsifying its
-dense vocab-tree view graph (e.g. ~140k pairs on St Peter's) down to the tuned MegaLoc selection, so the
-downstream Metis cluster tree stays manageable. Correspondences are still read from the COLMAP db (via
-``ColmapCorrespondenceGenerator``) for the surviving pairs.
+Sparsifies COLMAP's dense vocab-tree view graph (e.g. ~140k pairs on St Peter's) down to a MegaLoc-
+selected graph, WITHOUT fragmenting it: for every image we keep its ``num_matched`` most-MegaLoc-similar
+neighbors *among the COLMAP-verified ones*. This is a restricted per-image top-K (not a strict
+intersection of two independent top-K sets — that collapses when MegaLoc and COLMAP rank neighbors
+differently, as they do on repetitive scenes). Every kept pair is COLMAP-verified, so correspondences
+still come from the db (via ``ColmapCorrespondenceGenerator``); the graph stays connected and near-full
+coverage while the downstream Metis cluster tree shrinks.
 
 Authors: Kathirvel Gounder
 """
@@ -19,29 +20,33 @@ import gtsfm.utils.logger as logger_utils
 from gtsfm.products.visibility_graph import VisibilityGraph
 from gtsfm.retriever.colmap_db_retriever import ColmapDBRetriever
 from gtsfm.retriever.retriever_base import RetrieverBase
-from gtsfm.retriever.similarity_retriever import SimilarityRetriever
+from gtsfm.retriever.similarity_retriever import SimilarityRetriever, pairs_from_score_matrix
 
 logger = logger_utils.get_logger()
 
 
 class ColmapDBMegaLocRetriever(RetrieverBase):
-    """Intersect COLMAP-verified pairs with MegaLoc top-K similarity to sparsify the view graph."""
+    """Per-image top-K over COLMAP-verified neighbors, ranked by MegaLoc similarity."""
 
-    def __init__(self, database_path: str, num_matched: int, min_score: float = 0.1) -> None:
+    def __init__(self, database_path: str, num_matched: int, min_score: float = 0.0) -> None:
         """
         Args:
             database_path: path to the COLMAP database.db (features + verified two-view geometries).
-            num_matched: number of top MegaLoc matches to keep per image (the similarity top-K).
-            min_score: minimum MegaLoc similarity score to accept a match.
+            num_matched: number of COLMAP-verified neighbors to keep per image, ranked by MegaLoc sim.
+            min_score: minimum MegaLoc similarity to keep a (COLMAP-verified) neighbor. Default 0.0 =
+                rank-only (COLMAP already gates geometric quality; MegaLoc just picks WHICH K to keep).
         """
         self._colmap_retriever = ColmapDBRetriever(database_path)
         self._similarity_retriever = SimilarityRetriever(num_matched=num_matched, min_score=min_score)
+        self._num_matched = num_matched
+        self._min_score = min_score
 
     def __repr__(self) -> str:
         return (
             "ColmapDBMegaLocRetriever:\n"
-            f"    {self._colmap_retriever}\n"
-            f"    {self._similarity_retriever}"
+            f"    num_matched (COLMAP neighbors/image): {self._num_matched}\n"
+            f"    min_score: {self._min_score}\n"
+            f"    {self._colmap_retriever}"
         )
 
     def get_image_pairs(
@@ -50,10 +55,10 @@ class ColmapDBMegaLocRetriever(RetrieverBase):
         image_fnames: List[str],
         plots_output_dir: Optional[Path] = None,
     ) -> VisibilityGraph:
-        """Return COLMAP-verified pairs that are also in MegaLoc's per-image top-K.
+        """Return each image's top-K most-MegaLoc-similar COLMAP-verified neighbors.
 
         Args:
-            global_descriptors: MegaLoc descriptors, one per image (required for the similarity filter).
+            global_descriptors: MegaLoc descriptors, one per image (required for the ranking).
             image_fnames: file names of the images.
             plots_output_dir: directory to save plots to. If None, plots are not saved.
 
@@ -72,20 +77,32 @@ class ColmapDBMegaLocRetriever(RetrieverBase):
             )
             return colmap_pairs
 
-        megaloc_pairs = self._similarity_retriever.get_image_pairs(
-            global_descriptors=global_descriptors,
-            image_fnames=image_fnames,
-            plots_output_dir=plots_output_dir,
-        )
+        num_images = len(image_fnames)
+        sim = self._similarity_retriever.compute_similarity_matrix(global_descriptors)
 
-        # Strict intersection: keep pairs that are both COLMAP-verified and in MegaLoc's top-K. Both
-        # retrievers return (i, j) with i < j over the same gtsfm image-index space, so set-and is exact.
-        pairs: VisibilityGraph = sorted(set(colmap_pairs) & set(megaloc_pairs))
+        # Candidate mask: only COLMAP-verified upper-triangular pairs are allowed. Everything else is
+        # marked invalid so the per-image top-K picks from an image's COLMAP neighbors, not all images.
+        is_invalid = ~np.triu(np.ones((num_images, num_images), dtype=bool))
+        np.fill_diagonal(is_invalid, True)
+        if colmap_pairs:
+            ci = np.fromiter((i for i, _ in colmap_pairs), dtype=int, count=len(colmap_pairs))
+            cj = np.fromiter((j for _, j in colmap_pairs), dtype=int, count=len(colmap_pairs))
+            colmap_mask = np.zeros((num_images, num_images), dtype=bool)
+            colmap_mask[ci, cj] = True  # COLMAP pairs are already i < j
+            is_invalid |= ~colmap_mask
+
+        pairs: VisibilityGraph = sorted(
+            pairs_from_score_matrix(
+                sim, invalid=is_invalid, num_select=self._num_matched, min_score=self._min_score
+            )
+        )
         logger.info(
-            "🗄️🔎 ColmapDBMegaLocRetriever: %d COLMAP-verified ∩ %d MegaLoc top-K = %d pairs (from %d images).",
+            "🗄️🔎 ColmapDBMegaLocRetriever: %d COLMAP-verified pairs → top-%d per image by MegaLoc "
+            "(min_score=%.2f) = %d pairs (from %d images).",
             len(colmap_pairs),
-            len(megaloc_pairs),
+            self._num_matched,
+            self._min_score,
             len(pairs),
-            len(image_fnames),
+            num_images,
         )
         return pairs
