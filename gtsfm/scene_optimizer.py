@@ -290,6 +290,7 @@ class SceneOptimizer:
         global_keypoints: Optional[list] = None
         if self._use_verified_pipeline:
             from gtsfm.cluster_optimizer.cluster_mvo import ClusterMVO, _pad_keypoints_list
+            from gtsfm.two_view_estimator import create_v_corr_idxs_futures
             from gtsfm.multi_view_optimizer import get_2d_tracks
             from gtsfm.products.visibility_graph import visibility_graph_keys
             from gtsfm.utils.graph import get_nodes_in_largest_connected_component
@@ -314,29 +315,56 @@ class SceneOptimizer:
                 )
                 padded_keypoints_list = _pad_keypoints_list(keypoints_list, num_images)
             else:
-                # Run the global frontend INLINE in the main process (mirroring the COLMAP-DB branch
-                # above). Routing the whole multi-hour frontend through a single monolithic delayed
-                # task on one worker + a giant blocking client.gather is fragile: over hours the
-                # scheduler<->worker/client comm hiccups, the worker is dropped, and every task dies
-                # with "lost dependencies" (NOT a memory issue — the footprint is ~15-20GB on a 2TB
-                # node). In-process there is no worker to lose, so that failure surface is gone.
-                # run_2view still runs identically (TwoViewEstimatorCacher / DB writes unaffected) and
-                # _run_two_view_v_corr_idxs keeps only v_corr_idxs, so nothing heavy is retained.
-                images = client.gather(image_futures)
-                keypoints_list, putative_corr_idxs_dict, _ = ClusterMVO._run_correspondence_generator(
-                    self.cluster_optimizer.correspondence_generator, list(visibility_graph), images
-                )
-                padded_keypoints_list = _pad_keypoints_list(keypoints_list, num_images)
+                # Global two-view over the retrieval graph, returning only v_corr_idxs (each heavy
+                # per-pair TwoViewResult is dropped the instant it is reduced). run_2view runs
+                # identically either way (TwoViewEstimatorCacher / DB writes unaffected). Dispatch on
+                # worker count:
                 relative_pose_priors = self.loader.get_relative_pose_priors(visibility_graph) or {}
                 gt_scene_mesh = self.loader.get_gt_scene_trimesh()
-                v_corr_idxs_dict, _ = ClusterMVO._run_two_view_v_corr_idxs(
-                    self.cluster_optimizer.two_view_estimator,
-                    padded_keypoints_list,
-                    putative_corr_idxs_dict,
-                    relative_pose_priors,
-                    gt_scene_mesh,
-                    one_view_data_dict,
-                )
+                try:
+                    num_workers = len(client.scheduler_info()["workers"])
+                except Exception:
+                    num_workers = 1
+
+                if num_workers <= 1:
+                    # Single worker (or unknown): run INLINE in the main process. With no worker to
+                    # lose there is zero scheduler<->worker comm-failure surface — the arrangement that
+                    # otherwise died with "lost dependencies" over multi-hour runs when one monolithic
+                    # task on one worker was dropped.
+                    logger.info("🔵 [frontend] 1 worker → running the global frontend inline (in-process).")
+                    images = client.gather(image_futures)
+                    keypoints_list, putative_corr_idxs_dict, _ = ClusterMVO._run_correspondence_generator(
+                        self.cluster_optimizer.correspondence_generator, list(visibility_graph), images
+                    )
+                    padded_keypoints_list = _pad_keypoints_list(keypoints_list, num_images)
+                    v_corr_idxs_dict, _ = ClusterMVO._run_two_view_v_corr_idxs(
+                        self.cluster_optimizer.two_view_estimator,
+                        padded_keypoints_list,
+                        putative_corr_idxs_dict,
+                        relative_pose_priors,
+                        gt_scene_mesh,
+                        one_view_data_dict,
+                    )
+                else:
+                    # Multiple workers: fan the frontend out across the pool. Correspondence generation
+                    # (per-image detection + per-pair matching) and two-view (chunked) both run in
+                    # parallel; only lean v_corr_idxs is gathered. Chunking (many small tasks, not one
+                    # monolithic task) means a dropped worker recomputes only its chunk, not the whole
+                    # multi-hour frontend.
+                    logger.info("🔵 [frontend] %d workers → running the global frontend in parallel.", num_workers)
+                    keypoints_list, putative_corr_idxs_dict = corr_gen.generate_correspondences(
+                        client, image_futures, list(visibility_graph)
+                    )
+                    padded_keypoints_list = _pad_keypoints_list(keypoints_list, num_images)
+                    v_corr_idxs_dict = create_v_corr_idxs_futures(
+                        client,
+                        self.cluster_optimizer.two_view_estimator,
+                        padded_keypoints_list,
+                        putative_corr_idxs_dict,
+                        relative_pose_priors,
+                        gt_scene_mesh,
+                        one_view_data_dict,
+                    )
 
             verified_graph = sorted(v_corr_idxs_dict.keys())
             all_nodes = visibility_graph_keys(verified_graph)
