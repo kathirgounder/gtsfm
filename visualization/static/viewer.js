@@ -513,6 +513,7 @@ class ColmapViewer {
   }
 
   async _createPCS(points) {
+    this._computeRobustBounds(points); // set robust center/radius before frustum sizing
     const pcs = new BABYLON.PointsCloudSystem(
       "pcs",
       { capacity: points.length, useColor: true },
@@ -1118,11 +1119,37 @@ class ColmapViewer {
     }
   }
 
+  _computeRobustBounds(points) {
+    // Robust scene center + radius from the parsed points: median center + 95th-percentile distance.
+    // Used to size frustums/camera dots and to reject out-of-range cameras, so a few stray points
+    // (common in messy higher-level merges) can't blow everything up. Computed from the points array
+    // (always available) rather than mesh vertex data (which a PointsCloudSystem may keep GPU-only).
+    const n = points.length;
+    if (!n) { this._robustCenter = new BABYLON.Vector3(0, 0, 0); this._robustRadius = 1.0; return; }
+    const step = Math.max(1, Math.floor(n / 20000)); // ~20k samples is plenty for robust stats
+    const xs = [], ys = [], zs = [];
+    for (let i = 0; i < n; i += step) { xs.push(points[i].x); ys.push(points[i].y); zs.push(points[i].z); }
+    const median = (a) => { a.sort((p, q) => p - q); return a[a.length >> 1]; };
+    const cx = median(xs), cy = median(ys), cz = median(zs);
+    const dists = [];
+    for (let i = 0; i < n; i += step) {
+      const dx = points[i].x - cx, dy = points[i].y - cy, dz = points[i].z - cz;
+      dists.push(Math.sqrt(dx * dx + dy * dy + dz * dz));
+    }
+    dists.sort((p, q) => p - q);
+    const p95 = dists[Math.min(dists.length - 1, Math.floor(dists.length * 0.95))] || 1.0;
+    this._robustCenter = new BABYLON.Vector3(cx, cy, cz);
+    this._robustRadius = p95 || 1.0;
+  }
+
   _sceneExtent() {
+    // Robust extent = 2 x 95th-percentile radius (set by _computeRobustBounds at point-cloud build).
+    // Falls back to the raw bounding box only if robust bounds haven't been computed yet.
+    if (this._robustRadius) return 2 * this._robustRadius;
     if (!this.pointsMesh) return 1.0;
     const bb = this.pointsMesh.getBoundingInfo().boundingBox;
-    const size = bb.maximumWorld.subtract(bb.minimumWorld);
-    return Math.max(size.x, size.y, size.z) || 1.0;
+    const s = bb.maximumWorld.subtract(bb.minimumWorld);
+    return Math.max(s.x, s.y, s.z) || 1.0;
   }
 
   _createFrusta(cams) {
@@ -1130,9 +1157,9 @@ class ColmapViewer {
     // + a Sphere — so ~1600 objects on an 800-camera scene). Camera-center dots become thin instances
     // of a single sphere. Result: 2 meshes total regardless of camera count. Placement is identical to
     // the old per-camera TransformNode (world = Compose(scale=1, rotation=R, translation=center)).
-    const size = this._sceneExtent();
+    const size = this._sceneExtent(); // robust extent; also stashes _robustCenter/_robustRadius
     const scale = 0.01 * size;      // frustum size = 1% of scene extent
-    const pivotDiam = 0.004 * size; // camera-center dot
+    const pivotDiam = 0.002 * size; // camera-center dot
 
     // Local frustum corners (camera looks down +Z), same shape/scale as before.
     const cornersLocal = [
@@ -1142,20 +1169,32 @@ class ColmapViewer {
       new BABYLON.Vector3(-0.4, 0.3, 1),
     ].map(v => v.scale(scale));
 
+    // Reject cameras with non-finite or wildly-out-of-range centers. Higher-level merges can place
+    // degenerate/unaligned cameras at garbage poses; drawing their frustums fills the screen with
+    // random lines. Anything past 12x the robust scene radius from the robust center is dropped.
+    const rc = this._robustCenter || new BABYLON.Vector3(0, 0, 0);
+    const rr = this._robustRadius || 0;
     const lines = [];
     const centers = [];
+    let skipped = 0;
     for (const c of cams) {
+      const apex = c.center;
+      if (!isFinite(apex.x) || !isFinite(apex.y) || !isFinite(apex.z) ||
+          (rr > 0 && BABYLON.Vector3.Distance(apex, rc) > 12 * rr)) {
+        skipped++;
+        continue;
+      }
       const world = BABYLON.Matrix.Compose(
         BABYLON.Vector3.One(),
         BABYLON.Quaternion.FromRotationMatrix(c.R),
-        c.center
+        apex
       );
-      const apex = c.center;
       centers.push(apex);
       const corners = cornersLocal.map(v => BABYLON.Vector3.TransformCoordinates(v, world));
       lines.push([apex, corners[0]], [apex, corners[1]], [apex, corners[2]], [apex, corners[3]]);
       lines.push([corners[0], corners[1]], [corners[1], corners[2]], [corners[2], corners[3]], [corners[3], corners[0]]);
     }
+    if (skipped) console.warn(`[viz] hid ${skipped} camera(s) with out-of-range poses (likely bad merge)`);
 
     if (lines.length) {
       const frusta = BABYLON.MeshBuilder.CreateLineSystem("frustumLines", { lines }, this.scene);
