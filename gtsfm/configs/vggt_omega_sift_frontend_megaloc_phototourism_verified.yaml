@@ -116,8 +116,14 @@ cluster_optimizer:
     use_global_view_graph_calibration: true
     # Re-triangulate union-find 2D tracks against post-BA cameras and run another BA.
     use_multi_view_retriangulation: false
-    # Per-cluster 3D init: false = lift per-pixel VGGT(-Omega) predicted depth (the known-good path).
-    use_triangulated_structure: false
+    # Per-cluster 3D init: true = VGGT(-Omega) POSES + SIFT tracks TRIANGULATED against them (geometric,
+    # multi-view-consistent structure). The depth-lift path (false) married each verified track to a single
+    # monocular depth guess; when that guess reprojected >14px the pre-BA filter deleted the point AND the
+    # verified constraint with it — the ToL audit measured 87-98% of per-cluster structure destroyed this
+    # way (26 tracks/cam at merge nodes vs >=51 healthy; 41/117 Sim3 merges left with 0 correspondences).
+    # Triangulated points pass the reproj filters by construction, so the verified viewgraph's constraints
+    # actually reach the merges. Same cost as depth-lift (one BA per cluster; triangulation is seconds).
+    use_triangulated_structure: true
     # Reuse the global verified correspondences (computed once over the full verified view graph) to build
     # each cluster's 2D tracks, instead of re-running the per-cluster correspondence generation + two-view
     # estimation. Pure speedup: per-edge v_corr is identical. Requires use_verified_pipeline.
