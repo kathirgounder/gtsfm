@@ -99,7 +99,12 @@ cluster_optimizer:
       gnc_loss: TLS
       factor_weight_outlier_threshold: 1e-6
 
-    pre_ba_max_reproj_error: 14.0
+    # 0 = SKIP the pre-BA reprojection filter entirely (cluster_vggt.py:77 gates on >0). That filter judged
+    # RAW, un-BA'd VGGT-Omega points (depth+poses not yet harmonized, so reproj is naturally high) against a
+    # 14px cap and deleted 87-98% of the per-cluster structure BEFORE BA could fix it (e.g. Tower of London
+    # C_2 nodes 5867->242 pts) -> thin merge anchors -> doubled walls + mis-seated blocks. The per-cluster BA
+    # already runs robust GNC/TLS, so it rejects true outliers itself; let it see the full structure first.
+    pre_ba_max_reproj_error: 0
     post_ba_max_reproj_error: 3.0
     drop_camera_with_no_track: false
     min_track_length: 3
