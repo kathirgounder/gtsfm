@@ -147,12 +147,11 @@ merging_options:
   min_track_length: 3
   allow_post_ba_reproj_filtering: true
   metric_constructed_only: true
-  # Trackless-camera recovery: injects good-pose / no-track cameras' merged poses into the post-merge
-  # retriangulation to recover them. Turned OFF now that the pre-BA reproj filter is skipped: with the full
-  # VGGT-Omega structure kept per cluster, cameras keep their tracks, so few/none are trackless and this
-  # recovery crutch is unneeded. Off also keeps the final retri clean (no injected cameras carrying possibly
-  # mis-seated merged poses). Flip back to true if a scene shows a meaningful trackless-camera drop.
-  recover_trackless_cameras_in_retriangulation: false
+  # Recover good-pose / no-VGGT-depth cameras (left track-less at construction, e.g. Brussels 104/207)
+  # by injecting their merged poses into the post-merge retriangulation, which geometrically re-triangulates
+  # their global 2D tracks (depth-confidence independent). Cameras that still fail to triangulate are
+  # cleanly dropped. With omega's better poses, this is the lever expected to finally recover 104/207.
+  recover_trackless_cameras_in_retriangulation: true
   ba_options:
     _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptions
     shared_calib: false
