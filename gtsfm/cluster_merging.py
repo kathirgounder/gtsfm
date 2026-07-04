@@ -519,13 +519,12 @@ def merge_scenes_with_sim3_nonlinear(
     aTi_measurements = _create_unary_measurements(parent_scene)
     bTi_measurements = [_create_unary_measurements(child_scene) for child_scene in valid_child_scenes]
 
-    # Point-correspondence sigma, SCENE-SCALE aware. The old fixed 1.0 was ~25% of a typical cluster's
-    # whole diameter, while the shared-camera pose unaries run at ~1e-2/sqrt(N) — an information ratio of
-    # ~1e4:1 that made the point anchors COSMETIC: seats stayed effectively pose-only (concentrated hinge,
-    # lever-arm tilt) no matter how many gid correspondences we supplied. 10% of the parent camera-spread
-    # radius (synthetic-validated stable incl. clumped/low-count pairs) gives anchors real weight while
-    # staying tolerant of triangulation noise; the RANSAC prefilter above removes outlier pairs first.
-    point3_sigma = max(1e-4, 0.10 * spread)
+    # Point-correspondence sigma. LEGACY (no gid sidecars) = fixed 1.0: points are effectively advisory
+    # and seats are pose-anchored — the exact R3-baseline semantics that produced the most complete ToL
+    # structure. ID MODE = 10% of the parent camera-spread radius (synthetic-validated stable incl.
+    # clumped/low-count pairs): identity-matched anchors carry real weight; the RANSAC prefilter above
+    # removes outlier pairs first.
+    point3_sigma = max(1e-4, 0.10 * spread) if parent_gid_index is not None else 1.0
 
     try:
         # New GTSAM API supports adding parent-child 3D correspondences per child.

@@ -175,3 +175,11 @@ bridge_min_component_size: 3
 
 # --- Verified-viewgraph pipeline (A/B treatment): verified-graph partition + post-merge retriangulation+BA ---
 use_verified_pipeline: true
+
+# RESET-to-baseline switches (2026-07-04): the most complete ToL reconstruction (R3: 471 cams, full wall +
+# corner + bridge) came from the LEGACY merge; the gid-anchored merge experiments traded structure for
+# accuracy. Keep the gid machinery gated OFF, and disable post-merge retri while re-establishing the
+# structure-complete baseline (fewer moving parts). Flip retri back on once full structure is recovered;
+# gid anchoring returns as an opt-in experiment debugged via local replay.
+enable_gid_merge_anchoring: false
+run_post_merge_retriangulation: false

@@ -185,6 +185,12 @@ class SceneOptimizer:
         bridge_min_component_size: int = 3,
         # --- Verified-viewgraph pipeline: verified-graph partition + post-merge retriangulation ---
         use_verified_pipeline: bool = False,
+        # Attach global-track-id sidecars so merges anchor on identity-matched correspondences (opt-in
+        # experiment; off = the R3-baseline legacy merge, which produced the most complete ToL structure).
+        enable_gid_merge_anchoring: bool = False,
+        # Post-merge retriangulation + BA (structure refinement). Off while re-establishing the
+        # structure-complete baseline — fewer moving parts; flip back on afterwards.
+        run_post_merge_retriangulation: bool = True,
     ) -> None:
         self.loader = loader
         self.image_pairs_generator = image_pairs_generator
@@ -195,6 +201,8 @@ class SceneOptimizer:
         self._bridge_top_k = bridge_top_k
         self._bridge_min_component_size = bridge_min_component_size
         self._use_verified_pipeline = use_verified_pipeline
+        self._enable_gid_merge_anchoring = enable_gid_merge_anchoring
+        self._run_post_merge_retriangulation = run_post_merge_retriangulation
         # Propagate metric_constructed_only to the cluster optimizer if it supports it.
         if hasattr(self.cluster_optimizer, "_metric_constructed_only"):
             setattr(self.cluster_optimizer, "_metric_constructed_only", self._merging_options.metric_constructed_only)
@@ -388,13 +396,15 @@ class SceneOptimizer:
             # Packed (camera, pixel) -> global-track-id arrays. Sliced per cluster below (mirroring the
             # per-node context packaging — no global broadcast) so merges can match tracks by GLOBAL
             # IDENTITY: same physical point triangulated by two clusters from disjoint cameras.
-            gid_index_arrays = cluster_merging.build_measurement_gid_arrays(global_tracks_2d)
-            logger.info(
-                "🔗 Built global-track-id index: %d measurement keys over %d tracks (%.1f MB packed).",
-                len(gid_index_arrays[0]),
-                len(global_tracks_2d),
-                sum(a.nbytes for a in gid_index_arrays) / 1e6,
-            )
+            # Opt-in: without the sidecars the merge runs the legacy (R3-baseline) path.
+            if self._enable_gid_merge_anchoring:
+                gid_index_arrays = cluster_merging.build_measurement_gid_arrays(global_tracks_2d)
+                logger.info(
+                    "🔗 Built global-track-id index: %d measurement keys over %d tracks (%.1f MB packed).",
+                    len(gid_index_arrays[0]),
+                    len(global_tracks_2d),
+                    sum(a.nbytes for a in gid_index_arrays) / 1e6,
+                )
 
             # Reuse the global verified correspondences + keypoints per cluster (skip the per-cluster
             # frontend). Plumbed via ClusterContext; clusters subset by their edges and build tracks_2d
@@ -547,6 +557,7 @@ class SceneOptimizer:
                 # globally-verified tracks against the merged poses, then BA. Written as a separate output.
                 if (
                     self._use_verified_pipeline
+                    and self._run_post_merge_retriangulation
                     and global_tracks_2d
                     and root_merged_result is not None
                     and root_merged_result.scene is not None

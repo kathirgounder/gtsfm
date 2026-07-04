@@ -127,6 +127,17 @@ class TestGidIndex(unittest.TestCase):
         self.assertEqual(merged.number_tracks(), parent.number_tracks())
         self.assertEqual(set(merged.get_valid_camera_indices()), set(PARENT_CAMS))
 
+    def test_no_sidecar_runs_legacy_path(self) -> None:
+        """Without gid sidecars (enable_gid_merge_anchoring=False), the merge is the R3-baseline legacy
+        path: shared-camera matching, no corr-floor guard — a large low-corr child is KEPT, not dropped."""
+        shared = list(range(30, 46))
+        parent = _scene(PARENT_CAMS + shared, list(range(30)), point_offset=0.0)
+        child_cams = shared + list(range(46, 62))  # 32 cams, low legacy correspondences
+        child = _scene(child_cams, list(range(60)), point_offset=0.0)
+        # No annotate_scene_with_metadata -> no sidecars -> id_mode False everywhere.
+        merged = merge_scenes_with_sim3_nonlinear(parent, [child])
+        self.assertTrue(set(child_cams).issubset(set(merged.get_valid_camera_indices())))
+
     def test_structureless_child_dropped_any_size(self) -> None:
         """A 0-track child is never merged, even with shared cameras (nothing can anchor or verify it)."""
         parent = _scene(PARENT_CAMS, list(range(20)), point_offset=0.0)
