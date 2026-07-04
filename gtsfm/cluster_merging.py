@@ -196,6 +196,63 @@ def _union_gid_indices(*indices) -> Optional[tuple[np.ndarray, np.ndarray]]:
     return uniq_keys, gids[first]
 
 
+def _prefilter_point_pairs(
+    pairs: list[tuple[np.ndarray, np.ndarray]], spread: float
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], float, float]:
+    """RANSAC-verify point pairs BEFORE the joint Sim3 solve; returns (inliers, pair_scale, inlier_ratio).
+
+    A wrong pair under a tight noise sigma dominates the quadratic cost and can warp the solve; worse, a
+    COHERENTLY wrong pair set (e.g. mismatched regions) implies a consistent wrong similarity that the
+    solver will follow off a cliff (observed: children with 150 correspondences solving at scale 81-289).
+    Fitting the pairs alone first both cleans them and measures the transform they actually imply, so the
+    caller can refuse a seat with evidence instead of detonating.
+    """
+    if len(pairs) < 5:
+        return pairs, 1.0, 1.0
+    A = np.array([np.asarray(p) for p, _ in pairs])  # parent
+    B = np.array([np.asarray(c) for _, c in pairs])  # child
+
+    def _umeyama(src, dst):
+        mu_s, mu_d = src.mean(0), dst.mean(0)
+        Sc, Dc = src - mu_s, dst - mu_d
+        U, S, Vt = np.linalg.svd(Dc.T @ Sc / len(src))
+        d = np.sign(np.linalg.det(U @ Vt))
+        R = U @ np.diag([1.0, 1.0, d]) @ Vt
+        var = (Sc**2).sum() / len(src)
+        if var < 1e-12:
+            return None
+        s = (S * [1.0, 1.0, d]).sum() / var
+        return s, R, mu_d - s * R @ mu_s
+
+    rng = np.random.default_rng(0)
+    thresh = max(1e-6, 0.10 * spread)
+    best_inl, best_count = None, -1
+    for _ in range(256):
+        idx = rng.choice(len(pairs), 3, replace=False)
+        fit = _umeyama(A[idx], B[idx])  # parent -> child
+        if fit is None:
+            continue
+        s, R, t = fit
+        if not (1e-6 < s < 1e6):
+            continue
+        err = np.linalg.norm((s * (R @ A.T)).T + t - B, axis=1)
+        inl = err < thresh
+        if inl.sum() > best_count:
+            best_count, best_inl = int(inl.sum()), inl
+    if best_inl is None or best_count < 5:
+        return [], 1.0, 0.0
+    fit = _umeyama(A[best_inl], B[best_inl])
+    if fit is None:
+        return [], 1.0, 0.0
+    s, R, t = fit
+    err = np.linalg.norm((s * (R @ A.T)).T + t - B, axis=1)
+    inl = err < thresh
+    inliers = [pairs[k] for k in range(len(pairs)) if inl[k]]
+    # pair_scale is child->parent (matches the solved aSb convention used by the scale band).
+    pair_scale = 1.0 / s if s > 1e-12 else float("inf")
+    return inliers, float(pair_scale), float(inl.mean())
+
+
 def _select_gid_point_correspondences(
     parent_scene: GtsfmData,
     child_scene: GtsfmData,
@@ -346,6 +403,13 @@ def merge_scenes_with_sim3_nonlinear(
     parent_camera_ids = set(parent_scene.get_valid_camera_indices())
     parent_gid_index = _scene_gid_index(parent_scene)
 
+    # Parent camera-spread radius: the scene-scale yardstick for the point-pair RANSAC threshold and the
+    # point-factor sigma below.
+    _centers = np.array(
+        [np.array(parent_scene.get_camera(i).pose().translation()) for i in parent_camera_ids]
+    )
+    spread = float(np.median(np.linalg.norm(_centers - _centers.mean(axis=0), axis=1))) if len(_centers) >= 2 else 1.0
+
     valid_child_scenes: list[GtsfmData] = []
     overlapping_points: list[list[tuple[np.ndarray, np.ndarray]]] = []
     for i, child_scene in enumerate(children_scenes):
@@ -376,6 +440,23 @@ def merge_scenes_with_sim3_nonlinear(
         else:
             points = []
 
+        # RANSAC-verify the pairs BEFORE the joint solve (ID mode): clean outlier matches, and measure the
+        # similarity the pair set actually implies. A coherently-wrong pair set (pair_scale far from 1)
+        # means the correspondences cannot be trusted to seat this child — refuse with evidence, pre-solve.
+        if id_mode and points:
+            points, pair_scale, pair_inlier_ratio = _prefilter_point_pairs(points, spread)
+            if points and not (0.25 <= pair_scale <= 4.0):
+                logger.warning(
+                    "MERGE_GUARD: dropping child %d pre-solve (cams=%d, pairs imply scale=%.3g "
+                    "[inlier_ratio=%.2f], shared_cams=%d) — inconsistent correspondences.",
+                    i,
+                    len(child_camera_ids),
+                    pair_scale,
+                    pair_inlier_ratio,
+                    len(common_camera_ids),
+                )
+                continue
+
         # MERGE_GUARD: a child with NO structure cannot be seated by anything — never merge it (a 36-cam
         # leaf held by 1 track and 0-track children previously rode in on pose priors and detonated merges).
         if child_scene.number_tracks() == 0:
@@ -391,12 +472,15 @@ def merge_scenes_with_sim3_nonlinear(
         # block (ToL: 83 cams seated on 26 correspondences drifted 60-190m). Accuracy > camera count.
         # OVERLAP ESCAPE: >=15 surviving shared cameras are a strong pose anchor on their own (measured:
         # a 50-cam child with 21 shared cams seated fine at 25 correspondences; 7-9 shared cams failed) —
-        # dropping such children costs Nc for no accuracy gain.
+        # BUT only for children with real structure: a 66-cam child holding ONE track escaped through the
+        # camera clause and detonated the root merge (1.6e22 px max). Pose anchors can place a block; they
+        # cannot vouch for a block whose own reconstruction is hollow.
+        camera_escape = len(common_camera_ids) >= 15 and child_scene.number_tracks() >= 50
         if (
             id_mode
             and len(child_camera_ids) >= guard_child_min_cams
             and len(points) < min_sim3_correspondences_large_child
-            and len(common_camera_ids) < 15
+            and not camera_escape
         ):
             logger.warning(
                 "MERGE_GUARD: dropping child %d (cams=%d, id_correspondences=%d < %d, shared_cams=%d) — "
@@ -438,15 +522,10 @@ def merge_scenes_with_sim3_nonlinear(
     # Point-correspondence sigma, SCENE-SCALE aware. The old fixed 1.0 was ~25% of a typical cluster's
     # whole diameter, while the shared-camera pose unaries run at ~1e-2/sqrt(N) — an information ratio of
     # ~1e4:1 that made the point anchors COSMETIC: seats stayed effectively pose-only (concentrated hinge,
-    # lever-arm tilt) no matter how many gid correspondences we supplied. Weight anchors like anchors:
-    # ~2% of the parent camera-spread radius, so 100+ spread points genuinely pin the far end of a block.
-    parent_centers = np.array([np.array(parent_scene.get_camera(i).pose().translation())
-                               for i in parent_scene.get_valid_camera_indices()])
-    if len(parent_centers) >= 2:
-        spread = float(np.median(np.linalg.norm(parent_centers - parent_centers.mean(axis=0), axis=1)))
-    else:
-        spread = 1.0
-    point3_sigma = max(1e-4, 0.02 * spread)
+    # lever-arm tilt) no matter how many gid correspondences we supplied. 10% of the parent camera-spread
+    # radius (synthetic-validated stable incl. clumped/low-count pairs) gives anchors real weight while
+    # staying tolerant of triangulation noise; the RANSAC prefilter above removes outlier pairs first.
+    point3_sigma = max(1e-4, 0.10 * spread)
 
     try:
         # New GTSAM API supports adding parent-child 3D correspondences per child.

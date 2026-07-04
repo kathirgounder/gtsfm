@@ -145,7 +145,14 @@ class TestGidIndex(unittest.TestCase):
         shared = list(range(30, 46))  # 16 shared cameras
         parent = _scene(PARENT_CAMS + shared, list(range(30)), point_offset=0.0)
         child_cams = shared + list(range(46, 62))  # 32 cams total, 16 shared
-        child = _scene(child_cams, list(range(5)), point_offset=0.0)  # only 5 matching tracks (< 50 floor)
+        child = _scene(child_cams, list(range(5)), point_offset=0.0)  # only 5 MATCHING tracks (< 50 corr floor)
+        # Give the child real structure (>=50 tracks for the escape's structure floor) whose measurements
+        # do NOT resolve in the gid index (offset uvs) -> correspondences stay at 5.
+        for extra in range(60):
+            track = SfmTrack(Point3(float(extra), -50.0, 5.0))
+            for c in child_cams[:4]:
+                track.addMeasurement(c, _uv(extra, c) + np.array([5000.0, 5000.0]))
+            self.assertTrue(child.add_track(track))
 
         # Global tracks must SPAN this test's cameras so both slices resolve (id_mode active).
         tracks_2d = []
