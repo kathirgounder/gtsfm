@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional, TypeVar, cast
 
 import matplotlib
+import numpy as np
 from dask.delayed import delayed
 from dask.distributed import Client, Future, performance_report
 from omegaconf import OmegaConf
@@ -393,6 +394,30 @@ class SceneOptimizer:
             global_tracks_2d = get_2d_tracks(v_corr_idxs_dict, padded_keypoints_list)
             logger.info("🔎 Built %d global 2D tracks from verified correspondences.", len(global_tracks_2d))
 
+            # Persist the global tracks for OFFLINE merge/BA replay (~25MB npz). The COLMAP text exports
+            # are complete per-node BA problems, but global track IDENTITY (which cluster tracks are the
+            # same physical point) only exists here — dumping it enables desk-side experiments (merge
+            # replays, gid-correspondence debugging, cluster-Sim3-averaging prototypes) without PACE runs.
+            try:
+                _cams, _us, _vs, _tids = [], [], [], []
+                for _tid, _tr in enumerate(global_tracks_2d):
+                    for _m in _tr.measurements:
+                        _cams.append(_m.i)
+                        _us.append(float(_m.uv[0]))
+                        _vs.append(float(_m.uv[1]))
+                        _tids.append(_tid)
+                np.savez_compressed(
+                    base_output_paths.results / "global_tracks_2d.npz",
+                    cam=np.asarray(_cams, dtype=np.int32),
+                    u=np.asarray(_us, dtype=np.float32),
+                    v=np.asarray(_vs, dtype=np.float32),
+                    track_id=np.asarray(_tids, dtype=np.int32),
+                )
+                logger.info("💾 Saved global tracks for offline replay -> %s", base_output_paths.results / "global_tracks_2d.npz")
+                del _cams, _us, _vs, _tids
+            except Exception as _exc:
+                logger.warning("Failed to save global_tracks_2d.npz (offline replay dump): %s", _exc)
+
             # Packed (camera, pixel) -> global-track-id arrays. Sliced per cluster below (mirroring the
             # per-node context packaging — no global broadcast) so merges can match tracks by GLOBAL
             # IDENTITY: same physical point triangulated by two clusters from disjoint cameras.
@@ -459,6 +484,44 @@ class SceneOptimizer:
         assert self.graph_partitioner is not None, "Graph partitioner is not set up!"
         cluster_tree = self.graph_partitioner.run(visibility_graph)
         self.graph_partitioner.log_partition_details(cluster_tree, base_output_paths)
+
+        # --- Offline-replay telemetry (all small; enables desk-side merge/BA/prior experiments on a
+        # downloaded results folder without re-running the pipeline) ---
+        try:
+            import pickle as _pickle
+
+            with open(base_output_paths.results / "cluster_tree.pkl", "wb") as _f:
+                _pickle.dump(cluster_tree, _f)  # exact tree structure (which node merges into which)
+        except Exception as _exc:
+            logger.warning("Failed to save cluster_tree.pkl: %s", _exc)
+        try:
+            if self._use_verified_pipeline and v_corr_idxs_dict:
+                _i = np.array([e[0] for e in v_corr_idxs_dict], dtype=np.int32)
+                _j = np.array([e[1] for e in v_corr_idxs_dict], dtype=np.int32)
+                _n = np.array([len(v) for v in v_corr_idxs_dict.values()], dtype=np.int32)
+                np.savez_compressed(
+                    base_output_paths.results / "verified_graph.npz", i=_i, j=_j, num_inliers=_n
+                )  # the verified view graph: per-edge inlier counts (edge-addition / connectivity studies)
+        except Exception as _exc:
+            logger.warning("Failed to save verified_graph.npz: %s", _exc)
+        try:
+            import json as _json
+
+            _cal = {}
+            for _idx, _ovd in one_view_data_dict.items():
+                _entry = {}
+                if _ovd.intrinsics is not None:
+                    _c = _ovd.intrinsics
+                    _entry["initial"] = [_c.fx(), _c.k1(), _c.k2(), _c.px(), _c.py()]
+                if global_refined_intrinsics and _idx in global_refined_intrinsics:
+                    _c = global_refined_intrinsics[_idx]
+                    _entry["fetzer"] = [_c.fx(), _c.k1(), _c.k2(), _c.px(), _c.py()]
+                if _entry:
+                    _cal[int(_idx)] = _entry
+            with open(base_output_paths.results / "calibrations.json", "w") as _f:
+                _json.dump(_cal, _f)  # loader-initial vs global-Fetzer focals (focal/prior experiments)
+        except Exception as _exc:
+            logger.warning("Failed to save calibrations.json: %s", _exc)
         save_retrieval_two_view_metrics(base_output_paths)
 
         logger.info("🔥 GTSFM: Scheduling cluster optimizations...")
