@@ -17,7 +17,6 @@ import gtsfm.common.types as gtsfm_types
 import gtsfm.utils.logger as logger_utils
 import gtsfm.utils.metrics as metrics_utils
 from gtsfm.bundle.bundle_adjustment import BundleAdjustmentOptions
-from gtsfm.cluster_optimizer.cluster_anysplat import save_splats
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.evaluation.metrics import GtsfmMetric, GtsfmMetricsGroup
 from gtsfm.utils import align as align_utils
@@ -36,6 +35,12 @@ logger = logger_utils.get_logger()
 
 _SCENE_PLOTS_DIR_ATTR = "_gtsfm_plots_dir"
 _SCENE_LABEL_ATTR = "_gtsfm_cluster_label"
+# Sidecar attached to each scene: packed (camera, pixel) -> global-track-id index (see
+# build_measurement_gid_arrays). Rides the GtsfmData through dask exactly like the plots/label attrs,
+# so merges can recognize that two locally-triangulated tracks are the SAME global track even when the
+# two reconstructions share no cameras (the identity was established once, globally, by the verified
+# union-find; per-cluster slicing used to discard it).
+_SCENE_GID_INDEX_ATTR = "_gtsfm_measurement_gid_index"
 
 
 @dataclass
@@ -67,6 +72,13 @@ class MergingOptions:
     # (>=15 inlier tracks) joins the retri BA and jointly refines shared structure as intended — all poses
     # pinned by use_pose_prior_all_cameras, so the existing reconstruction is bounded, not free to drift.
     recover_trackless_cameras_in_retriangulation: bool = False
+    # Global-track-ID merge guard (active only when scenes carry the gid-index sidecar, i.e. the verified
+    # pipeline): a child with >= guard_child_min_cams cameras whose ID-matched Sim3 correspondences come out
+    # below min_sim3_correspondences_large_child has no reliable structural tie to the parent — its 7-DoF
+    # seat would be under-constrained (ToL: an 83-cam child seated on 26 correspondences produced a rigid
+    # 68-camera stray block 60-190m off). Such children are DROPPED (accuracy over camera count).
+    guard_child_min_cams: int = 30
+    min_sim3_correspondences_large_child: int = 50
     ba_options: BundleAdjustmentOptions = field(default_factory=BundleAdjustmentOptions)
 
 
@@ -92,6 +104,131 @@ def _create_unary_measurements(scene: GtsfmData) -> list[UnaryMeasurementPose3]:
 
 def _measurement_key(cam_idx: int, uv: np.ndarray) -> tuple[int, int, int]:
     return cam_idx, math.floor(float(uv[0])), math.floor(float(uv[1]))
+
+
+# ---------------------------------------------------------------------------
+# Global-track-ID (gid) index: packed numpy, NOT python dicts — lean enough to ride each scene
+# (KB-MB per cluster, ~20MB at the root union) with zero extra gather/broadcast. Keys use the SAME
+# integer-floor quantization as _measurement_key, and measurements survive BA/filtering verbatim, so a
+# track's global identity is recoverable at ANY pipeline stage from any one of its measurements.
+# ---------------------------------------------------------------------------
+
+_GID_CAM_SHIFT = 44
+_GID_U_SHIFT = 22
+_GID_COORD_MASK = (1 << 22) - 1
+
+
+def _pack_measurement_keys(cams: np.ndarray, us: np.ndarray, vs: np.ndarray) -> np.ndarray:
+    """Pack (camera, floor(u), floor(v)) into a single int64 (same quantization as _measurement_key)."""
+    u = np.clip(np.floor(us).astype(np.int64), 0, _GID_COORD_MASK)
+    v = np.clip(np.floor(vs).astype(np.int64), 0, _GID_COORD_MASK)
+    return (cams.astype(np.int64) << _GID_CAM_SHIFT) | (u << _GID_U_SHIFT) | v
+
+
+def build_measurement_gid_arrays(tracks_2d) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Flatten global 2D tracks into parallel (packed_key, gid, cam) arrays (unsorted).
+
+    Built ONCE in the main process from the global union-find tracks; per-cluster slices are cut with
+    slice_gid_index. ~1.8M entries / ~20MB for 337k Tower-of-London tracks.
+    """
+    cams, us, vs, gids = [], [], [], []
+    for gid, track in enumerate(tracks_2d):
+        for m in track.measurements:
+            cams.append(m.i)
+            us.append(float(m.uv[0]))
+            vs.append(float(m.uv[1]))
+            gids.append(gid)
+    cams_arr = np.asarray(cams, dtype=np.int64)
+    keys = _pack_measurement_keys(cams_arr, np.asarray(us), np.asarray(vs))
+    return keys, np.asarray(gids, dtype=np.int32), cams_arr.astype(np.int32)
+
+
+def slice_gid_index(
+    keys: np.ndarray, gids: np.ndarray, cams: np.ndarray, camera_set
+) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """Cut the per-cluster gid index: entries whose camera is in ``camera_set``, sorted by key for lookup."""
+    if keys is None or len(keys) == 0:
+        return None
+    mask = np.isin(cams, np.fromiter(camera_set, dtype=np.int32))
+    if not mask.any():
+        return None
+    k, g = keys[mask], gids[mask]
+    order = np.argsort(k, kind="stable")
+    return k[order], g[order]
+
+
+def _lookup_gid(index: tuple[np.ndarray, np.ndarray], cam_idx: int, uv: np.ndarray) -> int:
+    """Return the global track id for one measurement, or -1 if unknown."""
+    keys, gids = index
+    key = int(
+        _pack_measurement_keys(np.array([cam_idx]), np.array([float(uv[0])]), np.array([float(uv[1])]))[0]
+    )
+    pos = int(np.searchsorted(keys, key))
+    if pos < len(keys) and int(keys[pos]) == key:
+        return int(gids[pos])
+    return -1
+
+
+def _track_gid(track: gtsam.SfmTrack, index: Optional[tuple[np.ndarray, np.ndarray]]) -> int:
+    """Global id of a 3D track = first of its measurements found in the index (-1 if none)."""
+    if index is None:
+        return -1
+    for m_idx in range(track.numberMeasurements()):
+        cam_idx, uv = track.measurement(m_idx)
+        gid = _lookup_gid(index, cam_idx, uv)
+        if gid >= 0:
+            return gid
+    return -1
+
+
+def _scene_gid_index(scene: Optional[GtsfmData]) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    return getattr(scene, _SCENE_GID_INDEX_ATTR, None) if scene is not None else None
+
+
+def _union_gid_indices(*indices) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """Union of packed indices (first occurrence of a key wins); propagated up the merge tree."""
+    live = [ix for ix in indices if ix is not None and len(ix[0]) > 0]
+    if not live:
+        return None
+    keys = np.concatenate([ix[0] for ix in live])
+    gids = np.concatenate([ix[1] for ix in live])
+    uniq_keys, first = np.unique(keys, return_index=True)
+    return uniq_keys, gids[first]
+
+
+def _select_gid_point_correspondences(
+    parent_scene: GtsfmData,
+    child_scene: GtsfmData,
+    parent_index: tuple[np.ndarray, np.ndarray],
+    child_index: tuple[np.ndarray, np.ndarray],
+    max_correspondences: int = 100,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Sim3 point correspondences by GLOBAL TRACK IDENTITY — no shared camera required.
+
+    Both reconstructions cut their tracks from the same global track set, so matching by gid recognizes
+    the same physical point triangulated from DISJOINT camera sets (the cross-cluster edges the
+    shared-camera matcher cannot see). Pairs are sorted longest-tracks-first and capped.
+    """
+    parent_by_gid: dict[int, int] = {}
+    for t_idx, track in enumerate(parent_scene.tracks()):
+        gid = _track_gid(track, parent_index)
+        if gid >= 0 and gid not in parent_by_gid:
+            parent_by_gid[gid] = t_idx
+
+    pairs: list[tuple[int, int, int]] = []  # (combined_len, parent_idx, child_idx)
+    for c_idx, child_track in enumerate(child_scene.tracks()):
+        gid = _track_gid(child_track, child_index)
+        p_idx = parent_by_gid.get(gid) if gid >= 0 else None
+        if p_idx is not None:
+            combined = parent_scene.get_track(p_idx).numberMeasurements() + child_track.numberMeasurements()
+            pairs.append((combined, p_idx, c_idx))
+
+    pairs.sort(key=lambda p: -p[0])
+    parent_tracks = parent_scene.tracks()
+    child_tracks = child_scene.tracks()
+    return [
+        (parent_tracks[p].point3(), child_tracks[c].point3()) for _, p, c in pairs[:max_correspondences]
+    ]
 
 
 def _track_max_reprojection_error(scene: GtsfmData, track: gtsam.SfmTrack) -> float:
@@ -198,44 +335,89 @@ def merge_scenes_with_sim3_nonlinear(
     children_scenes: list[GtsfmData],
     max_track_correspondences_for_sim3: int = 150,
     scale_and_average_focal_length_in_merging: bool = False,
+    guard_child_min_cams: int = 30,
+    min_sim3_correspondences_large_child: int = 50,
 ) -> GtsfmData:
     if len(children_scenes) == 0:
         return parent_scene
 
-    aTi_measurements = _create_unary_measurements(parent_scene)
     parent_camera_ids = set(parent_scene.get_valid_camera_indices())
-    valid_child_scenes = []
+    parent_gid_index = _scene_gid_index(parent_scene)
 
+    valid_child_scenes: list[GtsfmData] = []
+    overlapping_points: list[list[tuple[np.ndarray, np.ndarray]]] = []
     for i, child_scene in enumerate(children_scenes):
         child_camera_ids = set(child_scene.get_valid_camera_indices())
         common_camera_ids = parent_camera_ids & child_camera_ids
-        if len(common_camera_ids) == 0:
-            logger.warning("Child scene %d has insufficient overlap with parent, skipping", i)
+        child_gid_index = _scene_gid_index(child_scene)
+        id_mode = parent_gid_index is not None and child_gid_index is not None
+
+        if max_track_correspondences_for_sim3 > 0:
+            if id_mode:
+                # Match by GLOBAL TRACK IDENTITY: recognizes the same physical points triangulated from
+                # DISJOINT camera sets (the cross-cluster overlap the shared-camera matcher cannot see).
+                points = _select_gid_point_correspondences(
+                    parent_scene,
+                    child_scene,
+                    parent_gid_index,
+                    child_gid_index,
+                    max_correspondences=max_track_correspondences_for_sim3,
+                )
+            else:
+                points = _select_overlapping_track_point_correspondences(
+                    parent_scene,
+                    child_scene,
+                    max_correspondences=max_track_correspondences_for_sim3,
+                    preferred_min_track_length=3,
+                    preferred_max_reproj_error_px=1.5,
+                )
+        else:
+            points = []
+
+        # MERGE_GUARD (ID mode only, where correspondence count is a complete anchor measure): a large
+        # child without a reliable structural tie gets an under-constrained 7-DoF seat -> rigid stray
+        # block (ToL: 83 cams seated on 26 correspondences drifted 60-190m). Accuracy > camera count.
+        if (
+            id_mode
+            and len(child_camera_ids) >= guard_child_min_cams
+            and len(points) < min_sim3_correspondences_large_child
+        ):
+            logger.warning(
+                "MERGE_GUARD: dropping child %d (cams=%d, id_correspondences=%d < %d, shared_cams=%d) — "
+                "under-constrained Sim3 seat.",
+                i,
+                len(child_camera_ids),
+                len(points),
+                min_sim3_correspondences_large_child,
+                len(common_camera_ids),
+            )
             continue
+
+        # Admission needs SOME constraint: shared-camera pose factors or point correspondences. (With the
+        # gid index, a child sharing ZERO cameras can still be seated on its point correspondences alone —
+        # tree-level overlap that died in reconstruction no longer orphans an anchorable child.)
+        if len(common_camera_ids) == 0 and len(points) < 10:
+            logger.warning(
+                "Child scene %d has insufficient overlap with parent (0 shared cams, %d correspondences), skipping",
+                i,
+                len(points),
+            )
+            continue
+
         valid_child_scenes.append(child_scene)
+        overlapping_points.append(points)
+        logger.info(
+            "Using %d parent-child point correspondences for child %d Sim3 alignment%s.",
+            len(points),
+            i,
+            " (global-track-id)" if id_mode else "",
+        )
 
     if len(valid_child_scenes) == 0:
         return parent_scene
 
     aTi_measurements = _create_unary_measurements(parent_scene)
     bTi_measurements = [_create_unary_measurements(child_scene) for child_scene in valid_child_scenes]
-    if max_track_correspondences_for_sim3 > 0:
-        overlapping_points = [
-            _select_overlapping_track_point_correspondences(
-                parent_scene,
-                child_scene,
-                max_correspondences=max_track_correspondences_for_sim3,
-                preferred_min_track_length=3,
-                preferred_max_reproj_error_px=1.5,
-            )
-            for child_scene in valid_child_scenes
-        ]
-    else:
-        overlapping_points = [[] for _ in valid_child_scenes]
-    for child_idx, overlap_points in enumerate(overlapping_points):
-        logger.info(
-            "Using %d parent-child point correspondences for child %d Sim3 alignment.", len(overlap_points), child_idx
-        )
 
     try:
         # New GTSAM API supports adding parent-child 3D correspondences per child.
@@ -349,14 +531,17 @@ def annotate_scene_with_metadata(
     scene: Optional[GtsfmData],
     plots_dir: str | Path | None,
     cluster_label: Optional[str],
+    measurement_gid_index: Optional[tuple[np.ndarray, np.ndarray]] = None,
 ) -> Optional[GtsfmData]:
-    """Attach plotting metadata to a scene before it is merged downstream."""
+    """Attach plotting metadata (and the optional per-cluster gid-index sidecar) to a scene before merging."""
     if scene is None:
         return None
     if plots_dir is not None:
         setattr(scene, _SCENE_PLOTS_DIR_ATTR, Path(plots_dir))
     if cluster_label is not None:
         setattr(scene, _SCENE_LABEL_ATTR, cluster_label)
+    if measurement_gid_index is not None:
+        setattr(scene, _SCENE_GID_INDEX_ATTR, measurement_gid_index)
     return scene
 
 
@@ -625,6 +810,10 @@ def _run_export_task(payload: Tuple[Optional[Path], Future | MergedNodeResult]) 
         gaussian_splats = merged_scene.get_gaussian_splats()
         if isinstance(gaussian_splats, GaussiansProtocol):
             try:
+                # Lazy import: cluster_anysplat transitively requires the GPU-only vggt package, which
+                # merging must not hard-depend on (only splat-carrying scenes ever reach this branch).
+                from gtsfm.cluster_optimizer.cluster_anysplat import save_splats
+
                 save_splats(merged_scene, merged_dir)
             except Exception as exc:
                 logger.warning("⚠️ Failed to export Gaussian splats: %s", exc)
@@ -637,6 +826,8 @@ def _run_export_task(payload: Tuple[Optional[Path], Future | MergedNodeResult]) 
             gaussian_splats = pre_ba_merged.get_gaussian_splats()
             if isinstance(gaussian_splats, GaussiansProtocol):
                 try:
+                    from gtsfm.cluster_optimizer.cluster_anysplat import save_splats
+
                     save_splats(pre_ba_merged, pre_ba_dir)
                 except Exception as exc:
                     logger.warning("⚠️ Failed to export Gaussian splats: %s", exc)
@@ -791,6 +982,10 @@ def combine_results(
 
     child_scenes: tuple[Optional[GtsfmData], ...] = tuple[GtsfmData | None, ...](child.scene for child in child_results)
 
+    # Union of the gid-index sidecars (this node's own + all children's) — used for gid-based duplicate
+    # fusion below and propagated on the outgoing scenes so ancestors can ID-match against this subtree.
+    node_gid_index = _union_gid_indices(_scene_gid_index(current), *[_scene_gid_index(c) for c in child_scenes])
+
     # Some stats for the merging metrics.
     parent_camera_set = set(current.get_valid_camera_indices()) if current is not None else set()
     child_camera_counts: list[int] = []
@@ -805,6 +1000,10 @@ def combine_results(
         pre_ba_scene: Optional[GtsfmData],
         trackless_cameras: Optional[dict] = None,
     ) -> MergedNodeResult:
+        # Sidecar rides the outgoing scenes (same rail as the plots/label attrs) — zero extra shipping.
+        for _scn in (result_scene, pre_ba_scene):
+            if _scn is not None and node_gid_index is not None:
+                setattr(_scn, _SCENE_GID_INDEX_ATTR, node_gid_index)
         return MergedNodeResult(
             scene=result_scene,
             pre_ba_scene=pre_ba_scene,
@@ -856,6 +1055,8 @@ def combine_results(
             valid_child_scenes,
             max_track_correspondences_for_sim3=options.max_track_correspondences_for_sim3,
             scale_and_average_focal_length_in_merging=options.scale_and_average_focal_length,
+            guard_child_min_cams=options.guard_child_min_cams,
+            min_sim3_correspondences_large_child=options.min_sim3_correspondences_large_child,
         )
         _log_scene_reprojection_stats(
             merged, "Merged with children (nonlinear alignment)", plot_histograms=options.plot_reprojection_histograms
@@ -882,6 +1083,7 @@ def combine_results(
         original_track_count = merged.number_tracks()
         merged_tracks: list = []
         measurement_to_track: dict[tuple[int, int, int], int] = {}
+        gid_to_track: dict[int, int] = {}
 
         for track in merged.tracks():
             measurements = [track.measurement(k) for k in range(track.numberMeasurements())]
@@ -891,6 +1093,11 @@ def combine_results(
                 if existing_idx is not None:
                     target_idx = existing_idx
                     break
+            # Same GLOBAL track triangulated by different clusters from DISJOINT cameras shares no
+            # measurement key — fuse it by global identity instead (kills ghost copies / double walls).
+            track_gid = _track_gid(track, node_gid_index)
+            if target_idx is None and track_gid >= 0:
+                target_idx = gid_to_track.get(track_gid)
 
             if target_idx is None:
                 merged_tracks.append(track)
@@ -908,6 +1115,8 @@ def combine_results(
             for m_idx in range(base_track.numberMeasurements()):
                 cam_idx, uv = base_track.measurement(m_idx)
                 measurement_to_track[_measurement_key(cam_idx, uv)] = target_idx
+            if track_gid >= 0:
+                gid_to_track[track_gid] = target_idx
 
         if len(merged_tracks) < original_track_count:
             logger.info(

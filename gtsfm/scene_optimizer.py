@@ -245,6 +245,7 @@ class SceneOptimizer:
             computation.sfm_result,
             context.output_paths.plots,
             context.label,
+            measurement_gid_index=context.measurement_gid_index,
         )
 
         io_future: Future = context.client.compute(io_graph)  # type: ignore
@@ -288,6 +289,7 @@ class SceneOptimizer:
         global_refined_intrinsics: Optional[dict] = None
         global_v_corr_idxs_dict: Optional[dict] = None
         global_keypoints: Optional[list] = None
+        gid_index_arrays: Optional[tuple] = None  # packed (keys, gids, cams) from the global 2D tracks
         if self._use_verified_pipeline:
             from gtsfm.cluster_optimizer.cluster_mvo import ClusterMVO, _pad_keypoints_list
             from gtsfm.two_view_estimator import create_v_corr_idxs_futures
@@ -383,6 +385,17 @@ class SceneOptimizer:
             global_tracks_2d = get_2d_tracks(v_corr_idxs_dict, padded_keypoints_list)
             logger.info("🔎 Built %d global 2D tracks from verified correspondences.", len(global_tracks_2d))
 
+            # Packed (camera, pixel) -> global-track-id arrays. Sliced per cluster below (mirroring the
+            # per-node context packaging — no global broadcast) so merges can match tracks by GLOBAL
+            # IDENTITY: same physical point triangulated by two clusters from disjoint cameras.
+            gid_index_arrays = cluster_merging.build_measurement_gid_arrays(global_tracks_2d)
+            logger.info(
+                "🔗 Built global-track-id index: %d measurement keys over %d tracks (%.1f MB packed).",
+                len(gid_index_arrays[0]),
+                len(global_tracks_2d),
+                sum(a.nbytes for a in gid_index_arrays) / 1e6,
+            )
+
             # Reuse the global verified correspondences + keypoints per cluster (skip the per-cluster
             # frontend). Plumbed via ClusterContext; clusters subset by their edges and build tracks_2d
             # eagerly in the main process (no scatter, no per-cluster two-view re-estimation).
@@ -462,6 +475,15 @@ class SceneOptimizer:
                         global_refined_intrinsics=global_refined_intrinsics,
                         global_v_corr_idxs_dict=global_v_corr_idxs_dict,
                         global_keypoints=global_keypoints,
+                        # Per-cluster slice of the gid index (only this node's cameras) — lean per-node
+                        # packaging, mirrors the context pattern; None disables ID-matching gracefully.
+                        measurement_gid_index=(
+                            cluster_merging.slice_gid_index(
+                                *gid_index_arrays, {k for edge in visibility_graph for k in edge}
+                            )
+                            if gid_index_arrays is not None
+                            else None
+                        ),
                     )
 
                 context_tree = cluster_tree.map_with_path(to_context)

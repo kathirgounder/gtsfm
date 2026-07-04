@@ -1,0 +1,132 @@
+"""Unit tests for global-track-ID merge anchoring (gid-index sidecar).
+
+Two clusters that triangulated the SAME global tracks from DISJOINT camera sets must be matchable by
+global identity (the shared-camera matcher finds nothing there), and the MERGE_GUARD must drop a large
+child whose ID-matched correspondences are too few to constrain its 7-DoF Sim3 seat.
+
+Authors: Kathirvel Gounder
+"""
+
+import unittest
+
+import numpy as np
+from gtsam import Cal3Bundler, PinholeCameraCal3Bundler, Point3, Pose3, Rot3, SfmTrack
+
+from gtsfm.cluster_merging import (
+    _SCENE_GID_INDEX_ATTR,
+    _lookup_gid,
+    _select_gid_point_correspondences,
+    _track_gid,
+    _union_gid_indices,
+    annotate_scene_with_metadata,
+    build_measurement_gid_arrays,
+    merge_scenes_with_sim3_nonlinear,
+    slice_gid_index,
+)
+from gtsfm.common.gtsfm_data import GtsfmData
+from gtsfm.common.sfm_track import SfmMeasurement, SfmTrack2d
+
+NUM_IMAGES = 64
+PARENT_CAMS = [0, 1, 2]
+CHILD_CAMS = [10, 11, 12]  # DISJOINT from parent — no shared cameras anywhere.
+
+
+def _uv(gid: int, cam: int) -> np.ndarray:
+    """Deterministic per-(track, camera) pixel; same values used for global tracks and scene tracks."""
+    return np.array([13.0 * gid + cam + 0.25, 7.0 * gid + 2 * cam + 0.75])
+
+
+def _global_tracks(num: int) -> list[SfmTrack2d]:
+    """Global 2D tracks spanning BOTH camera sets (the cross-cluster edges made them)."""
+    tracks = []
+    for gid in range(num):
+        meas = [SfmMeasurement(c, _uv(gid, c)) for c in PARENT_CAMS + CHILD_CAMS]
+        tracks.append(SfmTrack2d(measurements=meas))
+    return tracks
+
+
+def _scene(cams: list[int], gids: list[int], point_offset: float) -> GtsfmData:
+    """A reconstruction over ``cams`` containing one 3D track per gid (measurements = the global uvs)."""
+    data = GtsfmData(number_images=NUM_IMAGES)
+    for k, c in enumerate(cams):
+        pose = Pose3(Rot3(), np.array([k, 0.0, 0.0]))
+        data.add_camera(c, PinholeCameraCal3Bundler(pose, Cal3Bundler()))
+    for gid in gids:
+        track = SfmTrack(Point3(float(gid), point_offset, 0.0))
+        for c in cams:
+            track.addMeasurement(c, _uv(gid, c))
+        assert data.add_track(track)
+    return data
+
+
+class TestGidIndex(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tracks_2d = _global_tracks(60)
+        self.arrays = build_measurement_gid_arrays(self.tracks_2d)
+
+    def test_pack_slice_lookup_roundtrip(self) -> None:
+        """Every measurement resolves to its gid through a camera-restricted slice."""
+        parent_index = slice_gid_index(*self.arrays, set(PARENT_CAMS))
+        child_index = slice_gid_index(*self.arrays, set(CHILD_CAMS))
+        self.assertIsNotNone(parent_index)
+        for gid in (0, 7, 59):
+            self.assertEqual(_lookup_gid(parent_index, 0, _uv(gid, 0)), gid)
+            self.assertEqual(_lookup_gid(child_index, 11, _uv(gid, 11)), gid)
+        # A camera outside the slice must not resolve.
+        self.assertEqual(_lookup_gid(parent_index, 10, _uv(3, 10)), -1)
+
+    def test_correspondences_across_disjoint_cameras(self) -> None:
+        """Same global tracks triangulated from disjoint camera sets match by identity."""
+        parent = _scene(PARENT_CAMS, list(range(60)), point_offset=0.0)
+        child = _scene(CHILD_CAMS, list(range(60)), point_offset=100.0)
+        parent_index = slice_gid_index(*self.arrays, set(PARENT_CAMS))
+        child_index = slice_gid_index(*self.arrays, set(CHILD_CAMS))
+
+        pairs = _select_gid_point_correspondences(parent, child, parent_index, child_index, max_correspondences=100)
+        self.assertEqual(len(pairs), 60)
+        # Pairs must join the SAME physical point: x-coords encode the gid on both sides.
+        for p_pt, c_pt in pairs:
+            self.assertAlmostEqual(p_pt[0], c_pt[0])
+            self.assertAlmostEqual(p_pt[1] + 100.0, c_pt[1])
+
+    def test_track_gid_and_union(self) -> None:
+        parent_index = slice_gid_index(*self.arrays, set(PARENT_CAMS))
+        child_index = slice_gid_index(*self.arrays, set(CHILD_CAMS))
+        union = _union_gid_indices(parent_index, child_index)
+        parent = _scene(PARENT_CAMS, [5], point_offset=0.0)
+        child = _scene(CHILD_CAMS, [5], point_offset=100.0)
+        # Both scenes' copies of global track 5 resolve to the same gid through the union index.
+        self.assertEqual(_track_gid(parent.get_track(0), union), 5)
+        self.assertEqual(_track_gid(child.get_track(0), union), 5)
+
+    def test_merge_guard_drops_large_weak_child(self) -> None:
+        """A >=30-camera child with too few ID correspondences is dropped (returns parent unchanged)."""
+        parent = _scene(PARENT_CAMS, list(range(60)), point_offset=0.0)
+        big_cams = list(range(20, 55))  # 35 cameras, disjoint from parent
+        # Child shares only 5 global tracks with the parent -> 5 ID correspondences << 50 floor.
+        child = GtsfmData(number_images=NUM_IMAGES)
+        for k, c in enumerate(big_cams):
+            child.add_camera(c, PinholeCameraCal3Bundler(Pose3(Rot3(), np.array([k, 0.0, 0.0])), Cal3Bundler()))
+        for gid in range(5):
+            track = SfmTrack(Point3(float(gid), 100.0, 0.0))
+            for c in big_cams[:3]:
+                track.addMeasurement(c, _uv(gid, c))
+            self.assertTrue(child.add_track(track))
+
+        # Global tracks for the child's cameras exist too (so its index resolves).
+        tracks_2d = _global_tracks(60)
+        for gid in range(5):
+            for c in big_cams[:3]:
+                tracks_2d[gid].measurements.append(SfmMeasurement(c, _uv(gid, c)))
+        arrays = build_measurement_gid_arrays(tracks_2d)
+        annotate_scene_with_metadata(parent, None, None, slice_gid_index(*arrays, set(PARENT_CAMS)))
+        annotate_scene_with_metadata(child, None, None, slice_gid_index(*arrays, set(big_cams)))
+
+        merged = merge_scenes_with_sim3_nonlinear(parent, [child])
+        # Guard dropped the only child -> parent returned as-is.
+        self.assertEqual(merged.number_tracks(), parent.number_tracks())
+        self.assertEqual(set(merged.get_valid_camera_indices()), set(PARENT_CAMS))
+
+
+if __name__ == "__main__":
+    unittest.main()

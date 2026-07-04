@@ -58,6 +58,10 @@ class ClusterContext:
     # Used by ClusterVGGTWithFrontend when reuse_global_correspondences is set. See ClusterContext plumbing.
     global_v_corr_idxs_dict: dict | None = None
     global_keypoints: list | None = None
+    # Per-cluster slice of the packed (camera, pixel) -> global-track-id index (sorted int64 keys, int32
+    # gids). Attached to this cluster's reconstruction as a sidecar so merges can match tracks by GLOBAL
+    # identity across clusters that share no cameras. None disables ID-matching (non-verified pipelines).
+    measurement_gid_index: tuple | None = None
 
     @property
     def is_root(self) -> bool:
