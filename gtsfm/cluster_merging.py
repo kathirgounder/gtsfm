@@ -435,9 +435,24 @@ def merge_scenes_with_sim3_nonlinear(
     aTi_measurements = _create_unary_measurements(parent_scene)
     bTi_measurements = [_create_unary_measurements(child_scene) for child_scene in valid_child_scenes]
 
+    # Point-correspondence sigma, SCENE-SCALE aware. The old fixed 1.0 was ~25% of a typical cluster's
+    # whole diameter, while the shared-camera pose unaries run at ~1e-2/sqrt(N) — an information ratio of
+    # ~1e4:1 that made the point anchors COSMETIC: seats stayed effectively pose-only (concentrated hinge,
+    # lever-arm tilt) no matter how many gid correspondences we supplied. Weight anchors like anchors:
+    # ~2% of the parent camera-spread radius, so 100+ spread points genuinely pin the far end of a block.
+    parent_centers = np.array([np.array(parent_scene.get_camera(i).pose().translation())
+                               for i in parent_scene.get_valid_camera_indices()])
+    if len(parent_centers) >= 2:
+        spread = float(np.median(np.linalg.norm(parent_centers - parent_centers.mean(axis=0), axis=1)))
+    else:
+        spread = 1.0
+    point3_sigma = max(1e-4, 0.02 * spread)
+
     try:
         # New GTSAM API supports adding parent-child 3D correspondences per child.
-        aligner = TrajectoryAlignerSim3(aTi_measurements, bTi_measurements, [], False, overlapping_points, 1.0)
+        aligner = TrajectoryAlignerSim3(
+            aTi_measurements, bTi_measurements, [], False, overlapping_points, point3_sigma
+        )
     except TypeError:
         logger.warning(
             "TrajectoryAlignerSim3 point-correspondence API unavailable, falling back to pose-only alignment."
