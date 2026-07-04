@@ -167,6 +167,295 @@ def _run_post_merge_retriangulation(
     return refined
 
 
+# ---------------------------------------------------------------------------
+# Post-root-merge BOUNDARY RECOVERY (offline-validated exp5 recipe).
+#
+# The root merge can only keep cameras some cluster reconstructed AND some Sim3 seat carried in; island
+# cameras (clusters the MERGE_GUARD dropped, cams the per-cluster BA lost) end up with global-track
+# measurements but no pose. The recovery: (a) read the merged scene's own 3D as {gid: xyz} via the
+# majority-vote track identity, (b) DLT-triangulate every "boundary" global track that has >=3 posed
+# views (<3px mean reproj), (c) RANSAC-DLT resect unposed cameras against the UNION cluster-3D ∪
+# fresh-3D, iterating b<->c so newly posed cams enable new triangulations, (d) one BA over the
+# augmented scene. The union in (c) is essential: offline, an island camera saw 508 anchors in
+# cluster-3D vs 95 in fresh-only triangulation — the union is what made resection work.
+# ---------------------------------------------------------------------------
+
+
+def _dlt_triangulate(
+    measurements: list,
+    posed: dict,
+    intrinsics: dict,
+) -> tuple[Optional[np.ndarray], Optional[float]]:
+    """DLT multiview triangulation from posed cams; returns (X, mean reproj px) or (None, None).
+
+    Faithful port of the offline-validated triangulate(): ``measurements`` is [(cam, u, v), ...],
+    ``posed[i] = (R_w2c, t_w2c)`` (COLMAP convention), ``intrinsics[i] = (f, k1, k2, px, py)`` with only
+    f/px/py used (undistorted pinhole model, same as the offline replay).
+    """
+    A = []
+    for i, u, v in measurements:
+        Rm, tr = posed[i]
+        f, _, _, px, py = intrinsics[i]
+        xn, yn = (u - px) / f, (v - py) / f
+        P = np.hstack([Rm, tr[:, None]])
+        A.append(xn * P[2] - P[0])
+        A.append(yn * P[2] - P[1])
+    _, _, Vt = np.linalg.svd(np.array(A))
+    Xh = Vt[-1]
+    if abs(Xh[3]) < 1e-12:
+        return None, None
+    X = Xh[:3] / Xh[3]
+    errs = []
+    for i, u, v in measurements:
+        Rm, tr = posed[i]
+        f, _, _, px, py = intrinsics[i]
+        p = Rm @ X + tr
+        if p[2] <= 1e-9:  # behind a camera -> reject
+            return None, None
+        errs.append(np.hypot(p[0] / p[2] * f + px - u, p[1] / p[2] * f + py - v))
+    return X, float(np.mean(errs))
+
+
+def _ransac_dlt_resect(
+    observations: list,
+    intrinsics_entry: tuple,
+    struct: dict,
+    iters: int = 800,
+    min_inl: int = 10,
+    px_thresh: float = 4.0,
+) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray, int]]:
+    """RANSAC-DLT resection of one camera against {gid: xyz}; returns (R_w2c, t_w2c, center, n_inl) or None.
+
+    Faithful port of the offline-validated resect(): ``observations`` is this camera's global-track
+    measurements [(gid, u, v), ...]; only observations whose gid is in ``struct`` participate.
+    """
+    P3, P2 = [], []
+    for t, uu, vv in observations:
+        X3 = struct.get(int(t))
+        if X3 is not None:
+            P3.append(X3)
+            P2.append((uu, vv))
+    if len(P3) < min_inl:
+        return None
+    f, _, _, px0, py0 = intrinsics_entry
+    X = np.array(P3)
+    x = (np.array(P2) - [px0, py0]) / f
+    rng = np.random.default_rng(0)
+    best, best_inl = -1, None
+
+    def dlt(Xs, xs):
+        A = []
+        for (a, b, c), (xn, yn) in zip(Xs, xs):
+            A.append([a, b, c, 1, 0, 0, 0, 0, -xn * a, -xn * b, -xn * c, -xn])
+            A.append([0, 0, 0, 0, a, b, c, 1, -yn * a, -yn * b, -yn * c, -yn])
+        _, _, Vt = np.linalg.svd(np.array(A))
+        P = Vt[-1].reshape(3, 4)
+        U, S, Vt2 = np.linalg.svd(P[:, :3])
+        d = np.sign(np.linalg.det(U @ Vt2))
+        Rm = U @ np.diag([1, 1, d]) @ Vt2
+        sc = (S * [1, 1, d]).mean()
+        if abs(sc) < 1e-12:
+            return None
+        t = P[:, 3] / sc
+        if np.median((Rm @ X.T).T[:, 2] + t[2]) < 0:  # cheirality: majority of points must be in front
+            Rm, t = -Rm, -t
+        return Rm, t
+
+    for _ in range(iters):
+        idx = rng.choice(len(X), 6, replace=False)
+        fit = dlt(X[idx], x[idx])
+        if fit is None:
+            continue
+        Rm, t = fit
+        pr = (Rm @ X.T).T + t
+        e = np.linalg.norm(pr[:, :2] / np.maximum(pr[:, 2:3], 1e-9) - x, axis=1)
+        inl = (pr[:, 2] > 1e-9) & (e < px_thresh / f)
+        if inl.sum() > best:
+            best, best_inl = int(inl.sum()), inl
+    if best < min_inl:
+        return None
+    fit = dlt(X[best_inl], x[best_inl])
+    if fit is None:
+        return None
+    Rm, t = fit
+    return Rm, t, -Rm.T @ t, best
+
+
+def _calibration_to_tuple(cal) -> tuple[float, float, float, float, float]:
+    """(f, k1, k2, px, py) from a gtsam calibration (k1/k2 default 0 for non-Bundler models)."""
+    k1 = float(cal.k1()) if hasattr(cal, "k1") else 0.0
+    k2 = float(cal.k2()) if hasattr(cal, "k2") else 0.0
+    return float(cal.fx()), k1, k2, float(cal.px()), float(cal.py())
+
+
+def _run_boundary_recovery(
+    scene: GtsfmData,
+    tracks_2d: list,
+    options: MergingOptions,
+    fallback_intrinsics: Optional[dict] = None,
+) -> GtsfmData:
+    """Boundary triangulation + island-camera resection against the merged root scene, then one BA.
+
+    Runs as a single dask task on a worker (mirrors _run_post_merge_retriangulation). ``scene`` is the
+    worker-local copy of the root merged scene (mutated in place before BA); ``fallback_intrinsics``
+    maps camera index -> (f, k1, k2, px, py) for cameras NOT in the merged scene (global-Fetzer focals
+    with loader-initial fallback — the same precedence the offline replay used).
+    """
+    from gtsam import Cal3Bundler, PinholeCameraCal3Bundler, Pose3, Rot3, SfmTrack
+
+    from gtsfm import cluster_merging as _cm
+
+    gid_index = _cm._scene_gid_index(scene)
+    if gid_index is None:
+        logger.warning(
+            "🧭 Boundary recovery: merged scene carries no gid-index sidecar "
+            "(enable_gid_merge_anchoring off?); skipping."
+        )
+        return scene
+    fallback_intrinsics = fallback_intrinsics or {}
+
+    # Posed cameras of the merged scene, in the COLMAP (R_w2c, t_w2c) convention the DLT helpers use.
+    posed: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    intr: dict[int, tuple[float, float, float, float, float]] = {}
+    for i in scene.get_valid_camera_indices():
+        cam = scene.get_camera(i)
+        if cam is None:
+            continue
+        pose = cam.pose()  # gtsam camera pose = cam-to-world
+        R_w2c = np.asarray(pose.rotation().matrix()).T
+        posed[i] = (R_w2c, -R_w2c @ np.asarray(pose.translation()))
+        intr[i] = _calibration_to_tuple(cam.calibration())
+
+    # (a) gid -> 3D from the merged scene's own tracks (majority-vote identity; first track per gid wins).
+    struct: dict[int, np.ndarray] = {}
+    for track in scene.tracks():
+        gid = _cm._track_gid(track, gid_index)
+        if gid >= 0 and gid not in struct:
+            struct[gid] = np.asarray(track.point3())
+    n_cluster3d = len(struct)
+
+    # Per-camera observation index over the global 2D tracks (for resection).
+    cam_obs: dict[int, list[tuple[int, float, float]]] = {}
+    for tid, tr in enumerate(tracks_2d):
+        for m in tr.measurements:
+            cam_obs.setdefault(int(m.i), []).append((tid, float(m.uv[0]), float(m.uv[1])))
+    unposed_candidates = sorted(i for i in cam_obs if i not in posed)
+    logger.info(
+        "🧭 Boundary recovery: %d posed cams, %d cluster-3D gids, %d unposed cameras with "
+        "global-track measurements (%d with intrinsics).",
+        len(posed),
+        n_cluster3d,
+        len(unposed_candidates),
+        sum(1 for i in unposed_candidates if i in fallback_intrinsics),
+    )
+
+    # (b)<->(c): triangulate boundary tracks / resect unposed cameras, iterate (newly posed cams enable
+    # new triangulations). Cluster 3D wins on gid collision: gids already in `struct` are never
+    # re-triangulated, so fresh points only AUGMENT the merged structure (the essential union).
+    boundary_pts: dict[int, np.ndarray] = {}
+    recovered: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, int]] = {}
+    for it in range(3):
+        new_pts = 0
+        for tid, tr in enumerate(tracks_2d):
+            if tid in struct or tr.number_measurements() < 3:
+                continue
+            mp, seen = [], set()
+            for m in tr.measurements:
+                i = int(m.i)
+                if i in posed and i in intr and i not in seen:
+                    mp.append((i, float(m.uv[0]), float(m.uv[1])))
+                    seen.add(i)
+            if len(mp) < 3:
+                continue
+            X, err = _dlt_triangulate(mp, posed, intr)
+            if X is not None and err is not None and err < 3.0:
+                boundary_pts[tid] = X
+                struct[tid] = X
+                new_pts += 1
+        newly = 0
+        for ci in unposed_candidates:
+            if ci in posed:
+                continue
+            k_entry = fallback_intrinsics.get(ci)
+            if k_entry is None:
+                continue
+            r = _ransac_dlt_resect(cam_obs[ci], k_entry, struct)
+            if r is not None:
+                Rm, t, C, ninl = r
+                posed[ci] = (Rm, t)
+                intr[ci] = k_entry
+                recovered[ci] = (Rm, t, C, ninl)
+                newly += 1
+        logger.info(
+            "🧭 Boundary recovery iter %d: +%d triangulated (total boundary %d), "
+            "+%d cameras resected (total recovered %d, posed %d).",
+            it,
+            new_pts,
+            len(boundary_pts),
+            newly,
+            len(recovered),
+            len(posed),
+        )
+        if newly == 0:
+            break
+
+    if not recovered and not boundary_pts:
+        logger.info("🧭 Boundary recovery: nothing to recover (0 boundary tracks, 0 cameras); scene unchanged.")
+        return scene
+
+    # (d) Add recovered cameras (COLMAP w2c -> gtsam cam-to-world) + boundary tracks restricted to
+    # posed cameras, then ONE BA over the augmented scene and the standard post-BA reproj filter.
+    for ci in sorted(recovered):
+        Rm, t, C, ninl = recovered[ci]
+        f, k1, k2, px, py = intr[ci]
+        pose_c2w = Pose3(Rot3(Rm.T), C)  # COLMAP w2c -> gtsam camera pose (cam-to-world)
+        scene.add_camera(ci, PinholeCameraCal3Bundler(pose_c2w, Cal3Bundler(f, k1, k2, px, py)))
+        logger.info("🧭 Boundary recovery: resected camera %d with %d RANSAC inliers.", ci, ninl)
+
+    final_cams = set(scene.get_valid_camera_indices())
+    added_tracks = 0
+    for gid in sorted(boundary_pts):
+        track = SfmTrack(boundary_pts[gid])
+        seen = set()
+        for m in tracks_2d[gid].measurements:
+            i = int(m.i)
+            if i in final_cams and i not in seen:
+                track.addMeasurement(i, np.array([float(m.uv[0]), float(m.uv[1])]))
+                seen.add(i)
+        if track.numberMeasurements() >= 3 and scene.add_track(track):
+            added_tracks += 1
+    logger.info(
+        "🧭 Boundary recovery: triangulated %d boundary tracks (added %d), resected %d cameras; "
+        "scene now %d cams / %d tracks. Running BA...",
+        len(boundary_pts),
+        added_tracks,
+        len(recovered),
+        len(final_cams),
+        scene.number_tracks(),
+    )
+
+    try:
+        optimizer = options.ba_options.to_optimizer(min_track_length=options.min_track_length)
+        refined, _ = optimizer.run_simple_ba(scene)
+        refined = refined.filter_landmark_measurements(
+            options.post_ba_max_reproj_error,
+            options.min_track_length,
+            retain_cameras_without_tracks=options.keep_all_cameras,
+        )
+    except Exception as exc:
+        logger.warning("🧭 Boundary recovery BA failed (%s); returning un-refined augmented scene.", exc)
+        refined = scene
+    # Same all-images GT denominator as the merged metrics (see _run_post_merge_retriangulation).
+    refined._image_info = scene._clone_image_info()
+    logger.info(
+        "🧭 Boundary recovery final: %d cameras / %d tracks (was %d cams pre-recovery).",
+        len(refined.get_valid_camera_indices()),
+        refined.number_tracks(),
+        len(final_cams) - len(recovered),
+    )
+    return refined
+
+
 class SceneOptimizer:
     """Wrapper combining different modules to run the whole pipeline on a
     loader."""
@@ -192,6 +481,11 @@ class SceneOptimizer:
         # Post-merge retriangulation + BA (structure refinement). Off while re-establishing the
         # structure-complete baseline — fewer moving parts; flip back on afterwards.
         run_post_merge_retriangulation: bool = True,
+        # Post-root-merge boundary recovery (offline-validated): triangulate global boundary tracks
+        # against the merged cameras, RANSAC-DLT resect cameras the merge never placed against the
+        # cluster-3D ∪ fresh-3D union, iterate, then one BA. Requires the gid sidecar
+        # (enable_gid_merge_anchoring) to read the merged scene's 3D by global identity.
+        enable_boundary_recovery: bool = False,
     ) -> None:
         self.loader = loader
         self.image_pairs_generator = image_pairs_generator
@@ -204,6 +498,7 @@ class SceneOptimizer:
         self._use_verified_pipeline = use_verified_pipeline
         self._enable_gid_merge_anchoring = enable_gid_merge_anchoring
         self._run_post_merge_retriangulation = run_post_merge_retriangulation
+        self._enable_boundary_recovery = enable_boundary_recovery
         # Propagate metric_constructed_only to the cluster optimizer if it supports it.
         if hasattr(self.cluster_optimizer, "_metric_constructed_only"):
             setattr(self.cluster_optimizer, "_metric_constructed_only", self._merging_options.metric_constructed_only)
@@ -652,6 +947,58 @@ class SceneOptimizer:
                             cameras_gt=cameras_gt,
                             metric_constructed_only=self._merging_options.metric_constructed_only,
                             suffix="_retriangulated",
+                        )
+                    )
+
+                # Post-root-merge boundary recovery: DLT-triangulate boundary global tracks against the
+                # merged cameras, RANSAC-DLT resect unposed cameras against cluster-3D ∪ fresh-3D,
+                # iterate, then one BA. Runs as a single dask task on a worker (like the retri stage).
+                if (
+                    self._use_verified_pipeline
+                    and self._enable_boundary_recovery
+                    and global_tracks_2d
+                    and root_merged_result is not None
+                    and root_merged_result.scene is not None
+                ):
+                    # Intrinsics for cameras NOT in the merged scene: global-Fetzer focals, falling
+                    # back to the loader-initial intrinsics (same precedence as the offline replay).
+                    boundary_intrinsics: dict[int, tuple] = {}
+                    for _idx, _ovd in one_view_data_dict.items():
+                        _cal = None
+                        if global_refined_intrinsics and _idx in global_refined_intrinsics:
+                            _cal = global_refined_intrinsics[_idx]
+                        elif _ovd.intrinsics is not None:
+                            _cal = _ovd.intrinsics
+                        if _cal is not None:
+                            boundary_intrinsics[int(_idx)] = _calibration_to_tuple(_cal)
+                    logger.info(
+                        "🧭 GTSFM: Boundary recovery on %d global 2D tracks vs the merged root scene...",
+                        len(global_tracks_2d),
+                    )
+                    recovered_scene: GtsfmData = client.submit(
+                        _run_boundary_recovery,
+                        root_merged_result.scene,
+                        global_tracks_2d,
+                        self._merging_options,
+                        boundary_intrinsics,
+                        pure=False,
+                    ).result()
+                    recovery_dir = base_output_paths.results / "merged_boundary_recovered"
+                    recovery_dir.mkdir(parents=True, exist_ok=True)
+                    recovered_scene.export_as_colmap_text(recovery_dir)
+                    logger.info(
+                        "🧭 Boundary-recovered scene: %d images, %d cameras, %d tracks → %s",
+                        recovered_scene.number_images(),
+                        len(recovered_scene.get_valid_camera_indices()),
+                        recovered_scene.number_tracks(),
+                        recovery_dir,
+                    )
+                    base_metrics_groups.append(
+                        cluster_merging.compute_merging_metrics(
+                            recovered_scene,
+                            cameras_gt=cameras_gt,
+                            metric_constructed_only=self._merging_options.metric_constructed_only,
+                            suffix="_boundary_recovered",
                         )
                     )
 

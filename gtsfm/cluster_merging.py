@@ -170,15 +170,26 @@ def _lookup_gid(index: tuple[np.ndarray, np.ndarray], cam_idx: int, uv: np.ndarr
 
 
 def _track_gid(track: gtsam.SfmTrack, index: Optional[tuple[np.ndarray, np.ndarray]]) -> int:
-    """Global id of a 3D track = first of its measurements found in the index (-1 if none)."""
+    """Global id of a 3D track = MAJORITY VOTE over ALL of its measurements found in the index (-1 if none).
+
+    First-hit identity was dishonest: a single pixel-bin collision on the first indexed measurement
+    assigned the whole track a foreign gid, minting phantom parent<->child "correspondences" between
+    tracks that share no physical point (offline replay: zero-overlap children showed up with 150
+    matches). Voting over every measurement makes rare collisions harmless — the true identity of the
+    remaining measurements outvotes them — so anchor counts (and the MERGE_GUARD decisions built on
+    them) are honest.
+    """
     if index is None:
         return -1
+    votes: dict[int, int] = {}
     for m_idx in range(track.numberMeasurements()):
         cam_idx, uv = track.measurement(m_idx)
         gid = _lookup_gid(index, cam_idx, uv)
         if gid >= 0:
-            return gid
-    return -1
+            votes[gid] = votes.get(gid, 0) + 1
+    if not votes:
+        return -1
+    return max(votes, key=votes.get)  # type: ignore[arg-type]
 
 
 def _scene_gid_index(scene: Optional[GtsfmData]) -> Optional[tuple[np.ndarray, np.ndarray]]:

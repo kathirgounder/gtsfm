@@ -25,6 +25,7 @@ from gtsfm.cluster_merging import (
 )
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.common.sfm_track import SfmMeasurement, SfmTrack2d
+from gtsfm.scene_optimizer import _dlt_triangulate, _ransac_dlt_resect
 
 NUM_IMAGES = 64
 PARENT_CAMS = [0, 1, 2]
@@ -98,6 +99,34 @@ class TestGidIndex(unittest.TestCase):
         # Both scenes' copies of global track 5 resolve to the same gid through the union index.
         self.assertEqual(_track_gid(parent.get_track(0), union), 5)
         self.assertEqual(_track_gid(child.get_track(0), union), 5)
+
+    def test_track_gid_majority_vote(self) -> None:
+        """A track whose FIRST measurement's pixel bin collides to a different gid still resolves to the
+        majority gid (the old first-hit identity returned the collided gid -> phantom correspondences)."""
+        tracks_2d = [
+            # gid 0: a single measurement in camera 0 whose bin (10, 20) the test track will collide into.
+            SfmTrack2d(measurements=[SfmMeasurement(0, np.array([10.25, 20.75]))]),
+            # gid 1: measurements in cameras 1 and 2 — the test track's TRUE identity.
+            SfmTrack2d(
+                measurements=[
+                    SfmMeasurement(1, np.array([30.25, 40.75])),
+                    SfmMeasurement(2, np.array([50.25, 60.75])),
+                ]
+            ),
+        ]
+        index = slice_gid_index(*build_measurement_gid_arrays(tracks_2d), {0, 1, 2})
+
+        track = SfmTrack(Point3(0.0, 0.0, 0.0))
+        track.addMeasurement(0, np.array([10.9, 20.1]))  # floors to bin (10, 20) -> collides to gid 0
+        track.addMeasurement(1, np.array([30.5, 40.9]))  # -> gid 1
+        track.addMeasurement(2, np.array([50.7, 60.2]))  # -> gid 1
+        # Majority (2 votes gid 1 vs 1 collided vote gid 0) wins; first-hit would have returned 0.
+        self.assertEqual(_track_gid(track, index), 1)
+
+        # And a track with no indexed measurements still resolves to -1.
+        unknown = SfmTrack(Point3(0.0, 0.0, 0.0))
+        unknown.addMeasurement(0, np.array([9999.5, 9999.5]))
+        self.assertEqual(_track_gid(unknown, index), -1)
 
     def test_merge_guard_drops_large_weak_child(self) -> None:
         """A >=30-camera child with too few ID correspondences is dropped (returns parent unchanged)."""
@@ -177,6 +206,57 @@ class TestGidIndex(unittest.TestCase):
         merged = merge_scenes_with_sim3_nonlinear(parent, [child])
         # Escape clause: child kept (its cameras present in the merged scene).
         self.assertTrue(set(child_cams).issubset(set(merged.get_valid_camera_indices())))
+
+
+class TestBoundaryRecoveryGeometry(unittest.TestCase):
+    """Unit tests for the boundary-recovery DLT helpers (ports of the offline-validated exp5 recipe)."""
+
+    def test_dlt_triangulate_recovers_known_point(self) -> None:
+        """3 posed cameras observing a known 3D point: DLT recovers it to <1e-6 with ~0 reprojection."""
+        f, px, py = 500.0, 320.0, 240.0
+        x_true = np.array([0.5, 0.5, 10.0])
+        centers = [np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])]
+        posed, intrinsics, measurements = {}, {}, []
+        for i, center in enumerate(centers):
+            r_w2c = np.eye(3)
+            t_w2c = -r_w2c @ center
+            posed[i] = (r_w2c, t_w2c)
+            intrinsics[i] = (f, 0.0, 0.0, px, py)
+            p = r_w2c @ x_true + t_w2c
+            measurements.append((i, p[0] / p[2] * f + px, p[1] / p[2] * f + py))
+
+        x_rec, err = _dlt_triangulate(measurements, posed, intrinsics)
+        self.assertIsNotNone(x_rec)
+        np.testing.assert_allclose(x_rec, x_true, atol=1e-6)
+        self.assertLess(err, 1e-6)
+
+    def test_ransac_dlt_resect_recovers_known_camera(self) -> None:
+        """Noise-free observations of 60 known 3D points: resection recovers the exact w2c pose."""
+        rng = np.random.default_rng(42)
+        struct = {g: rng.uniform([-2.0, -2.0, 4.0], [2.0, 2.0, 8.0]) for g in range(60)}
+        theta = 0.3
+        r_true = np.array(
+            [
+                [np.cos(theta), 0.0, np.sin(theta)],
+                [0.0, 1.0, 0.0],
+                [-np.sin(theta), 0.0, np.cos(theta)],
+            ]
+        )
+        c_true = np.array([0.5, -0.3, -2.0])
+        t_true = -r_true @ c_true
+        f, px, py = 600.0, 400.0, 300.0
+        observations = []
+        for g, point in struct.items():
+            p = r_true @ point + t_true
+            observations.append((g, p[0] / p[2] * f + px, p[1] / p[2] * f + py))
+
+        result = _ransac_dlt_resect(observations, (f, 0.0, 0.0, px, py), struct)
+        self.assertIsNotNone(result)
+        r_rec, t_rec, c_rec, num_inliers = result
+        self.assertEqual(num_inliers, 60)
+        np.testing.assert_allclose(r_rec, r_true, atol=1e-6)
+        np.testing.assert_allclose(t_rec, t_true, atol=1e-6)
+        np.testing.assert_allclose(c_rec, c_true, atol=1e-6)
 
 
 if __name__ == "__main__":
