@@ -25,8 +25,8 @@ image_pairs_generator:
       _target_: gtsfm.frontend.global_descriptor.MegaLoc
   retriever:
     _target_: gtsfm.retriever.Similarity
-    num_matched: 100
-    min_score: 0.15
+    num_matched: 200  # K is the lever: reference graph median degree 90; covers C_9's 306 bridge edges
+    min_score: 0.10   # threshold study: min_score irrelevant below K~160; 0.10 unlocks deep ranks
   batch_size: 16
 
 graph_partitioner:
@@ -181,7 +181,7 @@ use_verified_pipeline: true
 # mint phantom parent<->child correspondences (offline replay saw zero-overlap children arrive with
 # "150 matches"). With honest anchor counts the MERGE_GUARDs act on real evidence; offline replay of
 # the instrumented ToL drop: strays 54->30, aligned inliers 230->289.
-enable_gid_merge_anchoring: true
+enable_gid_merge_anchoring: false  # peak-structure legacy merge for this A/B (majority-vote fix stays in code)
 # Retri stays OFF; the boundary-recovery stage below is the post-merge structure/camera recovery path.
 run_post_merge_retriangulation: false
 # Post-root-merge boundary recovery (offline-validated exp5 recipe): DLT-triangulate boundary global
@@ -189,4 +189,4 @@ run_post_merge_retriangulation: false
 # cameras (min 10 inliers @4px) against the cluster-3D ∪ fresh-3D UNION (an island camera had 508
 # anchors in cluster-3D vs 95 fresh-only — the union is what makes resection work), iterate, then one
 # BA with the merge ba_options. Requires enable_gid_merge_anchoring (reads merged 3D by global id).
-enable_boundary_recovery: true
+enable_boundary_recovery: false  # off for this experiment; re-enable after retrieval A/B
