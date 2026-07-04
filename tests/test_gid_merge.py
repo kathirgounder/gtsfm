@@ -127,6 +127,39 @@ class TestGidIndex(unittest.TestCase):
         self.assertEqual(merged.number_tracks(), parent.number_tracks())
         self.assertEqual(set(merged.get_valid_camera_indices()), set(PARENT_CAMS))
 
+    def test_structureless_child_dropped_any_size(self) -> None:
+        """A 0-track child is never merged, even with shared cameras (nothing can anchor or verify it)."""
+        parent = _scene(PARENT_CAMS, list(range(20)), point_offset=0.0)
+        child = GtsfmData(number_images=NUM_IMAGES)
+        for k, c in enumerate(PARENT_CAMS + [20, 21]):  # shares ALL parent cameras, but zero tracks
+            child.add_camera(c, PinholeCameraCal3Bundler(Pose3(Rot3(), np.array([k, 0.0, 0.0])), Cal3Bundler()))
+        merged = merge_scenes_with_sim3_nonlinear(parent, [child])
+        self.assertEqual(set(merged.get_valid_camera_indices()), set(PARENT_CAMS))
+
+    def test_overlap_escape_keeps_large_child_with_strong_camera_anchor(self) -> None:
+        """A large child with >=15 shared cameras is KEPT despite low ID-corr (measured: 21-shared seats fine).
+
+        Reproduces the gid-run regression where a 50-cam child with 21 shared cameras and 25 correspondences
+        was dropped, costing Nc with no accuracy gain.
+        """
+        shared = list(range(30, 46))  # 16 shared cameras
+        parent = _scene(PARENT_CAMS + shared, list(range(30)), point_offset=0.0)
+        child_cams = shared + list(range(46, 62))  # 32 cams total, 16 shared
+        child = _scene(child_cams, list(range(5)), point_offset=0.0)  # only 5 matching tracks (< 50 floor)
+
+        # Global tracks must SPAN this test's cameras so both slices resolve (id_mode active).
+        tracks_2d = []
+        for gid in range(30):
+            meas = [SfmMeasurement(c, _uv(gid, c)) for c in PARENT_CAMS + shared + list(range(46, 62))]
+            tracks_2d.append(SfmTrack2d(measurements=meas))
+        arrays = build_measurement_gid_arrays(tracks_2d)
+        annotate_scene_with_metadata(parent, None, None, slice_gid_index(*arrays, set(PARENT_CAMS + shared)))
+        annotate_scene_with_metadata(child, None, None, slice_gid_index(*arrays, set(child_cams)))
+
+        merged = merge_scenes_with_sim3_nonlinear(parent, [child])
+        # Escape clause: child kept (its cameras present in the merged scene).
+        self.assertTrue(set(child_cams).issubset(set(merged.get_valid_camera_indices())))
+
 
 if __name__ == "__main__":
     unittest.main()

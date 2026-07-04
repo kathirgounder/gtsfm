@@ -236,6 +236,8 @@ def _track_max_reprojection_error(scene: GtsfmData, track: gtsam.SfmTrack) -> fl
     if np.isinf(errors).any():
         return float("inf")
     finite_errors = errors[np.isfinite(errors)]
+    if finite_errors.size == 0:  # all-NaN (e.g. every projection failed) — treat as unusable, not a crash
+        return float("inf")
     return float(np.max(finite_errors))
 
 
@@ -374,13 +376,27 @@ def merge_scenes_with_sim3_nonlinear(
         else:
             points = []
 
+        # MERGE_GUARD: a child with NO structure cannot be seated by anything — never merge it (a 36-cam
+        # leaf held by 1 track and 0-track children previously rode in on pose priors and detonated merges).
+        if child_scene.number_tracks() == 0:
+            logger.warning(
+                "MERGE_GUARD: dropping child %d (cams=%d, tracks=0) — structureless reconstruction.",
+                i,
+                len(child_camera_ids),
+            )
+            continue
+
         # MERGE_GUARD (ID mode only, where correspondence count is a complete anchor measure): a large
         # child without a reliable structural tie gets an under-constrained 7-DoF seat -> rigid stray
         # block (ToL: 83 cams seated on 26 correspondences drifted 60-190m). Accuracy > camera count.
+        # OVERLAP ESCAPE: >=15 surviving shared cameras are a strong pose anchor on their own (measured:
+        # a 50-cam child with 21 shared cams seated fine at 25 correspondences; 7-9 shared cams failed) —
+        # dropping such children costs Nc for no accuracy gain.
         if (
             id_mode
             and len(child_camera_ids) >= guard_child_min_cams
             and len(points) < min_sim3_correspondences_large_child
+            and len(common_camera_ids) < 15
         ):
             logger.warning(
                 "MERGE_GUARD: dropping child %d (cams=%d, id_correspondences=%d < %d, shared_cams=%d) — "
@@ -436,6 +452,28 @@ def merge_scenes_with_sim3_nonlinear(
         opt_bSa = result.atSimilarity3(gtsam.Symbol("S", i).key())
         opt_aSb = opt_bSa.inverse()
         opt_aSb_list.append(opt_aSb)
+
+    # MERGE_GUARD scale band: clusters are metric (global Fetzer focals), so a child's solved Sim3 scale
+    # must be ~1. A wild scale means the solve diverged (few/degenerate constraints — e.g. a 9-cam child
+    # on 12 correspondences detonated a merge to 5.7e8 px max reproj); merging it plants a garbage block
+    # that BA can only "fix" by deletion. Drop such children post-solve.
+    kept_children, kept_sim3 = [], []
+    for i, (child_scene, opt_aSb) in enumerate(zip(valid_child_scenes, opt_aSb_list)):
+        s = float(opt_aSb.scale())
+        if not (0.25 <= s <= 4.0):
+            logger.warning(
+                "MERGE_GUARD: dropping child %d post-solve (cams=%d, solved Sim3 scale=%.3g outside [0.25, 4]) "
+                "— diverged seat.",
+                i,
+                len(child_scene.get_valid_camera_indices()),
+                s,
+            )
+            continue
+        kept_children.append(child_scene)
+        kept_sim3.append(opt_aSb)
+    valid_child_scenes, opt_aSb_list = kept_children, kept_sim3
+    if len(valid_child_scenes) == 0:
+        return parent_scene
 
     merged = parent_scene
     for i, aTi in opt_aTi.items():
