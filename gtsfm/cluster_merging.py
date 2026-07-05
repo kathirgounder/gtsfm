@@ -1067,6 +1067,57 @@ def _drop_outlier_tracks(scene: GtsfmData) -> GtsfmData:
     return scene
 
 
+def filter_tracks_by_triangulation_angle(scene: GtsfmData, min_angle_deg: float) -> GtsfmData:
+    """Drop tracks whose maximum pairwise triangulation angle is below ``min_angle_deg``.
+
+    Low-parallax tracks are depth-unconstrained: the reprojection filters cannot see their depth
+    error (it lies along the viewing ray), so they survive BA as fuzz/spray around the structure.
+    Output-side filter only — intended for the final merged scene at export, never inside merging.
+    """
+    if min_angle_deg <= 0:
+        return scene
+    cameras = scene.cameras()
+    centers = {cam_idx: np.asarray(camera.pose().translation(), dtype=float) for cam_idx, camera in cameras.items()}
+
+    retained_tracks = []
+    for track in scene.tracks():
+        track_cams = {int(track.measurement(k)[0]) for k in range(track.numberMeasurements())}
+        cam_centers = np.array([centers[i] for i in track_cams if i in centers])
+        if len(cam_centers) < 2:
+            continue  # <2 posed views: no triangulation support at all
+        rays = cam_centers - np.asarray(track.point3(), dtype=float)
+        norms = np.linalg.norm(rays, axis=1)
+        rays = rays[norms > 1e-9] / norms[norms > 1e-9, None]
+        if len(rays) < 2:
+            continue
+        if len(rays) > 25:  # cap the pairwise cost for long tracks (evenly spaced, deterministic)
+            rays = rays[np.linspace(0, len(rays) - 1, 25).astype(int)]
+        cos_matrix = np.clip(rays @ rays.T, -1.0, 1.0)
+        np.fill_diagonal(cos_matrix, 1.0)
+        if math.degrees(math.acos(float(cos_matrix.min()))) >= min_angle_deg:
+            retained_tracks.append(track)
+
+    removed = scene.number_tracks() - len(retained_tracks)
+    logger.info(
+        "🔭 Triangulation-angle filter (<%.1f deg): dropped %d of %d tracks (%.1f%%).",
+        min_angle_deg,
+        removed,
+        scene.number_tracks(),
+        100.0 * removed / max(scene.number_tracks(), 1),
+    )
+    if removed == 0:
+        return scene
+    filtered = GtsfmData.from_cameras_and_tracks(
+        cameras,
+        retained_tracks,
+        number_images=scene.number_images(),
+        image_info=scene._clone_image_info(),
+        gaussian_splats=scene.get_gaussian_splats(),
+    )
+    _propagate_scene_metadata(filtered, scene)
+    return filtered
+
+
 def _align_and_merge_results(
     result1: GtsfmData,
     result2: GtsfmData,

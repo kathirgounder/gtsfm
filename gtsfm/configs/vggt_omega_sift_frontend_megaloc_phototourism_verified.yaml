@@ -190,3 +190,8 @@ run_post_merge_retriangulation: false
 # anchors in cluster-3D vs 95 fresh-only — the union is what makes resection work), iterate, then one
 # BA with the merge ba_options. Requires enable_gid_merge_anchoring (reads merged 3D by global id).
 enable_boundary_recovery: false  # off for this experiment; re-enable after retrieval A/B
+# Export an angle-filtered copy of the final merged scene (merged_anglefiltered/) dropping tracks
+# whose max pairwise triangulation angle is under this (COLMAP's default cutoff). Validated on the
+# 120/0.15 ToL drop: killed 16% of tracks — almost entirely the low-parallax fuzz/spray that passes
+# the 3px reproj filter with unconstrained depth. Output-side only; merged/ is still written unfiltered.
+min_triangulation_angle_deg: 1.5

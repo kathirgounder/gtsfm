@@ -486,6 +486,12 @@ class SceneOptimizer:
         # cluster-3D ∪ fresh-3D union, iterate, then one BA. Requires the gid sidecar
         # (enable_gid_merge_anchoring) to read the merged scene's 3D by global identity.
         enable_boundary_recovery: bool = False,
+        # Export-time low-parallax track filter (0 = off). Tracks whose max pairwise triangulation
+        # angle is below this are depth-unconstrained: they pass the reprojection filters (reproj
+        # error is blind to depth error along the ray) yet scatter as fuzz/spray around the
+        # structure. ToL 120/0.15 audit: 16% of merged tracks sat below 1.5deg (COLMAP's default
+        # cutoff). Output-side only — merges, poses, and BA never see it.
+        min_triangulation_angle_deg: float = 0.0,
     ) -> None:
         self.loader = loader
         self.image_pairs_generator = image_pairs_generator
@@ -499,6 +505,7 @@ class SceneOptimizer:
         self._enable_gid_merge_anchoring = enable_gid_merge_anchoring
         self._run_post_merge_retriangulation = run_post_merge_retriangulation
         self._enable_boundary_recovery = enable_boundary_recovery
+        self._min_triangulation_angle_deg = min_triangulation_angle_deg
         # Propagate metric_constructed_only to the cluster optimizer if it supports it.
         if hasattr(self.cluster_optimizer, "_metric_constructed_only"):
             setattr(self.cluster_optimizer, "_metric_constructed_only", self._merging_options.metric_constructed_only)
@@ -999,6 +1006,35 @@ class SceneOptimizer:
                             cameras_gt=cameras_gt,
                             metric_constructed_only=self._merging_options.metric_constructed_only,
                             suffix="_boundary_recovered",
+                        )
+                    )
+
+                # Export-time low-parallax cleanup: write an angle-filtered copy of the final merged
+                # scene alongside merged/ (the unfiltered export stays for A/B). Poses/merges untouched.
+                if (
+                    self._use_verified_pipeline
+                    and self._min_triangulation_angle_deg > 0
+                    and root_merged_result is not None
+                    and root_merged_result.scene is not None
+                ):
+                    angle_filtered = cluster_merging.filter_tracks_by_triangulation_angle(
+                        root_merged_result.scene, self._min_triangulation_angle_deg
+                    )
+                    angle_dir = base_output_paths.results / "merged_anglefiltered"
+                    angle_dir.mkdir(parents=True, exist_ok=True)
+                    angle_filtered.export_as_colmap_text(angle_dir)
+                    logger.info(
+                        "🔭 Angle-filtered scene (>=%.1f deg): %d tracks → %s",
+                        self._min_triangulation_angle_deg,
+                        angle_filtered.number_tracks(),
+                        angle_dir,
+                    )
+                    base_metrics_groups.append(
+                        cluster_merging.compute_merging_metrics(
+                            angle_filtered,
+                            cameras_gt=cameras_gt,
+                            metric_constructed_only=self._merging_options.metric_constructed_only,
+                            suffix="_anglefiltered",
                         )
                     )
 
