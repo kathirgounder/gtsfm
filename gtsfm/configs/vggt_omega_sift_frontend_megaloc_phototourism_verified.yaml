@@ -25,8 +25,8 @@ image_pairs_generator:
       _target_: gtsfm.frontend.global_descriptor.MegaLoc
   retriever:
     _target_: gtsfm.retriever.Similarity
-    num_matched: 200  # K is the lever: reference graph median degree 90; covers C_9's 306 bridge edges
-    min_score: 0.10   # threshold study: min_score irrelevant below K~160; 0.10 unlocks deep ranks
+    num_matched: 120  # K is the lever (validated live 2026-07-05: the mis-seated block at K=60 seats at K=120
+    min_score: 0.15   # — its bridge edges rank 60-300; ~52k pairs vs 114k at 200/0.10, same structural win)
   batch_size: 16
 
 graph_partitioner:
