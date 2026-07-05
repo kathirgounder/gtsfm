@@ -103,6 +103,14 @@ cluster_optimizer:
     post_ba_max_reproj_error: 3.0
     drop_camera_with_no_track: false
     min_track_length: 3
+    # PER-CLUSTER BA OFF (ToL census, 2026-07-06): grading every cluster of the 120/0.15 drop against
+    # 1DSfM GT showed the cluster BA DEGRADED 7/8 clusters (median 2.90 -> 4.34m; C_4 0.86 -> 3.23m,
+    # C_9_1 11.4 -> 19.7m) while raw VGGT-Omega + global-Fetzer K was the most accurate version of
+    # every healthy cluster. Mechanism: pre-BA structure reprojects at ~4px (intrinsics-model error);
+    # with focals pinned the BA resolves it by moving the free poses — px gains, meter losses. With BA
+    # off, every cluster ships bit-identical Fetzer intrinsics per camera (best case for Sim3 merges)
+    # and the pose-pinned merge BA does the polishing. Flip to true to A/B against the old behavior.
+    run_per_cluster_ba: false
     input_mode: crop
     seed: 42
     # false => our optimizer's VGGT loader is bypassed and predict() is called with model=None, so the

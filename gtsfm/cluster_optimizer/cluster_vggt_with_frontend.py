@@ -365,6 +365,11 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         # identical, so it is a pure speedup. Requires the verified pipeline; falls back to the per-cluster
         # frontend when the globals are absent.
         reuse_global_correspondences: bool = False,
+        # Run the per-cluster pose+structure BA. OFF keeps raw VGGT poses + global-Fetzer intrinsics
+        # verbatim (ToL census: the BA degraded 7/8 clusters vs GT by resolving the ~4px pose/Fetzer-K
+        # inconsistency through the free poses); structure polishing then happens only in the
+        # pose-pinned merge BAs.
+        run_per_cluster_ba: bool = True,
     ) -> None:
         super().__init__(
             correspondence_generator=correspondence_generator,
@@ -388,6 +393,7 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         self._use_multi_view_retriangulation = use_multi_view_retriangulation
         self._use_triangulated_structure = use_triangulated_structure
         self._reuse_global_correspondences = reuse_global_correspondences
+        self._run_per_cluster_ba = run_per_cluster_ba
 
         self._weights_path = Path(weights_path) if weights_path is not None else None
         self._loader_kwargs: dict[str, Any] = {}
@@ -427,7 +433,8 @@ class ClusterVGGTWithFrontend(ClusterMVO):
             f"tri={self._use_triangulated_structure}"
             f"{'/allkpts' if not self._use_triangulated_structure else ''}"
             f"{'/gcorr' if self._reuse_global_correspondences else ''},"
-            f"mvr={self._use_multi_view_retriangulation})",
+            f"mvr={self._use_multi_view_retriangulation},"
+            f"clusterba={self._run_per_cluster_ba})",
         ]
         return "ClusterVGGTWithFrontend(\n  " + ",\n  ".join(components) + "\n)"
 
@@ -564,6 +571,7 @@ class ClusterVGGTWithFrontend(ClusterMVO):
             cluster_label=context.label,
             tracks_2d=tracks_2d_graph,
             use_multi_view_retriangulation=self._use_multi_view_retriangulation,
+            run_bundle_adjustment=self._run_per_cluster_ba,
         )
 
         # 7. Metrics + I/O.
