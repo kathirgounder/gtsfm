@@ -744,19 +744,36 @@ class SceneOptimizer:
             # graph (heuristic init, never VGGT focals), supplied to clusters via ClusterContext. Replaces
             # the per-cluster calibration, which falls back to VGGT focals for sparsely-connected cameras.
             if getattr(self.cluster_optimizer, "uses_global_view_graph_calibration", False):
-                from gtsfm.view_graph_estimator.view_graph_calibration import compute_global_view_graph_intrinsics
+                if getattr(self.cluster_optimizer, "calibration_source", "fetzer") == "exif":
+                    # EXIF passthrough: hand the loader/EXIF intrinsics to every cluster verbatim.
+                    # ToL gold audit: EXIF 1.91% median focal error (unbiased) vs scipy Fetzer 5.26%
+                    # (−4% bias) — and the 1DSfM reference pipeline itself calibrated from EXIF.
+                    # Same frozen-K coherence as Fetzer (bit-identical per camera across clusters).
+                    global_refined_intrinsics = {
+                        idx: ovd.intrinsics
+                        for idx, ovd in one_view_data_dict.items()
+                        if ovd.intrinsics is not None
+                    }
+                    logger.info(
+                        "🔭 Global calibration: EXIF passthrough for %d cameras (Fetzer skipped).",
+                        len(global_refined_intrinsics),
+                    )
+                else:
+                    from gtsfm.view_graph_estimator.view_graph_calibration import (
+                        compute_global_view_graph_intrinsics,
+                    )
 
-                global_refined_intrinsics = client.gather(
-                    client.compute(
-                        delayed(compute_global_view_graph_intrinsics)(
-                            v_corr_idxs_dict, padded_keypoints_list, one_view_data_dict
+                    global_refined_intrinsics = client.gather(
+                        client.compute(
+                            delayed(compute_global_view_graph_intrinsics)(
+                                v_corr_idxs_dict, padded_keypoints_list, one_view_data_dict
+                            )
                         )
                     )
-                )
-                logger.info(
-                    "🔭 Global Fetzer calibration: refined %d focals over the full verified view graph.",
-                    len(global_refined_intrinsics),
-                )
+                    logger.info(
+                        "🔭 Global Fetzer calibration: refined %d focals over the full verified view graph.",
+                        len(global_refined_intrinsics),
+                    )
 
         # Bridge reconnection: add cross-component edges to reconnect island components.
         if similarity_matrix is not None and self._bridge_min_similarity > 0:

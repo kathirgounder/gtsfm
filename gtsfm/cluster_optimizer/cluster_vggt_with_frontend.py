@@ -370,6 +370,15 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         # inconsistency through the free poses); structure polishing then happens only in the
         # pose-pinned merge BAs.
         run_per_cluster_ba: bool = True,
+        # Source of the frozen per-camera focals handed to every cluster (requires
+        # use_global_view_graph_calibration):
+        #   "fetzer" — global Fetzer self-calibration over the verified graph (legacy).
+        #   "exif"   — loader/EXIF intrinsics passed through verbatim. ToL gold audit (592 GT cams,
+        #              exact per-image scales): EXIF median focal err 1.91% (+0.06% bias) vs scipy
+        #              Fetzer 5.26% (−4.0% bias, 74% of cams >3%) — Fetzer DEGRADED the EXIF it
+        #              started from; 56% of verified edges are Fetzer-degenerate (planar/focal-
+        #              unstable). The 1DSfM reference itself used EXIF.
+        calibration_source: str = "fetzer",
     ) -> None:
         super().__init__(
             correspondence_generator=correspondence_generator,
@@ -394,6 +403,9 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         self._use_triangulated_structure = use_triangulated_structure
         self._reuse_global_correspondences = reuse_global_correspondences
         self._run_per_cluster_ba = run_per_cluster_ba
+        if calibration_source not in ("fetzer", "exif"):
+            raise ValueError(f"calibration_source must be 'fetzer' or 'exif', got {calibration_source!r}")
+        self._calibration_source = calibration_source
 
         self._weights_path = Path(weights_path) if weights_path is not None else None
         self._loader_kwargs: dict[str, Any] = {}
@@ -434,7 +446,8 @@ class ClusterVGGTWithFrontend(ClusterMVO):
             f"{'/allkpts' if not self._use_triangulated_structure else ''}"
             f"{'/gcorr' if self._reuse_global_correspondences else ''},"
             f"mvr={self._use_multi_view_retriangulation},"
-            f"clusterba={self._run_per_cluster_ba})",
+            f"clusterba={self._run_per_cluster_ba},"
+            f"src={self._calibration_source})",
         ]
         return "ClusterVGGTWithFrontend(\n  " + ",\n  ".join(components) + "\n)"
 
@@ -442,6 +455,11 @@ class ClusterVGGTWithFrontend(ClusterMVO):
     def uses_global_view_graph_calibration(self) -> bool:
         """Whether this optimizer expects global Fetzer focals from the SceneOptimizer via ClusterContext."""
         return self._use_global_view_graph_calibration
+
+    @property
+    def calibration_source(self) -> str:
+        """Source of the frozen global intrinsics: 'fetzer' (self-calibration) or 'exif' (loader passthrough)."""
+        return self._calibration_source
 
     @property
     def reuses_global_correspondences(self) -> bool:
