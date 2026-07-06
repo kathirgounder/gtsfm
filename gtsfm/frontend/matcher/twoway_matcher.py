@@ -134,7 +134,12 @@ class TwoWayMatcher(MatcherBase):
 
         if self._ratio_test_threshold is not None:
             all_matches = opencv_matcher.knnMatch(descriptors_1, descriptors_2, k=2)
-            matches = [m1 for m1, m2 in all_matches if m1.distance <= self._ratio_test_threshold * m2.distance]
+            # knnMatch(k=2) yields <2 candidates per query when the train side has <2 descriptors
+            # (near-featureless internet images) — those queries cannot pass a ratio test; skip them.
+            matches = [
+                m[0] for m in all_matches
+                if len(m) == 2 and m[0].distance <= self._ratio_test_threshold * m[1].distance
+            ]
         else:
             matches = opencv_matcher.match(descriptors_1, descriptors_2)
 
