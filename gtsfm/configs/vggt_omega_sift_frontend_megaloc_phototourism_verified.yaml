@@ -103,14 +103,15 @@ cluster_optimizer:
     post_ba_max_reproj_error: 3.0
     drop_camera_with_no_track: false
     min_track_length: 3
-    # PER-CLUSTER BA OFF (ToL census, 2026-07-06): grading every cluster of the 120/0.15 drop against
-    # 1DSfM GT showed the cluster BA DEGRADED 7/8 clusters (median 2.90 -> 4.34m; C_4 0.86 -> 3.23m,
-    # C_9_1 11.4 -> 19.7m) while raw VGGT-Omega + global-Fetzer K was the most accurate version of
-    # every healthy cluster. Mechanism: pre-BA structure reprojects at ~4px (intrinsics-model error);
-    # with focals pinned the BA resolves it by moving the free poses — px gains, meter losses. With BA
-    # off, every cluster ships bit-identical Fetzer intrinsics per camera (best case for Sim3 merges)
-    # and the pose-pinned merge BA does the polishing. Flip to true to A/B against the old behavior.
-    run_per_cluster_ba: false
+    # PER-CLUSTER BA back ON (2026-07-06 live A/B): the BA-off arm regressed — lost bridge, new
+    # floaters, flipped cameras. The census (BA degraded 7/8 clusters' survivor accuracy) was real
+    # but had SURVIVOR BIAS: cluster BA + its 3px post-filter is also the pipeline's main early
+    # CULLING stage (flipped/garbage VGGT cameras lose their tracks there and die; without it they
+    # ride to the final model as floaters/flips, and merge BAs exclude rather than fix low-track
+    # cams). Keep BA for its culling; the accuracy damage it caused shrinks with EXIF K (the ~4px
+    # inconsistency it mis-attributed to poses was largely Fetzer focal error). BA-off remains a
+    # research direction pending a replacement culling stage (post-cluster consistency filter).
+    run_per_cluster_ba: true
     input_mode: crop
     seed: 42
     # false => our optimizer's VGGT loader is bypassed and predict() is called with model=None, so the
@@ -177,11 +178,10 @@ merging_options:
     # optimize POSES, not focals. Without this the free-focal BA distorts good focals (0.9-2.4% -> up to
     # 100% err vs GLOMAP) to absorb Sim3 pose error, inflating reproj and dropping cameras at the 3px filter.
     use_calibration_prior: true
-    # Tightened 10 -> 2 (2026-07-06): merge BAs were measured forking duplicated cameras' focals by
-    # 9px median / 386px max across sibling branches (each level re-anchors at current values —
-    # a random walk). With unbiased EXIF K arriving, hold it nearly frozen through the tree; the
-    # top-level merge BA remains the single pooled refinement point.
-    calibration_prior_focal_sigma: 2.0
+    # Back to 10 (2026-07-06): σ=2 was part of the regressed BA-off arm (less room for the pinned
+    # merge BA to polish -> structure loss at the 3px filters -> bridge child starved+dropped).
+    # σ=10 is the proven golden-run value. Revisit tightening only with a merge-survival guard.
+    calibration_prior_focal_sigma: 10.0
     use_pose_prior_all_cameras: true
     use_gnc: false
     gnc_loss: TLS
