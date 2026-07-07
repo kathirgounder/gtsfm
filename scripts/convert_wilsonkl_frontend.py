@@ -34,6 +34,7 @@ def main() -> None:
 
     # ---- coords.txt: per-image keypoints in ORIGINAL pixel frame + original dims ----
     kp = {}  # img -> np.ndarray (N,2) in loader frame
+    dims = {}  # img -> (loader_w, loader_h) expected at run time (EXIF-rotation guard)
     header_re = re.compile(r"#index = (\d+),.*?keys = (\d+), px = ([\d.]+), py = ([\d.]+)")
     cur_img, cur_rows, scale_uv = None, None, (1.0, 1.0)
 
@@ -49,8 +50,9 @@ def main() -> None:
                 cur_img = int(m.group(1))
                 px, py = float(m.group(3)), float(m.group(4))
                 w0, h0 = 2 * px, 2 * py
-                su, sv, _, _ = get_downsampling_factor_per_axis(int(h0), int(w0), args.max_resolution)
+                su, sv, new_h, new_w = get_downsampling_factor_per_axis(int(h0), int(w0), args.max_resolution)
                 scale_uv = (su, sv)
+                dims[cur_img] = (new_w, new_h)
                 cur_rows = []
             else:
                 p = line.split()
@@ -108,10 +110,13 @@ def main() -> None:
     for k, e in enumerate(E):
         corr_offsets[k + 1] = corr_offsets[k] + len(corr[e])
     corr_flat = np.concatenate([corr[e] for e in E]) if E else np.zeros((0, 2), np.int32)
+    img_dims = np.full((n_images, 2), -1, dtype=np.int32)
+    for i, (w, h) in dims.items():
+        img_dims[i] = (w, h)
     np.savez_compressed(
         args.output, n_images=n_images, kp_offsets=kp_offsets, kp_flat=kp_flat,
         edges=edge_arr, corr_offsets=corr_offsets, corr_flat=corr_flat,
-        max_resolution=args.max_resolution,
+        max_resolution=args.max_resolution, img_dims=img_dims,
     )
     print(f"[+{time.time()-t0:.0f}s] wrote {args.output}")
 

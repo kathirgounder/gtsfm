@@ -98,7 +98,7 @@ def _finalize_io_tasks(*_args: object) -> None:
     return None
 
 
-def _load_precomputed_frontend(path: str, num_images: int):
+def _load_precomputed_frontend(path: str, num_images: int, expected_dims=None, max_resolution=None):
     """Load a precomputed frontend (scripts/convert_wilsonkl_frontend.py output).
 
     Returns (padded_keypoints_list, v_corr_idxs_dict) — the exact products of the global
@@ -112,10 +112,30 @@ def _load_precomputed_frontend(path: str, num_images: int):
     n = int(z["n_images"])
     if n > num_images:
         raise ValueError(f"precomputed frontend covers {n} images but loader has {num_images}")
+    if max_resolution is not None and "max_resolution" in z and int(z["max_resolution"]) != int(max_resolution):
+        raise ValueError(
+            f"precomputed frontend was converted at max_resolution={int(z['max_resolution'])} "
+            f"but this run uses {int(max_resolution)} — reconvert."
+        )
+    # EXIF-rotation guard: the benchmark's coords are in Bundler's raw pixel frame; our loader
+    # applies EXIF transpose. Drop images whose loader-frame dims disagree with the converter's
+    # expectation (their keypoints would be transposed -> silent geometric poison otherwise).
+    dropped_imgs = set()
+    if expected_dims is not None and "img_dims" in z:
+        img_dims = z["img_dims"]
+        for i, (w, h) in expected_dims.items():
+            if i < n and img_dims[i][0] > 0:
+                if abs(int(img_dims[i][0]) - int(w)) > 2 or abs(int(img_dims[i][1]) - int(h)) > 2:
+                    dropped_imgs.add(i)
+        if dropped_imgs:
+            logger.warning(
+                "📦 Precomputed frontend: dropping %d image(s) whose loader dims mismatch the "
+                "converted frame (EXIF-rotation / different source files).", len(dropped_imgs)
+            )
     kp_offsets, kp_flat = z["kp_offsets"], z["kp_flat"]
     keypoints_list = []
     for i in range(num_images):
-        if i < n:
+        if i < n and i not in dropped_imgs:
             a, b = int(kp_offsets[i]), int(kp_offsets[i + 1])
             keypoints_list.append(Keypoints(coordinates=kp_flat[a:b].astype(np.float64)))
         else:
@@ -123,8 +143,11 @@ def _load_precomputed_frontend(path: str, num_images: int):
     edges, corr_offsets, corr_flat = z["edges"], z["corr_offsets"], z["corr_flat"]
     v_corr_idxs_dict = {}
     for k in range(len(edges)):
+        i1, i2 = int(edges[k][0]), int(edges[k][1])
+        if i1 in dropped_imgs or i2 in dropped_imgs:
+            continue
         a, b = int(corr_offsets[k]), int(corr_offsets[k + 1])
-        v_corr_idxs_dict[(int(edges[k][0]), int(edges[k][1]))] = corr_flat[a:b]
+        v_corr_idxs_dict[(i1, i2)] = corr_flat[a:b]
     return keypoints_list, v_corr_idxs_dict
 
 
@@ -663,8 +686,16 @@ class SceneOptimizer:
                     "📦 Loading precomputed frontend from %s (SIFT/matching/two-view skipped).",
                     self._precomputed_frontend_path,
                 )
+                _expected_dims = {
+                    int(_i): (2.0 * _ovd.intrinsics.px(), 2.0 * _ovd.intrinsics.py())
+                    for _i, _ovd in one_view_data_dict.items()
+                    if _ovd.intrinsics is not None
+                }
                 padded_keypoints_list, v_corr_idxs_dict = _load_precomputed_frontend(
-                    self._precomputed_frontend_path, num_images
+                    self._precomputed_frontend_path,
+                    num_images,
+                    expected_dims=_expected_dims,
+                    max_resolution=getattr(self.loader, "_max_resolution", None),
                 )
             elif getattr(corr_gen, "produces_verified_correspondences", False):
                 # COLMAP-DB frontend: read the already-verified keypoints + matches straight from the
