@@ -98,6 +98,36 @@ def _finalize_io_tasks(*_args: object) -> None:
     return None
 
 
+def _load_precomputed_frontend(path: str, num_images: int):
+    """Load a precomputed frontend (scripts/convert_wilsonkl_frontend.py output).
+
+    Returns (padded_keypoints_list, v_corr_idxs_dict) — the exact products of the global
+    verification stage. The 1DSfM benchmark ships the frontend all published methods consumed
+    (EGs/coords/tracks); consuming it skips retrieval + SIFT + matching + two-view entirely
+    and makes comparisons to the published table rows share identical two-view inputs.
+    """
+    from gtsfm.common.keypoints import Keypoints
+
+    z = np.load(path)
+    n = int(z["n_images"])
+    if n > num_images:
+        raise ValueError(f"precomputed frontend covers {n} images but loader has {num_images}")
+    kp_offsets, kp_flat = z["kp_offsets"], z["kp_flat"]
+    keypoints_list = []
+    for i in range(num_images):
+        if i < n:
+            a, b = int(kp_offsets[i]), int(kp_offsets[i + 1])
+            keypoints_list.append(Keypoints(coordinates=kp_flat[a:b].astype(np.float64)))
+        else:
+            keypoints_list.append(Keypoints(coordinates=np.zeros((0, 2))))
+    edges, corr_offsets, corr_flat = z["edges"], z["corr_offsets"], z["corr_flat"]
+    v_corr_idxs_dict = {}
+    for k in range(len(edges)):
+        a, b = int(corr_offsets[k]), int(corr_offsets[k + 1])
+        v_corr_idxs_dict[(int(edges[k][0]), int(edges[k][1]))] = corr_flat[a:b]
+    return keypoints_list, v_corr_idxs_dict
+
+
 def _run_post_merge_retriangulation(
     scene: GtsfmData,
     tracks_2d: list,
@@ -492,6 +522,11 @@ class SceneOptimizer:
         # structure. ToL 120/0.15 audit: 16% of merged tracks sat below 1.5deg (COLMAP's default
         # cutoff). Output-side only — merges, poses, and BA never see it.
         min_triangulation_angle_deg: float = 0.0,
+        # Path to a precomputed-frontend npz (scripts/convert_wilsonkl_frontend.py). When set, the
+        # global frontend (SIFT/matching/two-view) is skipped and these keypoints + verified
+        # correspondences are used instead — the standard 1DSfM protocol, where all published
+        # methods consume the benchmark's released view graph and tracks.
+        precomputed_frontend_path: Optional[str] = None,
     ) -> None:
         self.loader = loader
         self.image_pairs_generator = image_pairs_generator
@@ -506,6 +541,7 @@ class SceneOptimizer:
         self._run_post_merge_retriangulation = run_post_merge_retriangulation
         self._enable_boundary_recovery = enable_boundary_recovery
         self._min_triangulation_angle_deg = min_triangulation_angle_deg
+        self._precomputed_frontend_path = precomputed_frontend_path
         # Propagate metric_constructed_only to the cluster optimizer if it supports it.
         if hasattr(self.cluster_optimizer, "_metric_constructed_only"):
             setattr(self.cluster_optimizer, "_metric_constructed_only", self._merging_options.metric_constructed_only)
@@ -618,7 +654,19 @@ class SceneOptimizer:
             # caches, so subsequent per-cluster frontends cache-hit). _run_two_view_estimation already
             # filters to result.valid().
             corr_gen = self.cluster_optimizer.correspondence_generator
-            if getattr(corr_gen, "produces_verified_correspondences", False):
+            if self._precomputed_frontend_path:
+                # Benchmark-released frontend (e.g. 1DSfM EGs/coords/tracks via
+                # scripts/convert_wilsonkl_frontend.py): the exact two-view inputs the published
+                # table rows consumed. Skips SIFT + matching + two-view entirely. NOTE: keypoints
+                # must be in the SAME loader frame (max_resolution) as this run's config.
+                logger.info(
+                    "📦 Loading precomputed frontend from %s (SIFT/matching/two-view skipped).",
+                    self._precomputed_frontend_path,
+                )
+                padded_keypoints_list, v_corr_idxs_dict = _load_precomputed_frontend(
+                    self._precomputed_frontend_path, num_images
+                )
+            elif getattr(corr_gen, "produces_verified_correspondences", False):
                 # COLMAP-DB frontend: read the already-verified keypoints + matches straight from the
                 # database in the main process. No Dask two-view estimation and — crucially — no
                 # client.gather of all per-edge results, the step that OOM-killed workers at scale.
