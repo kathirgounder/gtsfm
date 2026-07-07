@@ -104,6 +104,11 @@ class TwoWayMatcher(MatcherBase):
     def __perform_matching(self, descriptors_1: np.ndarray, descriptors_2: np.ndarray) -> np.ndarray:
         """Run the core logic for matching.
 
+        NOTE: cv2's BFMatcher parallelizes internally over the GLOBAL OpenCV thread pool, which
+        defaults to all cores — with N dask workers that is N full-node thread pools thrashing
+        each other (same oversubscription bug as pycolmap SIFT num_threads=-1, fixed 818f7b4f).
+        Parallelism comes from dask workers; each matcher task must stay single-threaded.
+
         Args:
             descriptors_1: descriptors for the 1st image.
             descriptors_2: descriptors for the 2nd image.
@@ -111,6 +116,8 @@ class TwoWayMatcher(MatcherBase):
         Returns:
             indices of the match between two images.
         """
+        cv.setNumThreads(1)  # idempotent; must run in the WORKER process (init doesn't re-run there)
+
         match_indices_1to2: Dict[int, int] = self.__perform_oneway_matching(descriptors_1, descriptors_2)
         match_indices_2to1: Dict[int, int] = self.__perform_oneway_matching(descriptors_2, descriptors_1)
 
