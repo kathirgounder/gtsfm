@@ -550,6 +550,11 @@ class SceneOptimizer:
         # correspondences are used instead — the standard 1DSfM protocol, where all published
         # methods consume the benchmark's released view graph and tracks.
         precomputed_frontend_path: Optional[str] = None,
+        # Path to a pair-list file (e.g. a 1DSfM EGs.txt; any lines starting with two integer image
+        # ids). Skips retrieval and runs OUR full frontend (SIFT/matching/two-view) on exactly these
+        # pairs — the accuracy of an own-frontend run at a fraction of the matching cost, since
+        # every pair is known-productive. Ignored when precomputed_frontend_path is set.
+        precomputed_pairs_path: Optional[str] = None,
     ) -> None:
         self.loader = loader
         self.image_pairs_generator = image_pairs_generator
@@ -565,6 +570,7 @@ class SceneOptimizer:
         self._enable_boundary_recovery = enable_boundary_recovery
         self._min_triangulation_angle_deg = min_triangulation_angle_deg
         self._precomputed_frontend_path = precomputed_frontend_path
+        self._precomputed_pairs_path = precomputed_pairs_path
         # Propagate metric_constructed_only to the cluster optimizer if it supports it.
         if hasattr(self.cluster_optimizer, "_metric_constructed_only"):
             setattr(self.cluster_optimizer, "_metric_constructed_only", self._merging_options.metric_constructed_only)
@@ -1161,6 +1167,32 @@ class SceneOptimizer:
     def _run_retriever(
         self, client: Client, output_paths: OutputPaths
     ) -> tuple[GtsfmMetricsGroup, VisibilityGraph, Optional[object]]:
+        # Precomputed pair list (e.g. a 1DSfM EGs.txt): skip retrieval entirely and hand the
+        # frontend exactly the benchmark's productive pairs — full-quality SIFT/matching/two-view
+        # runs on only these. Any text file whose lines start with two integer image ids works.
+        if self._precomputed_pairs_path:
+            pairs = set()
+            n_img = len(self.loader)
+            with open(self._precomputed_pairs_path) as f:
+                for line in f:
+                    p = line.split()
+                    if len(p) >= 2:
+                        try:
+                            a, b = int(p[0]), int(p[1])
+                        except ValueError:
+                            continue
+                        if a != b and 0 <= a < n_img and 0 <= b < n_img:
+                            pairs.add((min(a, b), max(a, b)))
+            visibility_graph = sorted(pairs)
+            logger.info(
+                "📦 Precomputed pair list: %d pairs from %s (retrieval skipped).",
+                len(visibility_graph), self._precomputed_pairs_path,
+            )
+            metrics = GtsfmMetricsGroup(
+                "retriever_metrics", [GtsfmMetric("num_retrieved_pairs", len(visibility_graph))]
+            )
+            return metrics, visibility_graph, None
+
         # TODO(Frank): refactor to move more of this logic into ImagePairsGenerator
         retriever_start_time = time.time()
         batch_size = self.image_pairs_generator._batch_size
