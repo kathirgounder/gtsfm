@@ -89,11 +89,11 @@ class MergingOptions:
     min_sim3_correspondences_large_child: int = 50
     ba_options: BundleAdjustmentOptions = field(default_factory=BundleAdjustmentOptions)
     # Post-merge retriangulation BA mode. When retri_free_ba is True the retri BA drops the
-    # calibration/pose priors and runs GNC — a fully-free final solve (GLOMAP-style): the priors that
-    # protect the incremental merges throttle the full-scene BA, which otherwise locks in the accuracy
-    # (BM offline replay: full AUC@3 0.232->0.546 on the same merged input). retri_iterations>1 alternates
-    # retriangulation with the free BA (retriangulating against improved poses recovers tri-failed tracks).
-    # Defaults preserve existing behavior (merge ba_options, single pass).
+    # calibration/pose priors — a fully-free final solve (GLOMAP-style): the priors that protect the
+    # incremental merges throttle the full-scene BA, which otherwise locks in the accuracy (BM offline
+    # replay: constructed AUC@10 0.770->0.806 on the same input; robust kernel/GNC inherited from
+    # ba_options). retri_iterations>1 re-triangulates against the improved poses between BAs — only
+    # worth it when the merged input is poor. Defaults preserve existing behavior.
     retri_free_ba: bool = False
     retri_iterations: int = 1
 

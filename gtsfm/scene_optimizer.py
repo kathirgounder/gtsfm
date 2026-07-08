@@ -186,18 +186,16 @@ def _run_post_merge_retriangulation(
     ba_options = options.ba_options
     if options.retri_free_ba:
         # Fully-free final solve (GLOMAP-style): the calibration/pose priors that protect the
-        # incremental merges throttle the full-scene BA; dropped here, with GNC for outliers.
+        # incremental merges throttle the full-scene BA — dropped here. Robustness (robust kernel /
+        # GNC) is inherited from ba_options unchanged.
         from dataclasses import replace as _dc_replace
 
         ba_options = _dc_replace(
             ba_options,
             use_calibration_prior=False,
             use_pose_prior_all_cameras=False,
-            use_gnc=True,
-            gnc_loss="TLS",
-            factor_weight_outlier_threshold=1e-6,
         )
-        logger.info("🔓 Post-merge retri BA running FREE (no calib/pose priors, GNC on).")
+        logger.info("🔓 Post-merge retri BA running FREE (no calib/pose priors).")
 
     refined = scene
     for retri_iter in range(max(1, options.retri_iterations)):
