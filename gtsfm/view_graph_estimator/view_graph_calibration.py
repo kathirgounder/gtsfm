@@ -28,7 +28,11 @@ except ImportError:  # pragma: no cover
 # wheels do not. The solver uses it when present and falls back to scipy otherwise — the ToL gold
 # A/B showed the GATES carry the improvement (13.25% -> 5.32% median focal error on identical
 # inputs), with the solver choice secondary.
-_HAS_SELFCAL_FACTOR = hasattr(gtsam, "SelfCalibrationFactor")
+# The closed-form focal factor is named SelfCalibrationFactor in current gtsam-develop and
+# FetzerFactor in pre-rename builds; older builds also store the focal variables as Vector1
+# instead of double. _solve_focals handles both names and both storage conventions.
+_SELFCAL_FACTOR_CLS = getattr(gtsam, "SelfCalibrationFactor", None) or getattr(gtsam, "FetzerFactor", None)
+_HAS_SELFCAL_FACTOR = _SELFCAL_FACTOR_CLS is not None
 # COLMAP EstimateTwoViewGeometry model-selection threshold: PLANAR if H explains almost as many
 # correspondences as F. Planar/panoramic pairs drive the closed-form Fetzer residual to its poles.
 _MAX_H_INLIER_RATIO = 0.8
@@ -122,7 +126,9 @@ def _solve_focals(edges, cam_idx_to_var_idx, precomputed, initial_focals, jac_sp
     """Joint focal solve: gtsam SelfCalibrationFactor graph (Cauchy 0.01, GLOMAP-matched) when the
     custom build provides it, else scipy least_squares with Cauchy loss. Returns (focals, info)."""
     if _HAS_SELFCAL_FACTOR:
-        try:
+        sorted_cams = sorted(cam_idx_to_var_idx, key=cam_idx_to_var_idx.get)
+
+        def _gtsam_solve(as_vector: bool):
             graph = gtsam.NonlinearFactorGraph()
             edge_noise = gtsam.noiseModel.Robust.Create(
                 gtsam.noiseModel.mEstimator.Cauchy.Create(0.01),
@@ -130,24 +136,35 @@ def _solve_focals(edges, cam_idx_to_var_idx, precomputed, initial_focals, jac_sp
             )
             for cam1, cam2, F, pp1, pp2 in edges:
                 graph.add(
-                    gtsam.SelfCalibrationFactor(
+                    _SELFCAL_FACTOR_CLS(
                         gtsam.symbol("f", cam1), gtsam.symbol("f", cam2), F, pp1, pp2, edge_noise
                     )
                 )
             values = gtsam.Values()
-            sorted_cams = sorted(cam_idx_to_var_idx, key=cam_idx_to_var_idx.get)
             for var_idx, cam in enumerate(sorted_cams):
-                values.insert(gtsam.symbol("f", cam), float(initial_focals[var_idx]))
+                f0 = float(initial_focals[var_idx])
+                values.insert(gtsam.symbol("f", cam), np.array([f0]) if as_vector else f0)
             params = gtsam.LevenbergMarquardtParams()
             params.setMaxIterations(200)
             result = gtsam.LevenbergMarquardtOptimizer(graph, values, params).optimize()
-            focals = np.array([result.atDouble(gtsam.symbol("f", cam)) for cam in sorted_cams])
-            return focals, (
-                f"gtsam SelfCalibrationFactor LM, error {graph.error(values):.4f} -> "
-                f"{graph.error(result):.4f}"
-            )
-        except Exception as exc:  # pragma: no cover - build-specific API drift
-            logger.warning("SelfCalibrationFactor solve failed (%s); falling back to scipy.", exc)
+            if as_vector:
+                focals = np.array([float(result.atVector(gtsam.symbol("f", c))[0]) for c in sorted_cams])
+            else:
+                focals = np.array([result.atDouble(gtsam.symbol("f", c)) for c in sorted_cams])
+            return focals, graph.error(values), graph.error(result)
+
+        # Current builds store the focal variable as double; pre-rename FetzerFactor builds expect
+        # Vector1 (optimize() throws a GenericValue<double>-vs-Matrix RuntimeError). Try both.
+        for as_vector in (False, True):
+            try:
+                focals, e0, e1 = _gtsam_solve(as_vector)
+                return focals, (
+                    f"gtsam {_SELFCAL_FACTOR_CLS.__name__} LM"
+                    f"{' (Vector1 storage)' if as_vector else ''}, error {e0:.4f} -> {e1:.4f}"
+                )
+            except Exception as exc:
+                last_exc = exc
+        logger.warning("%s solve failed (%s); falling back to scipy.", _SELFCAL_FACTOR_CLS.__name__, last_exc)
     result = least_squares(
         _fetzer_residuals,
         x0=initial_focals,
