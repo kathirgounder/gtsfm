@@ -149,6 +149,11 @@ cluster_optimizer:
 merging_options:
   _target_: gtsfm.cluster_merging.MergingOptions
   run_bundle_adjustment: true
+  # Post-merge retri BA freedom (defaults preserve current behavior). retri_free_ba drops the
+  # calib/pose priors in the FINAL full-scene solve (GLOMAP-style; BM replay: AUC@10 0.48->0.79);
+  # retri_iterations alternates retriangulation with that BA. Override per-run for IMC campaigns.
+  retri_free_ba: false
+  retri_iterations: 1
   merge_duplicate_tracks: true
   drop_child_if_merging_fail: true
   drop_outlier_after_camera_merging: true
