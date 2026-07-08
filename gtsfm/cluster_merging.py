@@ -88,6 +88,14 @@ class MergingOptions:
     guard_child_min_cams: int = 30
     min_sim3_correspondences_large_child: int = 50
     ba_options: BundleAdjustmentOptions = field(default_factory=BundleAdjustmentOptions)
+    # Post-merge retriangulation BA mode. When retri_free_ba is True the retri BA drops the
+    # calibration/pose priors and runs GNC — a fully-free final solve (GLOMAP-style): the priors that
+    # protect the incremental merges throttle the full-scene BA, which otherwise locks in the accuracy
+    # (BM offline replay: full AUC@3 0.232->0.546 on the same merged input). retri_iterations>1 alternates
+    # retriangulation with the free BA (retriangulating against improved poses recovers tri-failed tracks).
+    # Defaults preserve existing behavior (merge ba_options, single pass).
+    retri_free_ba: bool = False
+    retri_iterations: int = 1
 
 
 def _create_unary_measurements(scene: GtsfmData) -> list[UnaryMeasurementPose3]:
