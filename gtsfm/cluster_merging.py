@@ -53,13 +53,14 @@ class MergingOptions:
     drop_outlier_after_camera_merging: bool = True
     drop_camera_with_no_track: bool = True
     keep_all_cameras: bool = False
-    # MERGE_GUARD Sim3 scale band: a solved child scale outside [min, max] is treated as a diverged
-    # seat and the child is dropped. VGGT scene scale is arbitrary PER CLUSTER (per-batch
-    # normalization), so heterogeneous cluster extents legitimately produce large ratios — Roman
-    # Forum audit: 18 dropped children (~1,200 cams incl. a 258-cam subtree) at scales 4.06–12.5 and
-    # 0.07–0.25, all lawful seats; the original ToL detonations this band was built for were 1e8+.
-    sim3_scale_band_min: float = 0.25
-    sim3_scale_band_max: float = 4.0
+    # MERGE_GUARD Sim3 scale band — DISABLED by default (band = [0, inf)). VGGT scene scale is
+    # arbitrary PER CLUSTER (per-batch normalization), so heterogeneous cluster extents produce
+    # large-but-lawful solved scales: the old [0.25, 4] band executed 18 lawful Roman Forum children
+    # (~1,200 cams incl. a 258-cam subtree at scale 4.06). Genuinely diverged seats are caught by
+    # the structureless/0-track guards, the correspondence floor, and the post-merge BA + reproj
+    # filters. Set a finite band only to re-enable the legacy behavior.
+    sim3_scale_band_min: float = 0.0
+    sim3_scale_band_max: float = float("inf")
     plot_reprojection_histograms: bool = True
     use_nonlinear_sim3_alignment: bool = False
     max_track_correspondences_for_sim3: int = 150
@@ -414,7 +415,7 @@ def merge_scenes_with_sim3_nonlinear(
     scale_and_average_focal_length_in_merging: bool = False,
     guard_child_min_cams: int = 30,
     min_sim3_correspondences_large_child: int = 50,
-    sim3_scale_band: Tuple[float, float] = (0.25, 4.0),
+    sim3_scale_band: Tuple[float, float] = (0.0, float("inf")),
 ) -> GtsfmData:
     if len(children_scenes) == 0:
         return parent_scene
