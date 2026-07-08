@@ -164,6 +164,13 @@ merging_options:
   min_track_length: 3
   allow_post_ba_reproj_filtering: true
   metric_constructed_only: true
+  # WIDENED Sim3 scale band (Roman Forum audit, 2026-07-07): VGGT scene scale is arbitrary per
+  # cluster (per-batch normalization), so heterogeneous cluster extents legitimately need 4-12x
+  # scale corrections at the seat — the old [0.25, 4] band executed 18 lawful children (~1,200
+  # cams, incl. a 258-cam subtree at scale 4.06). The detonations the band was built for (ToL)
+  # were 1e8+; [0.02, 50] still catches those with orders of magnitude to spare.
+  sim3_scale_band_min: 0.02
+  sim3_scale_band_max: 50.0
   # Trackless-camera recovery is OFF: the Tower of London metrics audit showed it injects more damage than
   # it recovers — 55 of 79 injected cameras failed to re-triangulate (0 retri tracks despite touching
   # 2000-4800 global tracks each => their merged poses were wrong) and their bad poses leaked into the

@@ -53,6 +53,13 @@ class MergingOptions:
     drop_outlier_after_camera_merging: bool = True
     drop_camera_with_no_track: bool = True
     keep_all_cameras: bool = False
+    # MERGE_GUARD Sim3 scale band: a solved child scale outside [min, max] is treated as a diverged
+    # seat and the child is dropped. VGGT scene scale is arbitrary PER CLUSTER (per-batch
+    # normalization), so heterogeneous cluster extents legitimately produce large ratios — Roman
+    # Forum audit: 18 dropped children (~1,200 cams incl. a 258-cam subtree) at scales 4.06–12.5 and
+    # 0.07–0.25, all lawful seats; the original ToL detonations this band was built for were 1e8+.
+    sim3_scale_band_min: float = 0.25
+    sim3_scale_band_max: float = 4.0
     plot_reprojection_histograms: bool = True
     use_nonlinear_sim3_alignment: bool = False
     max_track_correspondences_for_sim3: int = 150
@@ -407,6 +414,7 @@ def merge_scenes_with_sim3_nonlinear(
     scale_and_average_focal_length_in_merging: bool = False,
     guard_child_min_cams: int = 30,
     min_sim3_correspondences_large_child: int = 50,
+    sim3_scale_band: Tuple[float, float] = (0.25, 4.0),
 ) -> GtsfmData:
     if len(children_scenes) == 0:
         return parent_scene
@@ -456,7 +464,7 @@ def merge_scenes_with_sim3_nonlinear(
         # means the correspondences cannot be trusted to seat this child — refuse with evidence, pre-solve.
         if id_mode and points:
             points, pair_scale, pair_inlier_ratio = _prefilter_point_pairs(points, spread)
-            if points and not (0.25 <= pair_scale <= 4.0):
+            if points and not (sim3_scale_band[0] <= pair_scale <= sim3_scale_band[1]):
                 logger.warning(
                     "MERGE_GUARD: dropping child %d pre-solve (cams=%d, pairs imply scale=%.3g "
                     "[inlier_ratio=%.2f], shared_cams=%d) — inconsistent correspondences.",
@@ -564,13 +572,15 @@ def merge_scenes_with_sim3_nonlinear(
     kept_children, kept_sim3 = [], []
     for i, (child_scene, opt_aSb) in enumerate(zip(valid_child_scenes, opt_aSb_list)):
         s = float(opt_aSb.scale())
-        if not (0.25 <= s <= 4.0):
+        if not (sim3_scale_band[0] <= s <= sim3_scale_band[1]):
             logger.warning(
-                "MERGE_GUARD: dropping child %d post-solve (cams=%d, solved Sim3 scale=%.3g outside [0.25, 4]) "
-                "— diverged seat.",
+                "MERGE_GUARD: dropping child %d post-solve (cams=%d, solved Sim3 scale=%.3g outside "
+                "[%g, %g]) — diverged seat.",
                 i,
                 len(child_scene.get_valid_camera_indices()),
                 s,
+                sim3_scale_band[0],
+                sim3_scale_band[1],
             )
             continue
         kept_children.append(child_scene)
@@ -1250,6 +1260,7 @@ def combine_results(
             scale_and_average_focal_length_in_merging=options.scale_and_average_focal_length,
             guard_child_min_cams=options.guard_child_min_cams,
             min_sim3_correspondences_large_child=options.min_sim3_correspondences_large_child,
+            sim3_scale_band=(options.sim3_scale_band_min, options.sim3_scale_band_max),
         )
         _log_scene_reprojection_stats(
             merged, "Merged with children (nonlinear alignment)", plot_histograms=options.plot_reprojection_histograms
