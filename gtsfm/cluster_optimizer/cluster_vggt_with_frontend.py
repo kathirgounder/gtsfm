@@ -131,6 +131,36 @@ def _scale_camera_intrinsics(
     raise ValueError(f"Unsupported calibration type: {type(cal)}")
 
 
+def _predicted_intrinsics_original_res(vggt_result, image_shapes, image_indices) -> dict[int, list[float]]:
+    """Model-predicted intrinsics rescaled to original image resolution, keyed by global index.
+
+    Offline-replay telemetry: the build overrides the model's predicted intrinsics with the
+    view-graph/refined focals, so without this capture they are unrecoverable from any export.
+    """
+    global_to_local = {gidx: lidx for lidx, gidx in enumerate(image_indices)}
+    out: dict[int, list[float]] = {}
+    for global_idx, camera in vggt_result.cameras.items():
+        if global_idx not in image_shapes or global_idx not in global_to_local:
+            continue
+        _, orig_W = image_shapes[global_idx]
+        scaled_W = float(vggt_result.original_coords[global_to_local[global_idx], 4])
+        cal = _scale_camera_intrinsics(camera, scale=orig_W / scaled_W).calibration()
+        out[int(global_idx)] = [cal.fx(), cal.k1(), cal.k2(), cal.px(), cal.py()]
+    return out
+
+
+def _save_predicted_intrinsics(scene, results_path: Path) -> None:
+    """Persist the model-predicted intrinsics sidecar (if the build attached one)."""
+    pred = getattr(scene, "_vggt_predicted_intrinsics", None)
+    if not pred:
+        return
+    import json
+
+    results_path.mkdir(parents=True, exist_ok=True)
+    with open(results_path / "vggt_predicted_intrinsics.json", "w") as f:
+        json.dump(pred, f)
+
+
 def _build_gtsfm_data_from_vggt_depth(
     vggt_result: VggtGeometryResult,
     tracks_2d: list[SfmTrack2d],
@@ -243,6 +273,8 @@ def _build_gtsfm_data_from_vggt_depth(
             gtsfm_data.add_track(sfm_track)
 
     logger.info("Built GtsfmData with %d cameras and %d tracks.", len(cameras), gtsfm_data.number_tracks())
+    setattr(gtsfm_data, "_vggt_predicted_intrinsics",
+            _predicted_intrinsics_original_res(vggt_result, image_shapes, image_indices))
     return gtsfm_data
 
 
@@ -309,6 +341,8 @@ def _build_gtsfm_data_via_triangulation(
         cameras_only.add_camera(global_idx, camera)
 
     result = multi_view_retriangulate_from_2d_tracks(cameras_only, tracks_2d, min_track_length=min_track_length)
+    setattr(result, "_vggt_predicted_intrinsics",
+            _predicted_intrinsics_original_res(vggt_result, image_shapes, image_indices))
     logger.info(
         "Built GtsfmData via triangulation: %d cameras, %d tracks (from %d input 2D tracks).",
         result.number_images(),
@@ -607,6 +641,9 @@ class ClusterVGGTWithFrontend(ClusterMVO):
             io_tasks.append(delayed(_save_reconstruction_as_text)(ba_result_graph, context.output_paths.results))
             io_tasks.append(
                 delayed(_save_pre_ba_reconstruction_as_text)(pre_ba_result_graph, context.output_paths.results)
+            )
+            io_tasks.append(
+                delayed(_save_predicted_intrinsics)(pre_ba_result_graph, context.output_paths.results)
             )
 
         return ClusterComputationGraph(
