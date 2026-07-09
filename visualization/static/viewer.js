@@ -59,6 +59,7 @@ class ColmapViewer {
     // Per-scene up-alignment (data → Y-up) + saved framing for the R key.
     this.sceneRotation = null;
     this.savedView = null;
+    this._cleanView = false; // H toggles this to hide all overlays for screenshots
 
     this.light = new BABYLON.HemisphericLight("H", new BABYLON.Vector3(0, 1, 0), this.scene);
     this.light.intensity = 0.85;
@@ -98,8 +99,8 @@ class ColmapViewer {
     this.engine.runRenderLoop(() => this.scene.render());
     window.addEventListener("resize", () => this.engine.resize());
 
-    // Camera hotkeys (mirrors pipeline-viz): R = reset framing, F = flip front/back,
-    // T = flip top/bottom. Ignored while typing in a form field.
+    // Camera hotkeys: R = reset framing, F = flip front/back, T = flip top/bottom,
+    // H = hide/show all UI (clean screenshot). Ignored while typing in a form field.
     window.addEventListener("keydown", (e) => {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       const tag = (e.target && e.target.tagName) || "";
@@ -114,6 +115,7 @@ class ColmapViewer {
           break;
         case "f": this.camera.alpha += Math.PI; break;
         case "t": this.camera.beta = Math.PI - this.camera.beta; break;
+        case "h": this._toggleCleanView(); break;
         default: return;
       }
       e.preventDefault();
@@ -236,7 +238,14 @@ class ColmapViewer {
 
   _applyStatsVisibility() {
     if (!this.statsRoot) return;
-    this.statsRoot.style.display = this.statsVisible ? "" : "none";
+    this.statsRoot.style.display = (this._cleanView || !this.statsVisible) ? "none" : "";
+  }
+
+  _toggleCleanView() {
+    // Hide ALL overlays (stats card + control bar) for an unobstructed money shot; press H again to restore.
+    this._cleanView = !this._cleanView;
+    this._applyStatsVisibility();
+    this._applyHudMode();
   }
 
   _applyStatsMode() {
@@ -252,6 +261,7 @@ class ColmapViewer {
     if (!this.hudRoot) return;
     this.hudRoot.classList.remove("hud-hidden");
     this.hudRoot.classList.toggle("hud-splat-mode", this.mode === "splat");
+    this.hudRoot.style.display = this._cleanView ? "none" : "";
   }
 
   _renderStats() {
@@ -1318,8 +1328,8 @@ class ColmapViewer {
     // of a single sphere. Result: 2 meshes total regardless of camera count. Placement is identical to
     // the old per-camera TransformNode (world = Compose(scale=1, rotation=R, translation=center)).
     const size = this._sceneExtent(); // robust extent; also stashes _robustCenter/_robustRadius
-    const scale = 0.01 * size;      // frustum size = 1% of scene extent
-    const pivotDiam = 0.002 * size; // camera-center dot
+    const scale = 0.006 * size;      // compact frustum (~0.6% of scene extent) for paper figures
+    const pivotDiam = 0.0015 * size; // small camera-center dot
 
     // Local frustum corners (camera looks down +Z), scaled — plain [x,y,z] arrays.
     const cornersLocal = [
@@ -1358,7 +1368,7 @@ class ColmapViewer {
 
     if (lines.length) {
       const frusta = BABYLON.MeshBuilder.CreateLineSystem("frustumLines", { lines }, this.scene);
-      frusta.color = new BABYLON.Color3(1, 0.45, 0.25);
+      frusta.color = new BABYLON.Color3(0.1, 0.1, 0.1); // near-black wireframe (1DSfM / Snavely look)
       frusta.isPickable = false;
       frusta.renderingGroupId = 1; // draw after points
       frusta.parent = this.frustumGroup;
@@ -1368,7 +1378,7 @@ class ColmapViewer {
     if (centers.length) {
       const base = BABYLON.MeshBuilder.CreateSphere("camPivotBase", { diameter: pivotDiam, segments: 6 }, this.scene);
       const pivotMat = new BABYLON.StandardMaterial("camPivotMat", this.scene);
-      pivotMat.emissiveColor = new BABYLON.Color3(0, 0, 0.5);
+      pivotMat.emissiveColor = new BABYLON.Color3(0.1, 0.1, 0.1); // match the dark frustums
       pivotMat.disableLighting = true;
       base.material = pivotMat;
       base.isPickable = false;
