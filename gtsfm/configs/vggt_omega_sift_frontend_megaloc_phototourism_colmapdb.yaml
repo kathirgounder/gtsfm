@@ -87,13 +87,20 @@ cluster_optimizer:
     post_ba_max_reproj_error: 3.0
     drop_camera_with_no_track: false
     min_track_length: 3
+    # Golden 1DSfM cluster stage: BA on (EXIF-pinned focals + GNC above), poses free.
+    run_per_cluster_ba: true
     input_mode: crop
     seed: 42
     model_cache_key: false  # forces the omega transformer to self-load (never the vanilla VGGT loader)
     use_view_graph_calibration: true
     use_global_view_graph_calibration: true
+    # EXIF passthrough (ToL gold audit 2026-07-06): EXIF ~1.9% vs Fetzer ~5.3% median focal error
+    # on 1DSfM. NOTE: the class default is "fetzer" — this key must stay explicit.
+    calibration_source: exif
     use_multi_view_retriangulation: false
-    use_triangulated_structure: false
+    # Triangulated structure (NOT depth-lift): the ToL audit measured 87-98% of per-cluster
+    # structure destroyed by the depth-lift path. Must match the verified config.
+    use_triangulated_structure: true
     # Reuse the global (db) verified correspondences per cluster — required so clusters don't re-run a
     # frontend. The colmap-db path makes this the only consumer of the correspondences.
     reuse_global_correspondences: true
@@ -102,6 +109,10 @@ cluster_optimizer:
 merging_options:
   _target_: gtsfm.cluster_merging.MergingOptions
   run_bundle_adjustment: true
+  # Post-merge retri BA freedom (defaults preserve current behavior); override per-run,
+  # e.g. merging_options.retri_free_ba=true for the golden free finale.
+  retri_free_ba: false
+  retri_iterations: 1
   merge_duplicate_tracks: true
   drop_child_if_merging_fail: true
   drop_outlier_after_camera_merging: true
@@ -117,7 +128,9 @@ merging_options:
   min_track_length: 3
   allow_post_ba_reproj_filtering: true
   metric_constructed_only: true
-  recover_trackless_cameras_in_retriangulation: true
+  # OFF per the ToL metrics audit: recovery injected more floaters than it recovered
+  # (55/79 injected cameras failed to re-triangulate). Matches the verified config.
+  recover_trackless_cameras_in_retriangulation: false
   ba_options:
     _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptions
     shared_calib: false
@@ -135,3 +148,9 @@ bridge_min_component_size: 3
 
 # --- Verified-viewgraph pipeline ---
 use_verified_pipeline: true
+
+# Tail flags in lockstep with the verified config (2026-07-14 sync).
+enable_gid_merge_anchoring: false
+run_post_merge_retriangulation: false
+enable_boundary_recovery: false
+min_triangulation_angle_deg: 1.5
