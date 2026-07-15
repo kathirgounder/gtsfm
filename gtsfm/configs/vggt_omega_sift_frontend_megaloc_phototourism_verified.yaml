@@ -159,6 +159,9 @@ merging_options:
   drop_outlier_after_camera_merging: true
   drop_camera_with_no_track: false
   keep_all_cameras: false
+  # Prior-backed annex export (see the colmapdb config): off here to keep phototourism runs byte-stable;
+  # enable per-run with merging_options.export_trackless_annex=true.
+  export_trackless_annex: false
   plot_reprojection_histograms: true
   use_nonlinear_sim3_alignment: true
   max_track_correspondences_for_sim3: 150

@@ -23,7 +23,7 @@ from gtsfm.utils import align as align_utils
 from gtsfm.utils import data_utils
 from gtsfm.utils.reprojection import compute_track_reprojection_errors
 from gtsfm.utils.splat import GaussiansProtocol, merge_gaussian_splats
-from gtsfm.utils.transform import transform_gaussian_splats
+from gtsfm.utils.transform import camera_map_with_sim3, transform_gaussian_splats
 from gtsfm.utils.tree import Tree
 from gtsfm.utils.tree_dask import submit_tree_map
 
@@ -53,6 +53,13 @@ class MergingOptions:
     drop_outlier_after_camera_merging: bool = True
     drop_camera_with_no_track: bool = True
     keep_all_cameras: bool = False
+    # ANNEX (prior-backed retention): capture the cameras each node's post-BA track filter drops and
+    # carry them up the tree OUTSIDE the scenes — re-seated by the same Sim3 that seats their subtree,
+    # never entering a Sim3 solve, duplicate-camera resolution, or BA. The root's annex is exported as
+    # a separate posed-only model (results/annex_posed_only). Contrast keep_all_cameras=true, which
+    # keeps trackless cameras INSIDE every intermediate scene, where stale copies win parent-vs-child
+    # dedup and poison the merges (measured on ToL: core median 1.18m -> 18.35m).
+    export_trackless_annex: bool = False
     # MERGE_GUARD Sim3 scale band — DISABLED by default (band = [0, inf)). VGGT scene scale is
     # arbitrary PER CLUSTER (per-batch normalization), so heterogeneous cluster extents produce
     # large-but-lawful solved scales: the old [0.25, 4] band executed 18 lawful Roman Forum children
@@ -670,6 +677,11 @@ class MergedNodeResult:
     # merged-frame Camera. Populated only at nodes where recover_trackless_cameras_in_retriangulation
     # is set; the root node's set is what the post-merge retriangulation tries to geometrically recover.
     trackless_cameras: Optional[dict] = None
+    # Prior-backed ANNEX accumulated over this subtree (export_trackless_annex only): every camera a
+    # track filter dropped anywhere below, carried in THIS node's frame (each child's annex re-seated
+    # by the Sim3 relating the child scene to this merged result). Never merged into `scene`; the root's
+    # annex is exported as a separate posed-only model.
+    annex_cameras: Optional[dict] = None
 
 
 @dataclass(frozen=True)
@@ -1169,6 +1181,52 @@ def _align_and_merge_results(
         return result1
 
 
+def _carry_annex_cameras(
+    merged_scene: GtsfmData,
+    child_results: tuple["MergedNodeResult", ...],
+    fresh_drops: dict,
+) -> Optional[dict]:
+    """Accumulate the prior-backed annex at a merge node.
+
+    Each child's annex is re-seated into this node's frame by the Sim3 relating the child scene's poses
+    to the merged result (the same rail the gaussian-splat carry rides), then this node's own post-BA
+    filter drops are added (already in-frame, freshest poses — they override child copies). Cameras that
+    re-registered with tracks in the merged scene are purged: the tracked scene copy always wins. The
+    annex never enters a scene, a Sim3 solve, duplicate resolution, or a BA — inert cargo by construction.
+    """
+    annex: dict = {}
+    merged_poses = merged_scene.poses()
+    for child in child_results:
+        child_annex = child.annex_cameras
+        if not child_annex or child.scene is None:
+            continue
+        child_poses = child.scene.poses()
+        n_common = len(merged_poses.keys() & child_poses.keys())
+        if n_common < 3:
+            logger.info(
+                "🎒 Annex: child shares only %d cam(s) with the merged node — dropping its %d annex cam(s).",
+                n_common,
+                len(child_annex),
+            )
+            continue
+        try:
+            aSb = align_utils.sim3_from_Pose3_maps(merged_poses, child_poses)
+        except Exception as exc:
+            logger.warning(
+                "🎒 Annex: seat transform failed for a child (%s) — dropping its %d annex cam(s).",
+                exc,
+                len(child_annex),
+            )
+            continue
+        annex.update(camera_map_with_sim3(aSb, child_annex))
+    annex.update(fresh_drops)
+    for i in merged_scene.get_valid_camera_indices():
+        annex.pop(i, None)
+    if annex:
+        logger.info("🎒 Annex: carrying %d prior-backed camera pose(s) up the tree.", len(annex))
+    return annex or None
+
+
 def combine_results(
     current: GtsfmData | None,
     child_results: tuple[MergedNodeResult, ...],
@@ -1211,6 +1269,7 @@ def combine_results(
         result_scene: Optional[GtsfmData],
         pre_ba_scene: Optional[GtsfmData],
         trackless_cameras: Optional[dict] = None,
+        annex_cameras: Optional[dict] = None,
     ) -> MergedNodeResult:
         # Sidecar rides the outgoing scenes (same rail as the plots/label attrs) — zero extra shipping.
         for _scn in (result_scene, pre_ba_scene):
@@ -1220,6 +1279,7 @@ def combine_results(
             scene=result_scene,
             pre_ba_scene=pre_ba_scene,
             trackless_cameras=trackless_cameras,
+            annex_cameras=annex_cameras,
             metrics=compute_merging_metrics(
                 result_scene,
                 cameras_gt=cameras_gt,
@@ -1381,6 +1441,7 @@ def combine_results(
         )
 
         trackless_cameras: Optional[dict[int, gtsfm_types.CAMERA_TYPE]] = None
+        dropped_this_node: dict[int, gtsfm_types.CAMERA_TYPE] = {}
         if options.allow_post_ba_reproj_filtering:
             scene_before_filter = merged_with_ba
             cams_before_filter = set(scene_before_filter.get_valid_camera_indices())
@@ -1389,15 +1450,21 @@ def combine_results(
                 options.min_track_length,
                 retain_cameras_without_tracks=options.keep_all_cameras,
             )
-            if options.recover_trackless_cameras_in_retriangulation:
+            if options.recover_trackless_cameras_in_retriangulation or options.export_trackless_annex:
                 # Capture the good-pose cameras the track filter just dropped (e.g. low VGGT-depth-conf
-                # cams) with their merged-frame poses, so the post-merge retriangulation can recover them.
+                # cams) with their merged-frame poses, so the post-merge retriangulation can recover them
+                # and/or the annex can carry them up the tree.
                 dropped_ids = cams_before_filter - set(merged_with_ba.get_valid_camera_indices())
-                trackless_cameras = {
+                dropped_this_node = {
                     i: scene_before_filter.get_camera(i)
                     for i in dropped_ids
                     if scene_before_filter.get_camera(i) is not None
                 }
+                if options.recover_trackless_cameras_in_retriangulation:
+                    trackless_cameras = dropped_this_node
+        annex_cameras: Optional[dict] = None
+        if options.export_trackless_annex:
+            annex_cameras = _carry_annex_cameras(merged_with_ba, child_results, dropped_this_node)
         _log_scene_reprojection_stats(
             merged_with_ba,
             "merged result (with ba + outlier filtering)",
@@ -1430,15 +1497,15 @@ def combine_results(
                     except Exception as e:
                         logger.warning("⚠️ Failed to align and merge gaussians: %s", e)
                 merged_with_ba.set_gaussian_splats(merged_gaussians)
-                return _finalize_result(merged_with_ba, merged, trackless_cameras)
+                return _finalize_result(merged_with_ba, merged, trackless_cameras, annex_cameras)
 
             except Exception as alignment_exc:
                 logger.warning("⚠️ Failed to compute pre/post BA Sim(3): %s", alignment_exc)
-                return _finalize_result(merged_with_ba, merged, trackless_cameras)
+                return _finalize_result(merged_with_ba, merged, trackless_cameras, annex_cameras)
 
         else:
             logger.info("✖️ No Gaussians to merge")
-            return _finalize_result(merged_with_ba, merged, trackless_cameras)
+            return _finalize_result(merged_with_ba, merged, trackless_cameras, annex_cameras)
     except Exception as exc:
         logger.warning("⚠️ Failed to run bundle adjustment: %s", exc)
         return _finalize_result(merged, None)

@@ -156,7 +156,7 @@ def _run_post_merge_retriangulation(
     tracks_2d: list,
     options: MergingOptions,
     trackless_cameras: Optional[dict] = None,
-) -> GtsfmData:
+) -> tuple[GtsfmData, dict]:
     """Re-triangulate verified multiview 2D tracks against the merged cameras, then bundle-adjust.
 
     Mirrors the cluster-level retri stage (`_run_cluster_ba`): builds a fresh sparse structure from
@@ -168,6 +168,11 @@ def _run_post_merge_retriangulation(
     track), their merged poses are injected so the geometric retriangulation -- which is depth-confidence
     INDEPENDENT -- can re-triangulate their existing global 2D tracks and recover them. Cameras that
     still fail to gain a >=3-view track are excluded from BA and dropped by the final filter.
+
+    Returns:
+        (refined scene, dropped cameras): the second element maps camera index -> Camera for every
+        camera that entered retri but is absent from the refined scene, at its last BA'd pose (same
+        frame as the refined scene) — the retri-stage contribution to the prior-backed annex.
     """
     from gtsfm.bundle.bundle_adjustment import multi_view_retriangulate_from_2d_tracks
 
@@ -182,6 +187,14 @@ def _run_post_merge_retriangulation(
             len(injected),
             sorted(injected),
         )
+
+    # Last-seen camera per index (post-BA where available): the pose a camera holds if a later
+    # filter drops it — captured for the annex instead of being lost.
+    last_seen: dict = {i: scene.get_camera(i) for i in scene.get_valid_camera_indices()}
+
+    def _dropped_vs(final_scene: GtsfmData) -> dict:
+        final_ids = set(final_scene.get_valid_camera_indices())
+        return {i: cam for i, cam in last_seen.items() if i not in final_ids and cam is not None}
 
     ba_options = options.ba_options
     if options.retri_free_ba:
@@ -202,9 +215,14 @@ def _run_post_merge_retriangulation(
         retri = multi_view_retriangulate_from_2d_tracks(refined, tracks_2d)
         if retri.number_tracks() == 0:
             logger.warning("Post-merge retriangulation produced no tracks; keeping previous scene.")
-            return refined if retri_iter > 0 else scene
+            kept = refined if retri_iter > 0 else scene
+            return kept, _dropped_vs(kept)
         optimizer = ba_options.to_optimizer(min_track_length=options.min_track_length)
         refined, _ = optimizer.run_simple_ba(retri)
+        for i in refined.get_valid_camera_indices():
+            cam = refined.get_camera(i)
+            if cam is not None:
+                last_seen[i] = cam
         refined = refined.filter_landmark_measurements(
             options.post_ba_max_reproj_error,
             options.min_track_length,
@@ -239,7 +257,7 @@ def _run_post_merge_retriangulation(
                 max_views,
             )
 
-    return refined
+    return refined, _dropped_vs(refined)
 
 
 # ---------------------------------------------------------------------------
@@ -1044,6 +1062,8 @@ class SceneOptimizer:
 
                 # Post-merge retriangulation (structure refinement): rebuild sparse structure from the
                 # globally-verified tracks against the merged poses, then BA. Written as a separate output.
+                retri_scene: Optional[GtsfmData] = None
+                retri_dropped: dict = {}
                 if (
                     self._use_verified_pipeline
                     and self._run_post_merge_retriangulation
@@ -1055,7 +1075,8 @@ class SceneOptimizer:
                         "🔧 GTSFM: Post-merge retriangulation on %d global 2D tracks vs merged poses...",
                         len(global_tracks_2d),
                     )
-                    refined: GtsfmData = client.submit(
+                    refined: GtsfmData
+                    refined, retri_dropped = client.submit(
                         _run_post_merge_retriangulation,
                         root_merged_result.scene,
                         global_tracks_2d,
@@ -1063,6 +1084,7 @@ class SceneOptimizer:
                         root_merged_result.trackless_cameras,
                         pure=False,
                     ).result()
+                    retri_scene = refined
                     retri_dir = base_output_paths.results / "merged_retriangulated"
                     retri_dir.mkdir(parents=True, exist_ok=True)
                     refined.export_as_colmap_text(retri_dir)
@@ -1080,6 +1102,55 @@ class SceneOptimizer:
                             suffix="_retriangulated",
                         )
                     )
+
+                # Prior-backed ANNEX export: every camera a track filter dropped anywhere in the tree
+                # (carried up outside the scenes) plus the retri stage's own drops, re-seated onto the
+                # final scene and written as a posed-only model. Zero effect on the core solve — the
+                # annex never entered a Sim3 seat, a duplicate resolution, or a BA.
+                if (
+                    self._use_verified_pipeline
+                    and self._merging_options.export_trackless_annex
+                    and root_merged_result is not None
+                    and root_merged_result.scene is not None
+                ):
+                    from gtsfm.utils import align as align_utils
+                    from gtsfm.utils.transform import camera_map_with_sim3
+
+                    final_scene = retri_scene if retri_scene is not None else root_merged_result.scene
+                    annex: dict = {}
+                    tree_annex = dict(root_merged_result.annex_cameras or {})
+                    if tree_annex and retri_scene is not None:
+                        # The retri BA can drift the gauge relative to the root-merge frame the tree
+                        # annex was captured in — absorb it with one Sim3 over the shared cameras.
+                        try:
+                            fSr = align_utils.sim3_from_Pose3_maps(
+                                final_scene.poses(), root_merged_result.scene.poses()
+                            )
+                            tree_annex = camera_map_with_sim3(fSr, tree_annex)
+                        except Exception as exc:
+                            logger.warning(
+                                "🎒 Annex: root→final re-seat failed (%s); exporting root-frame poses.", exc
+                            )
+                    annex.update(tree_annex)
+                    annex.update(retri_dropped)  # freshest poses, already in the final frame
+                    for i in final_scene.get_valid_camera_indices():
+                        annex.pop(i, None)
+                    if annex:
+                        annex_scene = GtsfmData(number_images=final_scene.number_images())
+                        annex_scene._image_info = final_scene._clone_image_info()
+                        for i, cam in annex.items():
+                            if cam is not None:
+                                annex_scene.add_camera(i, cam)
+                        annex_dir = base_output_paths.results / "annex_posed_only"
+                        annex_dir.mkdir(parents=True, exist_ok=True)
+                        annex_scene.export_as_colmap_text(annex_dir)
+                        logger.info(
+                            "🎒 Annex export: %d prior-backed camera pose(s) (zero tracks by design) → %s",
+                            len(annex),
+                            annex_dir,
+                        )
+                    else:
+                        logger.info("🎒 Annex export enabled, but no camera was dropped anywhere in the tree.")
 
                 # Post-root-merge boundary recovery: DLT-triangulate boundary global tracks against the
                 # merged cameras, RANSAC-DLT resect unposed cameras against cluster-3D ∪ fresh-3D,

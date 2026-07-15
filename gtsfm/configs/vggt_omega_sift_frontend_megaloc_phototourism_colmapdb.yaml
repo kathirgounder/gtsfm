@@ -118,6 +118,11 @@ merging_options:
   drop_outlier_after_camera_merging: true
   drop_camera_with_no_track: false
   keep_all_cameras: false
+  # Prior-backed retention: carry every filter-dropped camera up OUTSIDE the scenes (re-seated by its
+  # subtree's Sim3, never entering a merge/dedup/BA) and export as results/annex_posed_only — poses
+  # only, zero tracks. Zero effect on the core solve. Do NOT confuse with keep_all_cameras, which
+  # re-admits stale cameras into the merges and measurably poisons the core (ToL: 1.18m -> 18.35m).
+  export_trackless_annex: true
   plot_reprojection_histograms: true
   use_nonlinear_sim3_alignment: true
   max_track_correspondences_for_sim3: 150
