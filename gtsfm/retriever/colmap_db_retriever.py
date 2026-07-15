@@ -73,8 +73,13 @@ class ColmapDBRetriever(RetrieverBase):
             pairs = set()
             n_verified = 0
             for pair_id, rows, config in conn.execute("SELECT pair_id, rows, config FROM two_view_geometries"):
-                # config 2 = CALIBRATED (E), 3 = UNCALIBRATED (F); rows>0 means inlier matches exist.
-                if rows is None or int(rows) == 0 or int(config) not in (2, 3):
+                # config 2 = CALIBRATED (E), 3 = UNCALIBRATED (F), 4 = PLANAR, 5 = PANORAMIC,
+                # 6 = PLANAR_OR_PANORAMIC. Homography-type pairs (4-6) carry real inlier
+                # correspondences (flat facades, rotation-heavy viewpoints) and GLOMAP consumes
+                # them — dropping them starved head-to-head same-graph comparisons (~1.3k of
+                # Wilson's ToL EG pairs are H-verified). Low-parallax structure is handled
+                # downstream by the triangulation/angle filters. rows>0 means inliers exist.
+                if rows is None or int(rows) == 0 or int(config) not in (2, 3, 4, 5, 6):
                     continue
                 n_verified += 1
                 cid1, cid2 = _pair_id_to_image_ids(int(pair_id))
