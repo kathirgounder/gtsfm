@@ -209,21 +209,23 @@ window.addEventListener("resize", () => engine.resize());
 // addKeyboard input.
 //   R → reset to initial auto-framing
 //   F → flip front/back (alpha += π)
-//   T → flip top/bottom by inverting the scene-up axis (rebuilds rotation,
-//        re-applies it to the data, and re-frames). This is a true vertical
-//        flip — handy if up-alignment landed inverted.
+//   T → flip top/bottom by rotating the alignment 180° about its x-axis
+//        (rebuilds rotation, re-applies it to the data, and re-frames).
+//        A proper rotation (det = +1) — handy if up-alignment landed inverted.
 let savedView = null;
 function flipSceneUpAndReframe() {
   if (!sceneRotation || !currentRun) return;
-  // Negate the second row of sceneRotation, which is the row that maps data → +Y.
-  // This effectively flips the up axis.
+  // Rotate the alignment 180° about its x-axis: negate the up (Y) AND forward (Z)
+  // rows. Negating only the up row would set det = -1 — a MIRROR reflection that
+  // renders the scene with reversed chirality (facades read backwards).
   sceneRotation[1] = sceneRotation[1].map(v => -v);
+  sceneRotation[2] = sceneRotation[2].map(v => -v);
   // Reload current stage so re-parsing uses the updated rotation.
   loadStage(currentStageIdx, { animate: false });
-  // Re-frame: target.y inverts, so reset camera to recomputed setup.
-  // For simplicity, just press R after to re-snap to a clean initial.
+  // Re-frame: transformed center's y and z invert with the flipped rows.
   if (savedView) {
     savedView.center[1] = -savedView.center[1];
+    savedView.center[2] = -savedView.center[2];
     camera.target.set(savedView.center[0], savedView.center[1], savedView.center[2]);
   }
 }
