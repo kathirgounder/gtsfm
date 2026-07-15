@@ -53,6 +53,7 @@ def _run_cluster_ba(
     cluster_label: Optional[str] = None,
     tracks_2d: Optional[list[SfmTrack2d]] = None,
     use_multi_view_retriangulation: bool = False,
+    run_bundle_adjustment: bool = True,
 ) -> tuple[GtsfmData, GtsfmData]:
     """Run cluster-level BA on a GtsfmData result.
 
@@ -91,6 +92,21 @@ def _run_cluster_ba(
         gtsfm_data, should_run_ba = data_utils.remove_cameras_with_no_tracks(gtsfm_data, "cluster-level BA")
         if not should_run_ba:
             return gtsfm_data, pre_ba_data
+
+    if not run_bundle_adjustment:
+        # ToL census (2026-07-06): per-cluster BA degraded 7/8 GT-gradeable clusters (median 2.90->4.34m
+        # vs GT) — the ~4px pose/Fetzer-K reprojection inconsistency gets resolved by moving the FREE
+        # poses instead of the pinned focals. Raw VGGT poses + global-Fetzer K are kept verbatim
+        # (bit-identical intrinsics per camera across clusters, which is what the Sim3 merges need);
+        # the pose-pinned merge BA downstream does the structure polishing safely. The 3px post-BA
+        # filter is NOT applied here: unpolished structure sits at ~4px and the merge pre-filter (14px)
+        # is the gate that admits it.
+        logger.info(
+            "%s🛑 Per-cluster BA disabled: keeping raw geometry (%d tracks after pre-BA filter).",
+            f"[{cluster_label}] " if cluster_label else "",
+            gtsfm_data.number_tracks(),
+        )
+        return gtsfm_data, pre_ba_data
 
     try:
         optimizer = ba_options.to_optimizer(min_track_length=min_track_length)
@@ -136,12 +152,22 @@ def _load_vggt_inputs(
     indices: list[int],
     mode: str,
     *,
+    transformer=None,
     save_processed_image: bool = False,
     output_root: Optional[str] = None,
     image_names: Optional[tuple[str, ...]] = None,
 ):
-    """Load and preprocess a batch of images for VGGT."""
-    image_batch, original_coords = load_image_batch_vggt_loader(loader, indices, mode=mode)
+    """Load and preprocess a batch of images for the geometry model.
+
+    Preprocessing follows the geometry transformer: VGGT and VGGT-Omega differ in resolution / patch
+    alignment / cropping, and the per-pixel depth lookup downstream indexes the model's depth map using
+    `original_coords` from here — so the loader must match the model. `transformer=None` keeps the legacy
+    VGGT loader (back-compat).
+    """
+    if transformer is not None:
+        image_batch, original_coords = transformer.load_image_batch(loader, indices, mode=mode)
+    else:
+        image_batch, original_coords = load_image_batch_vggt_loader(loader, indices, mode=mode)
     if not save_processed_image or output_root is None or image_names is None:
         return image_batch, original_coords
     if len(image_names) != image_batch.shape[0]:
@@ -487,6 +513,7 @@ class ClusterVGGT(ClusterOptimizerBase):
             context.loader,
             global_indices,
             mode=self._input_mode,
+            transformer=self.geometry_transformer,
             save_processed_image=self._save_processed_image,
             output_root=str(context.output_paths.results),
             image_names=image_names,
