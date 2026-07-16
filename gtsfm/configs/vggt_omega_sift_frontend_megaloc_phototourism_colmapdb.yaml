@@ -159,3 +159,6 @@ enable_gid_merge_anchoring: false
 run_post_merge_retriangulation: false
 enable_boundary_recovery: false
 min_triangulation_angle_deg: 1.5
+# One drag-and-drop output: results/final_reconstruction = post-retri scene, angle-filtered,
+# colorized from the source images, annex cameras included as posed-only frustums.
+export_final_reconstruction: true

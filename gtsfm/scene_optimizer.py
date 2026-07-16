@@ -151,6 +151,46 @@ def _load_precomputed_frontend(path: str, num_images: int, expected_dims=None, m
     return keypoints_list, v_corr_idxs_dict
 
 
+def _colorize_scene_tracks_in_place(scene: GtsfmData, loader) -> int:
+    """Set each track's (r, g, b) by sampling the source image at its first measurement, if in bounds.
+
+    Only measurement(0) is tried — a track whose first measurement rounds out of bounds, or whose
+    first-measurement image fails to load / is not RGB, keeps its previous color (no fallback scan).
+    Tracks are grouped by first-measurement camera so only one image is in memory at a time
+    (memory O(1 image), one pass over the registered images). Track keypoints live at the loader
+    resolution, so `loader.get_image(i)` samples in the right frame. Same single-sample scheme as
+    the offline colorize tool the qualitative figures were made with.
+
+    Returns the number of tracks colored. Never raises — a failed image load just leaves its
+    tracks at their previous color.
+    """
+    from collections import defaultdict
+
+    by_cam: dict[int, list] = defaultdict(list)
+    for j in range(scene.number_tracks()):
+        t = scene.get_track(j)
+        if t.numberMeasurements() > 0:
+            i, _ = t.measurement(0)
+            by_cam[int(i)].append(t)
+
+    n_colored = 0
+    for i in sorted(by_cam):
+        try:
+            arr = loader.get_image(i).value_array
+        except Exception:
+            continue
+        if arr is None or arr.ndim != 3 or arr.shape[2] < 3:
+            continue
+        h, w = arr.shape[:2]
+        for t in by_cam[i]:
+            _, uv = t.measurement(0)
+            u, v = int(round(float(uv[0]))), int(round(float(uv[1])))
+            if 0 <= u < w and 0 <= v < h:
+                t.r, t.g, t.b = float(arr[v, u, 0]), float(arr[v, u, 1]), float(arr[v, u, 2])
+                n_colored += 1
+    return n_colored
+
+
 def _run_post_merge_retriangulation(
     scene: GtsfmData,
     tracks_2d: list,
@@ -599,6 +639,11 @@ class SceneOptimizer:
         # structure. ToL 120/0.15 audit: 16% of merged tracks sat below 1.5deg (COLMAP's default
         # cutoff). Output-side only — merges, poses, and BA never see it.
         min_triangulation_angle_deg: float = 0.0,
+        # Emit results/final_reconstruction: the post-retri scene, angle-filtered (per
+        # min_triangulation_angle_deg), tracks COLORIZED from the source images, with the annex
+        # cameras included as posed-only frustums — one drag-and-drop folder for viz/analysis,
+        # no local post-processing. Export-side only; never touches the solve.
+        export_final_reconstruction: bool = True,
         # Path to a precomputed-frontend npz (scripts/convert_wilsonkl_frontend.py). When set, the
         # global frontend (SIFT/matching/two-view) is skipped and these keypoints + verified
         # correspondences are used instead — the standard 1DSfM protocol, where all published
@@ -623,6 +668,7 @@ class SceneOptimizer:
         self._run_post_merge_retriangulation = run_post_merge_retriangulation
         self._enable_boundary_recovery = enable_boundary_recovery
         self._min_triangulation_angle_deg = min_triangulation_angle_deg
+        self._export_final_reconstruction = export_final_reconstruction
         self._precomputed_frontend_path = precomputed_frontend_path
         self._precomputed_pairs_path = precomputed_pairs_path
         # Propagate metric_constructed_only to the cluster optimizer if it supports it.
@@ -1122,6 +1168,7 @@ class SceneOptimizer:
                 # (carried up outside the scenes) plus the retri stage's own drops, re-seated onto the
                 # final scene and written as a posed-only model. Zero effect on the core solve — the
                 # annex never entered a Sim3 seat, a duplicate resolution, or a BA.
+                annex: dict = {}  # populated below; also consumed by the final_reconstruction export
                 if (
                     self._use_verified_pipeline
                     and self._merging_options.export_trackless_annex
@@ -1132,7 +1179,6 @@ class SceneOptimizer:
                     from gtsfm.utils.transform import camera_map_with_sim3
 
                     final_scene = retri_scene if retri_scene is not None else root_merged_result.scene
-                    annex: dict = {}
                     tree_annex = dict(root_merged_result.annex_cameras or {})
                     # Retri drops that never entered the final BA graph are still in the root-merge
                     # gauge — fold them into the tree annex (fresher poses win) so they ride the
@@ -1254,6 +1300,59 @@ class SceneOptimizer:
                             suffix="_anglefiltered",
                         )
                     )
+
+                # FINAL RECONSTRUCTION export: one drag-and-drop folder — the best scene (post-retri
+                # when available), angle-filtered, tracks colorized from the source images, with the
+                # prior-backed annex cameras riding along as posed-only frustums. Pure output; runs
+                # last so it can never affect the solve or the other exports. Non-fatal on failure.
+                if (
+                    self._use_verified_pipeline
+                    and self._export_final_reconstruction
+                    and root_merged_result is not None
+                    and root_merged_result.scene is not None
+                ):
+                    try:
+                        best_scene = retri_scene if retri_scene is not None else root_merged_result.scene
+                        if self._min_triangulation_angle_deg > 0:
+                            best_scene = cluster_merging.filter_tracks_by_triangulation_angle(
+                                best_scene, self._min_triangulation_angle_deg
+                            )
+                        # Fresh copy: annex cameras and colors must not leak into the scenes the
+                        # metrics/exports above were computed from. Tracks are DEEP-copied —
+                        # add_track stores references, and colorize mutates r/g/b in place.
+                        from gtsam import SfmTrack as _SfmTrack
+
+                        out_scene = GtsfmData(number_images=best_scene.number_images())
+                        out_scene._image_info = best_scene._clone_image_info()
+                        for _i in best_scene.get_valid_camera_indices():
+                            out_scene.add_camera(_i, best_scene.get_camera(_i))
+                        for _t in best_scene.tracks():
+                            _tc = _SfmTrack(_t.point3())
+                            for _k in range(_t.numberMeasurements()):
+                                _mi, _uv = _t.measurement(_k)
+                                _tc.addMeasurement(_mi, _uv)
+                            out_scene.add_track(_tc)
+                        n_annex_added = 0
+                        for _i, _cam in annex.items():
+                            if _cam is not None and out_scene.get_camera(_i) is None:
+                                out_scene.add_camera(_i, _cam)
+                                n_annex_added += 1
+                        n_colored = _colorize_scene_tracks_in_place(out_scene, self.loader)
+                        final_dir = base_output_paths.results / "final_reconstruction"
+                        final_dir.mkdir(parents=True, exist_ok=True)
+                        out_scene.export_as_colmap_text(final_dir)
+                        logger.info(
+                            "📦 Final reconstruction: %d cams (%d annex posed-only), %d tracks "
+                            "(%d colorized, angle>=%.1f deg) → %s",
+                            len(out_scene.get_valid_camera_indices()),
+                            n_annex_added,
+                            out_scene.number_tracks(),
+                            n_colored,
+                            self._min_triangulation_angle_deg,
+                            final_dir,
+                        )
+                    except Exception as exc:
+                        logger.warning("📦 Final reconstruction export failed (non-fatal): %s", exc)
 
         if merged_scene is not None and merged_scene.merge_success:
             logger.info(

@@ -225,3 +225,7 @@ enable_boundary_recovery: false  # off for this experiment; re-enable after retr
 # 120/0.15 ToL drop: killed 16% of tracks — almost entirely the low-parallax fuzz/spray that passes
 # the 3px reproj filter with unconstrained depth. Output-side only; merged/ is still written unfiltered.
 min_triangulation_angle_deg: 1.5
+# One drag-and-drop output: results/final_reconstruction = post-retri scene, angle-filtered,
+# colorized from the source images, annex cameras included as posed-only frustums (when the
+# annex flag is on). Output-side only.
+export_final_reconstruction: true
