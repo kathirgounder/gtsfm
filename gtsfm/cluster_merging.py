@@ -1181,6 +1181,23 @@ def _align_and_merge_results(
         return result1
 
 
+def _annex_on_bailout(
+    merged_scene: Optional[GtsfmData],
+    child_results: tuple["MergedNodeResult", ...],
+    options: "MergingOptions",
+) -> Optional[dict]:
+    """Carry the children's annexes even when a node bails out early (BA failure, no-track prune):
+    the subtree's dropped cameras must not silently vanish on exactly the failure paths the annex
+    exists for. No fresh drops here — the node produced none."""
+    if not options.export_trackless_annex or merged_scene is None:
+        return None
+    try:
+        return _carry_annex_cameras(merged_scene, child_results, {})
+    except Exception as exc:
+        logger.warning("🎒 Annex: bailout carry failed (%s) — subtree annex dropped at this node.", exc)
+        return None
+
+
 def _carry_annex_cameras(
     merged_scene: GtsfmData,
     child_results: tuple["MergedNodeResult", ...],
@@ -1411,13 +1428,13 @@ def combine_results(
     if not options.run_bundle_adjustment:
         if options.drop_outlier_after_camera_merging:
             merged = _drop_outlier_tracks(merged)
-        return _finalize_result(merged, None)
+        return _finalize_result(merged, None, annex_cameras=_annex_on_bailout(merged, child_results, options))
 
     # Log cameras that have no supporting track measurements before running BA.
     if options.drop_camera_with_no_track:
         merged, should_run_ba = data_utils.remove_cameras_with_no_tracks(merged, "parent BA")
         if not should_run_ba:
-            return _finalize_result(merged, None)
+            return _finalize_result(merged, None, annex_cameras=_annex_on_bailout(merged, child_results, options))
     else:
         logger.info("📌 Retaining zero-track cameras before parent BA (drop disabled).")
 
@@ -1508,7 +1525,7 @@ def combine_results(
             return _finalize_result(merged_with_ba, merged, trackless_cameras, annex_cameras)
     except Exception as exc:
         logger.warning("⚠️ Failed to run bundle adjustment: %s", exc)
-        return _finalize_result(merged, None)
+        return _finalize_result(merged, None, annex_cameras=_annex_on_bailout(merged, child_results, options))
 
 
 __all__ = [

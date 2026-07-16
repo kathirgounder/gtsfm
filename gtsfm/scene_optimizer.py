@@ -170,9 +170,11 @@ def _run_post_merge_retriangulation(
     still fail to gain a >=3-view track are excluded from BA and dropped by the final filter.
 
     Returns:
-        (refined scene, dropped cameras): the second element maps camera index -> Camera for every
-        camera that entered retri but is absent from the refined scene, at its last BA'd pose (same
-        frame as the refined scene) — the retri-stage contribution to the prior-backed annex.
+        (refined scene, dropped cameras, root_frame_ids): `dropped` maps camera index -> Camera for
+        every camera that entered retri but is absent from the refined scene, at its last-held pose —
+        the retri-stage contribution to the prior-backed annex. `root_frame_ids` are the dropped
+        cameras that never entered the final BA graph: their poses are still in the INPUT (root-merge)
+        gauge and need the caller's root->final re-seat; the rest are already in the final frame.
     """
     from gtsfm.bundle.bundle_adjustment import multi_view_retriangulate_from_2d_tracks
 
@@ -189,12 +191,17 @@ def _run_post_merge_retriangulation(
         )
 
     # Last-seen camera per index (post-BA where available): the pose a camera holds if a later
-    # filter drops it — captured for the annex instead of being lost.
+    # filter drops it — captured for the annex instead of being lost. `never_baed` tracks cameras
+    # that never actually entered the FINAL retri BA graph (run_simple_ba returns excluded cameras
+    # at their unoptimized input poses): their captured poses are still in the INPUT (root-merge)
+    # gauge and must ride the root->final re-seat, unlike genuinely BA'd-then-dropped cameras.
     last_seen: dict = {i: scene.get_camera(i) for i in scene.get_valid_camera_indices()}
+    never_baed: set = set(last_seen)
 
-    def _dropped_vs(final_scene: GtsfmData) -> dict:
+    def _dropped_vs(final_scene: GtsfmData) -> tuple[dict, set]:
         final_ids = set(final_scene.get_valid_camera_indices())
-        return {i: cam for i, cam in last_seen.items() if i not in final_ids and cam is not None}
+        dropped = {i: cam for i, cam in last_seen.items() if i not in final_ids and cam is not None}
+        return dropped, never_baed & set(dropped)
 
     ba_options = options.ba_options
     if options.retri_free_ba:
@@ -216,13 +223,19 @@ def _run_post_merge_retriangulation(
         if retri.number_tracks() == 0:
             logger.warning("Post-merge retriangulation produced no tracks; keeping previous scene.")
             kept = refined if retri_iter > 0 else scene
-            return kept, _dropped_vs(kept)
+            dropped, root_frame_ids = _dropped_vs(kept)
+            return kept, dropped, root_frame_ids
         optimizer = ba_options.to_optimizer(min_track_length=options.min_track_length)
         refined, _ = optimizer.run_simple_ba(retri)
+        baed_this_iter = set()
         for i in refined.get_valid_camera_indices():
             cam = refined.get_camera(i)
             if cam is not None:
                 last_seen[i] = cam
+            if len(refined.get_measurements_for_camera(i)) >= ba_options.min_tracks_per_camera:
+                baed_this_iter.add(i)
+        # Only the LAST BA's gauge is the final frame — judge against this iteration alone.
+        never_baed = set(last_seen) - baed_this_iter
         refined = refined.filter_landmark_measurements(
             options.post_ba_max_reproj_error,
             options.min_track_length,
@@ -257,7 +270,8 @@ def _run_post_merge_retriangulation(
                 max_views,
             )
 
-    return refined, _dropped_vs(refined)
+    dropped, root_frame_ids = _dropped_vs(refined)
+    return refined, dropped, root_frame_ids
 
 
 # ---------------------------------------------------------------------------
@@ -1064,6 +1078,7 @@ class SceneOptimizer:
                 # globally-verified tracks against the merged poses, then BA. Written as a separate output.
                 retri_scene: Optional[GtsfmData] = None
                 retri_dropped: dict = {}
+                retri_root_frame_ids: set = set()
                 if (
                     self._use_verified_pipeline
                     and self._run_post_merge_retriangulation
@@ -1076,7 +1091,7 @@ class SceneOptimizer:
                         len(global_tracks_2d),
                     )
                     refined: GtsfmData
-                    refined, retri_dropped = client.submit(
+                    refined, retri_dropped, retri_root_frame_ids = client.submit(
                         _run_post_merge_retriangulation,
                         root_merged_result.scene,
                         global_tracks_2d,
@@ -1119,6 +1134,13 @@ class SceneOptimizer:
                     final_scene = retri_scene if retri_scene is not None else root_merged_result.scene
                     annex: dict = {}
                     tree_annex = dict(root_merged_result.annex_cameras or {})
+                    # Retri drops that never entered the final BA graph are still in the root-merge
+                    # gauge — fold them into the tree annex (fresher poses win) so they ride the
+                    # root->final re-seat below; BA'd-then-dropped cameras are already final-frame.
+                    tree_annex.update({i: retri_dropped[i] for i in retri_root_frame_ids if i in retri_dropped})
+                    final_frame_drops = {
+                        i: c for i, c in retri_dropped.items() if i not in retri_root_frame_ids
+                    }
                     if tree_annex and retri_scene is not None:
                         # The retri BA can drift the gauge relative to the root-merge frame the tree
                         # annex was captured in — absorb it with one Sim3 over the shared cameras.
@@ -1132,7 +1154,7 @@ class SceneOptimizer:
                                 "🎒 Annex: root→final re-seat failed (%s); exporting root-frame poses.", exc
                             )
                     annex.update(tree_annex)
-                    annex.update(retri_dropped)  # freshest poses, already in the final frame
+                    annex.update(final_frame_drops)
                     for i in final_scene.get_valid_camera_indices():
                         annex.pop(i, None)
                     if annex:
