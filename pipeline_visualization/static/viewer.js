@@ -301,8 +301,13 @@ function parsePoints3D(text) {
 // COLMAP stores cam_from_world. We invert to world-from-cam for rendering.
 function parseImages(text) {
   const images = [];
-  const lines = text.split("\n").filter(l => l.trim() && !l.trim().startsWith("#"));
+  // Keep blank lines: a camera with zero 2D points (posed-only annex cameras) has an EMPTY points
+  // line, and dropping it shifts the pose/points pairing so every second such camera is eaten.
+  // Only strip the comment header, then walk pose lines directly (a pose line has >= 10 fields
+  // starting with an integer id; points lines are coordinate triplets or blank).
+  const lines = text.split("\n").filter(l => !l.trim().startsWith("#"));
   for (let i = 0; i < lines.length; i += 2) {
+    if (!lines[i].trim()) { i -= 1; continue; }  // stray blank in pose slot: resync
     const parts = lines[i].trim().split(/\s+/);
     if (parts.length < 9) continue;
     const qw = parseFloat(parts[1]), qx = parseFloat(parts[2]),
