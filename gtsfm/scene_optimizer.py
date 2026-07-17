@@ -976,14 +976,32 @@ class SceneOptimizer:
                     # ToL gold audit: EXIF 1.91% median focal error (unbiased) vs scipy Fetzer 5.26%
                     # (−4% bias) — and the 1DSfM reference pipeline itself calibrated from EXIF.
                     # Same frozen-K coherence as Fetzer (bit-identical per camera across clusters).
+                    #
+                    # EXIF-LESS cameras are SKIPPED (not served): the loader substitutes the
+                    # 1.2 x maxdim heuristic for missing EXIF, and passing that through would PIN a
+                    # frequently-wrong focal at sigma=5px (measured: ~19-40% of 1DSfM cameras lack
+                    # EXIF; the heuristic is ~17% off on average). Cameras absent from this dict
+                    # fall back in the cluster build to the geometry model's predicted focal
+                    # (VGGT-Omega: ~1-2% median error) — trust EXIF where it exists, the learned
+                    # prior where it doesn't. NOTE: calibration content is not part of the cluster
+                    # cache keys — apply to fresh scenes or clear the cluster cache when toggling.
+                    _heur_factor = float(getattr(self.loader, "_default_focal_length_factor", 1.2))
+
+                    def _is_heuristic_cal(cal) -> bool:
+                        expected = _heur_factor * max(2.0 * cal.px(), 2.0 * cal.py())
+                        return expected > 0 and abs(cal.fx() - expected) / expected < 1e-6
+
                     global_refined_intrinsics = {
                         idx: ovd.intrinsics
                         for idx, ovd in one_view_data_dict.items()
-                        if ovd.intrinsics is not None
+                        if ovd.intrinsics is not None and not _is_heuristic_cal(ovd.intrinsics)
                     }
+                    n_total = sum(1 for ovd in one_view_data_dict.values() if ovd.intrinsics is not None)
                     logger.info(
-                        "🔭 Global calibration: EXIF passthrough for %d cameras (Fetzer skipped).",
+                        "🔭 Global calibration: EXIF passthrough for %d cameras; %d EXIF-less camera(s) "
+                        "fall back to the model-predicted focals (Fetzer skipped).",
                         len(global_refined_intrinsics),
+                        n_total - len(global_refined_intrinsics),
                     )
                 else:
                     from gtsfm.view_graph_estimator.view_graph_calibration import (
