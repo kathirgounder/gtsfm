@@ -270,6 +270,7 @@ let lerpAnimRAF = null;        // requestAnimationFrame handle for points lerp
 let frustumLerpRAF = null;     // requestAnimationFrame handle for frustum lerp
 const LERP_MS = 600;           // ms to interpolate between consecutive stages
 let pointSize = 2.0;           // current point cloud size, controlled by UI slider
+let frustumScale = 0.015;      // frustum size as a fraction of viewRange, controlled by UI slider
 
 // ── COLMAP parsing (minimal — just what we need) ────────────────────────────
 async function fetchText(url) {
@@ -375,8 +376,9 @@ function renderStagePoints({ xyz, rgb, count }) {
 // uniform size, no shading. Frustum = 4 apex→corner lines + 4 corner-quad lines.
 // Build the array of line segments for all frustums. Pure compute, no Babylon side effects.
 function buildFrustumLines(images, viewRange) {
-  // Frustum size = view_range * 0.03 (same constant as the matplotlib script).
-  const s = Math.max(0.001, viewRange * 0.03);
+  // Frustum size = view_range * frustumScale (slider-controlled; default halved vs the old
+  // fixed 0.03 — big frustum crowds obscured the structure on dense annex/GLOMAP models).
+  const s = Math.max(0.001, viewRange * frustumScale);
   const half = s * 0.5;
   const localCorners = [
     [-half, -half, s],
@@ -754,6 +756,18 @@ async function init() {
       pointSize = parseFloat(e.target.value);
       if (pointsMesh && pointsMesh.material) {
         pointsMesh.material.pointSize = pointSize;
+      }
+    });
+  }
+
+  // Frustum-size slider — rebuilds the line system in place from the current stage's images.
+  const frustumSlider = document.getElementById("frustumSize");
+  if (frustumSlider) {
+    frustumScale = parseFloat(frustumSlider.value) || frustumScale;
+    frustumSlider.addEventListener("input", e => {
+      frustumScale = parseFloat(e.target.value);
+      if (prevStageImages) {
+        updateFrustumsInPlace(prevStageImages, sceneViewRange ?? 1.0);
       }
     });
   }

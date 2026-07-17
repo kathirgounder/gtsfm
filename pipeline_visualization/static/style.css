@@ -64,6 +64,12 @@ html, body {
   bottom: 24px;
   left: 50%;
   transform: translateX(-50%);
+  /* Never wider than the viewport: long run paths used to size runSelect (and thus the whole
+     centered bar) past both screen edges, hiding the right-side sliders. */
+  max-width: calc(100vw - 32px);
+  box-sizing: border-box;
+  flex-wrap: wrap;
+  justify-content: center;
   background: rgba(255, 255, 255, 0.95);
   border: 1px solid rgba(0, 0, 0, 0.08);
   border-radius: 24px;
@@ -85,8 +91,13 @@ html, body {
   outline: none;
   cursor: pointer;
 }
-#runSelect { min-width: 200px; }
+#runSelect { min-width: 200px; max-width: 340px; text-overflow: ellipsis; }
 #modeSelect { min-width: 180px; }
+#frustumSize {
+  width: 100px;
+  cursor: pointer;
+  accent-color: #1a1a1a;
+}
 #playBtn {
   border: none;
   background: #1a1a1a;
