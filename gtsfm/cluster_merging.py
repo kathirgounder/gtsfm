@@ -1244,7 +1244,9 @@ def _carry_annex_cameras(
             )
             continue
         try:
-            aSb = align_utils.sim3_from_Pose3_maps(merged_poses, child_poses)
+            # Robust (hypothesis-sampled) fit: a plain least-squares Align is poisoned by stray
+            # cameras with extreme coordinates in either scene (the RF annex displacement).
+            aSb = align_utils.sim3_from_Pose3_maps_robust(merged_poses, child_poses)
         except Exception as exc:
             logger.warning(
                 "🎒 Annex: seat transform failed for a child (%s) — dropping its %d annex cam(s).",

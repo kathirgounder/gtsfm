@@ -1191,7 +1191,10 @@ class SceneOptimizer:
                         # The retri BA can drift the gauge relative to the root-merge frame the tree
                         # annex was captured in — absorb it with one Sim3 over the shared cameras.
                         try:
-                            fSr = align_utils.sim3_from_Pose3_maps(
+                            # Robust fit: the root scene can hold extreme-coordinate strays that
+                            # poison a least-squares Align (RF: the whole annex displaced by one
+                            # bad fSr).
+                            fSr = align_utils.sim3_from_Pose3_maps_robust(
                                 final_scene.poses(), root_merged_result.scene.poses()
                             )
                             tree_annex = camera_map_with_sim3(fSr, tree_annex)
