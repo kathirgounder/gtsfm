@@ -1218,11 +1218,28 @@ def _carry_annex_cameras(
         if not child_annex or child.scene is None:
             continue
         child_poses = child.scene.poses()
-        n_common = len(merged_poses.keys() & child_poses.keys())
-        if n_common < 3:
+        shared = sorted(merged_poses.keys() & child_poses.keys())
+        # CARRY GUARDS (RF lesson: a Sim3 fit on few / near-collinear anchors solves a garbage
+        # scale and launches the whole annex block off to numerical infinity — better to drop a
+        # child's annex than export exploded poses):
+        #   (a) >= 4 anchors;
+        #   (b) anchors non-degenerate (second principal extent >= 5% of the first);
+        #   (c) the solved transform must actually map the anchors onto their merged copies
+        #       (median residual <= 25% of the merged camera spread).
+        if len(shared) < 4:
             logger.info(
                 "🎒 Annex: child shares only %d cam(s) with the merged node — dropping its %d annex cam(s).",
-                n_common,
+                len(shared),
+                len(child_annex),
+            )
+            continue
+        a_pts = np.array([np.array(merged_poses[i].translation()) for i in shared])
+        b_pts = np.array([np.array(child_poses[i].translation()) for i in shared])
+        sv = np.linalg.svd(a_pts - a_pts.mean(axis=0), compute_uv=False)
+        if sv[0] <= 0 or sv[1] / sv[0] < 0.05:
+            logger.info(
+                "🎒 Annex: child's %d shared cams are near-collinear — dropping its %d annex cam(s).",
+                len(shared),
                 len(child_annex),
             )
             continue
@@ -1232,6 +1249,20 @@ def _carry_annex_cameras(
             logger.warning(
                 "🎒 Annex: seat transform failed for a child (%s) — dropping its %d annex cam(s).",
                 exc,
+                len(child_annex),
+            )
+            continue
+        pred = np.array([np.array(aSb.transformFrom(gtsam.Point3(*p))) for p in b_pts])
+        fit_res = np.linalg.norm(pred - a_pts, axis=1)
+        all_pts = np.array([np.array(p.translation()) for p in merged_poses.values()])
+        spread = float(np.median(np.linalg.norm(all_pts - all_pts.mean(axis=0), axis=1))) or 1.0
+        if float(np.median(fit_res)) > 0.25 * spread:
+            logger.warning(
+                "🎒 Annex: carry fit does not reproduce its %d anchors (median residual %.3g vs "
+                "spread %.3g) — dropping the child's %d annex cam(s).",
+                len(shared),
+                float(np.median(fit_res)),
+                spread,
                 len(child_annex),
             )
             continue

@@ -55,9 +55,12 @@ class TestCarryAnnexCameras(unittest.TestCase):
     """Direct contracts of _carry_annex_cameras (no BA involved)."""
 
     def setUp(self) -> None:
-        # Child frame b: three non-degenerate cameras + one annex camera.
+        # Child frame b: four non-degenerate cameras (carry guards need >= 4 non-collinear
+        # anchors) + one annex camera.
         self.child = GtsfmData(number_images=NUM_IMAGES)
-        for idx, (x, y, z, yaw) in zip((10, 11, 12), [(0, 0, 0, 0.0), (4, 0, 0, 0.3), (0, 3, 1, -0.2)]):
+        for idx, (x, y, z, yaw) in zip(
+            (10, 11, 12, 14), [(0, 0, 0, 0.0), (4, 0, 0, 0.3), (0, 3, 1, -0.2), (2, 1, 4, 0.1)]
+        ):
             self.child.add_camera(idx, _cam(x, y, z, yaw))
         self.annex_cam = _cam(7.0, 1.0, 2.0, 0.5)
         # A known Sim3 aSb seating child frame b into merged frame a.
@@ -91,12 +94,26 @@ class TestCarryAnnexCameras(unittest.TestCase):
         self.assertIsNone(annex)
 
     def test_carry_skips_child_with_thin_overlap(self) -> None:
-        # Only 2 shared cameras: too thin for a trustworthy seat transform — annex dropped.
+        # Only 3 shared cameras: below the 4-anchor floor — annex dropped.
         merged = self._merged_from_child()
         thin_child = GtsfmData(number_images=NUM_IMAGES)
-        for i in (10, 11):
+        for i in (10, 11, 12):
             thin_child.add_camera(i, self.child.get_camera(i))
         child_result = _result(thin_child, annex={13: self.annex_cam})
+        annex = _carry_annex_cameras(merged, (child_result,), {})
+        self.assertIsNone(annex)
+
+    def test_carry_skips_collinear_anchors(self) -> None:
+        # 4 shared cameras on a line: the Sim3 fit's scale/rotation are unconstrained around the
+        # axis (the RF annex explosion) — annex dropped.
+        line_child = GtsfmData(number_images=NUM_IMAGES)
+        for k, i in enumerate((10, 11, 12, 14)):
+            line_child.add_camera(i, _cam(float(k), 0.0, 0.0))
+        merged = GtsfmData(number_images=NUM_IMAGES)
+        for i in line_child.get_valid_camera_indices():
+            cam_b = line_child.get_camera(i)
+            merged.add_camera(i, PinholeCameraCal3Bundler(self.aSb.transformFrom(cam_b.pose()), CALIB))
+        child_result = _result(line_child, annex={13: self.annex_cam})
         annex = _carry_annex_cameras(merged, (child_result,), {})
         self.assertIsNone(annex)
 

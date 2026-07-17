@@ -1203,6 +1203,29 @@ class SceneOptimizer:
                     annex.update(final_frame_drops)
                     for i in final_scene.get_valid_camera_indices():
                         annex.pop(i, None)
+                    # Radius guard (last line of defense): a degenerate carry fit anywhere in the
+                    # tree can launch an annex block to numerically absurd coordinates. Anything
+                    # beyond 15x the core's robust radius is not a reportable pose — drop it.
+                    core_centers = np.array(
+                        [np.array(final_scene.get_camera(i).pose().translation())
+                         for i in final_scene.get_valid_camera_indices()]
+                    )
+                    ctr = np.median(core_centers, axis=0)
+                    radius = float(np.percentile(np.linalg.norm(core_centers - ctr, axis=1), 95)) or 1.0
+                    far = [
+                        i for i, c in annex.items()
+                        if c is None or not np.all(np.isfinite(np.array(c.pose().translation())))
+                        or float(np.linalg.norm(np.array(c.pose().translation()) - ctr)) > 15.0 * radius
+                    ]
+                    for i in far:
+                        annex.pop(i, None)
+                    if far:
+                        logger.warning(
+                            "🎒 Annex: dropped %d camera(s) beyond 15x the core radius "
+                            "(degenerate carry fits upstream); %d remain.",
+                            len(far),
+                            len(annex),
+                        )
                     if annex:
                         annex_scene = GtsfmData(number_images=final_scene.number_images())
                         annex_scene._image_info = final_scene._clone_image_info()
