@@ -198,11 +198,13 @@ def _build_gtsfm_data_from_vggt_depth(
 
     # Register cameras with intrinsics in original image resolution. If
     # `refined_intrinsics` is supplied (from view-graph calibration), use those
-    # directly; otherwise rescale VGGT's predicted intrinsics from VGGT pixel space.
+    # directly; cameras ABSENT from it (e.g. EXIF-less cameras the exif passthrough
+    # skips) fall back to rescaling the model's predicted intrinsics, same as when
+    # no refinement is supplied at all.
     gtsfm_data = GtsfmData(number_images=num_images)
     for global_idx, camera in cameras.items():
         if global_idx in image_shapes and global_idx in global_to_local:
-            if refined_intrinsics is not None:
+            if refined_intrinsics is not None and global_idx in refined_intrinsics:
                 camera = type(camera)(camera.pose(), refined_intrinsics[global_idx])
             else:
                 _, orig_W = image_shapes[global_idx]
@@ -332,7 +334,9 @@ def _build_gtsfm_data_via_triangulation(
     cameras_only = GtsfmData(number_images=num_images)
     for global_idx, camera in vggt_result.cameras.items():
         if global_idx in image_shapes and global_idx in global_to_local:
-            if refined_intrinsics is not None:
+            # Cameras absent from refined_intrinsics (EXIF-less under the exif passthrough)
+            # keep the model's predicted focal, rescaled to the original resolution.
+            if refined_intrinsics is not None and global_idx in refined_intrinsics:
                 camera = type(camera)(camera.pose(), refined_intrinsics[global_idx])
             else:
                 _, orig_W = image_shapes[global_idx]
