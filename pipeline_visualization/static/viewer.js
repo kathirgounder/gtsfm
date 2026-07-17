@@ -261,7 +261,8 @@ window.addEventListener("keydown", (e) => {
 let currentRun = null;        // { id, manifest_url, data_url_prefix, manifest }
 let currentStageIdx = 0;
 let pointsMesh = null;
-let frustumLines = null;       // single LinesSystem mesh for all frustums
+let frustumLines = null;       // LinesSystem for core / untiered frustums
+let frustumLinesAnnex = null;  // LinesSystem for flagged (zero-observation) frustums, drawn red
 let isPlaying = false;
 let playTimer = null;
 let prevStageData = null;      // previous stage points (for points LERP)
@@ -333,7 +334,19 @@ function parseImages(text) {
     // Keep the camera rotation matrix R in DATA frame; renderFrustums will
     // rotate corner offsets through R then through sceneRotation.
     const [cx, cy, cz] = applySceneRotation(cxC, cyC, czC);
-    images.push({ position: [cx, cy, cz], R: R, name: name, dataPos: [cxC, cyC, czC] });
+    // Tier flag: does this camera have any REAL 2D observation (POINT3D_ID != -1)? Posed-only
+    // annex cameras have a blank or placeholder-only points line. Used to color flagged
+    // cameras red in mixed models; models where no camera has observations (stripped viz
+    // copies) are treated as untiered.
+    let hasObs = false;
+    const ptsLine = (lines[i + 1] || "").trim();
+    if (ptsLine) {
+      const f = ptsLine.split(/\s+/);
+      for (let k = 2; k < f.length; k += 3) {
+        if (f[k] !== "-1") { hasObs = true; break; }
+      }
+    }
+    images.push({ position: [cx, cy, cz], R: R, name: name, dataPos: [cxC, cyC, czC], hasObs: hasObs });
   }
   return images;
 }
@@ -344,6 +357,7 @@ function disposePoints() {
 }
 function disposeFrustums() {
   if (frustumLines) { frustumLines.dispose(); frustumLines = null; }
+  if (frustumLinesAnnex) { frustumLinesAnnex.dispose(); frustumLinesAnnex = null; }
 }
 
 function renderStagePoints({ xyz, rgb, count }) {
@@ -406,20 +420,34 @@ function buildFrustumLines(images, viewRange) {
 function renderFrustums(images, viewRange) {
   disposeFrustums();
   if (!images.length) return;
-  const lines = buildFrustumLines(images, viewRange);
-  // updatable=true lets us re-feed lines via `instance:` for in-place vertex updates.
+  // Tier-aware coloring: red is reserved for FLAGGED (zero-observation / annex) cameras, so it
+  // only ever appears where the model itself declares low evidence. Cores and untiered models
+  // (all cameras alike, e.g. GLOMAP exports or viz-stripped copies) render neutral slate.
+  const core = images.filter(im => im.hasObs);
+  const annex = images.filter(im => !im.hasObs);
+  const mixed = core.length > 0 && annex.length > 0;
+  const baseImgs = mixed ? core : images;
   frustumLines = BABYLON.MeshBuilder.CreateLineSystem("frustums", {
-    lines: lines,
+    lines: buildFrustumLines(baseImgs, viewRange),
     updatable: true,
   }, scene);
-  frustumLines.color = new BABYLON.Color3(0.85, 0.15, 0.15);  // muted red, like matplotlib
-  frustumLines.alpha = 0.85;
+  frustumLines.color = new BABYLON.Color3(0.22, 0.24, 0.28);  // neutral slate
+  frustumLines.alpha = 0.75;
+  if (mixed) {
+    frustumLinesAnnex = BABYLON.MeshBuilder.CreateLineSystem("frustumsAnnex", {
+      lines: buildFrustumLines(annex, viewRange),
+      updatable: true,
+    }, scene);
+    frustumLinesAnnex.color = new BABYLON.Color3(0.85, 0.15, 0.15);  // flagged tier: red
+    frustumLinesAnnex.alpha = 0.9;
+  }
 }
 
 // Update existing frustum mesh in place (no dispose/recreate). Babylon updates
 // vertex positions of the same buffer when `instance:` is passed.
 function updateFrustumsInPlace(images, viewRange) {
-  if (!frustumLines) {
+  if (!frustumLines || frustumLinesAnnex) {
+    // Tiered models keep two line systems — rebuild both rather than instance-update one.
     renderFrustums(images, viewRange);
     return;
   }
@@ -435,6 +463,10 @@ function updateFrustumsInPlace(images, viewRange) {
 // per-stage refinements). Falls back to discrete swap if camera count differs.
 function lerpFrustums(prevImgs, nextImgs, viewRange, durationMs) {
   if (frustumLerpRAF) cancelAnimationFrame(frustumLerpRAF);
+  if (frustumLinesAnnex) {  // tiered models: discrete swap (lerp assumes one line system)
+    renderFrustums(nextImgs, viewRange);
+    return;
+  }
   if (!prevImgs || !frustumLines || prevImgs.length !== nextImgs.length) {
     renderFrustums(nextImgs, viewRange);
     return;
