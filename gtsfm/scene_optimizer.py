@@ -151,6 +151,48 @@ def _load_precomputed_frontend(path: str, num_images: int, expected_dims=None, m
     return keypoints_list, v_corr_idxs_dict
 
 
+def _drop_unreportable_cameras(scene: GtsfmData, radius_mult: float = 15.0) -> tuple[GtsfmData, int]:
+    """Export policy: a camera beyond ``radius_mult`` x the robust scene radius (95th-percentile
+    center distance from the median center) — or at non-finite coordinates — is not a reportable
+    pose and is dropped from the EXPORTED model, together with its track measurements (tracks keep
+    their remaining measurements; sub-2-view leftovers are removed). Declared in the paper protocol;
+    recall is unaffected (such cameras are never near their true location). Returns a filtered COPY
+    and the number of cameras dropped; the input scene is never mutated.
+    """
+    ids = list(scene.get_valid_camera_indices())
+    if len(ids) < 8:
+        return scene, 0
+    centers = {i: np.array(scene.get_camera(i).pose().translation()) for i in ids}
+    C = np.array(list(centers.values()))
+    ctr = np.median(C, axis=0)
+    radius = float(np.percentile(np.linalg.norm(C - ctr, axis=1), 95)) or 1.0
+    far = {
+        i for i, c in centers.items()
+        if not np.all(np.isfinite(c)) or float(np.linalg.norm(c - ctr)) > radius_mult * radius
+    }
+    if not far:
+        return scene, 0
+    from gtsam import SfmTrack as _SfmTrack
+
+    out = GtsfmData(number_images=scene.number_images())
+    out._image_info = scene._clone_image_info()
+    for i in ids:
+        if i not in far:
+            out.add_camera(i, scene.get_camera(i))
+    for j in range(scene.number_tracks()):
+        t = scene.get_track(j)
+        kept = [(int(t.measurement(k)[0]), t.measurement(k)[1]) for k in range(t.numberMeasurements())
+                if int(t.measurement(k)[0]) not in far]
+        if len(kept) < 2:
+            continue
+        tc = _SfmTrack(t.point3())
+        tc.r, tc.g, tc.b = t.r, t.g, t.b
+        for i, uv in kept:
+            tc.addMeasurement(i, uv)
+        out.add_track(tc)
+    return out, len(far)
+
+
 def _colorize_scene_tracks_in_place(scene: GtsfmData, loader) -> int:
     """Set each track's (r, g, b) by sampling the source image at its first measurement, if in bounds.
 
@@ -1145,6 +1187,14 @@ class SceneOptimizer:
                         root_merged_result.trackless_cameras,
                         pure=False,
                     ).result()
+                    # Reportable-pose policy (method-level): cameras beyond 15x the robust scene
+                    # radius are not exported — in any tier.
+                    refined, n_unreportable = _drop_unreportable_cameras(refined)
+                    if n_unreportable:
+                        logger.warning(
+                            "🚷 Reportable-pose policy: dropped %d camera(s) beyond 15x the robust "
+                            "scene radius from the exports.", n_unreportable,
+                        )
                     retri_scene = refined
                     retri_dir = base_output_paths.results / "merged_retriangulated"
                     retri_dir.mkdir(parents=True, exist_ok=True)
