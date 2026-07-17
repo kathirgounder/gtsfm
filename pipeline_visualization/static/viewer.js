@@ -420,27 +420,14 @@ function buildFrustumLines(images, viewRange) {
 function renderFrustums(images, viewRange) {
   disposeFrustums();
   if (!images.length) return;
-  // Tier-aware coloring: red is reserved for FLAGGED (zero-observation / annex) cameras, so it
-  // only ever appears where the model itself declares low evidence. Cores and untiered models
-  // (all cameras alike, e.g. GLOMAP exports or viz-stripped copies) render neutral slate.
-  const core = images.filter(im => im.hasObs);
-  const annex = images.filter(im => !im.hasObs);
-  const mixed = core.length > 0 && annex.length > 0;
-  const baseImgs = mixed ? core : images;
+  // Uniform red frustums (paper-wide convention: red = camera). The hasObs tier flag is still
+  // parsed and available if two-tone rendering is ever wanted again.
   frustumLines = BABYLON.MeshBuilder.CreateLineSystem("frustums", {
-    lines: buildFrustumLines(baseImgs, viewRange),
+    lines: buildFrustumLines(images, viewRange),
     updatable: true,
   }, scene);
-  frustumLines.color = new BABYLON.Color3(0.22, 0.24, 0.28);  // neutral slate
-  frustumLines.alpha = 0.75;
-  if (mixed) {
-    frustumLinesAnnex = BABYLON.MeshBuilder.CreateLineSystem("frustumsAnnex", {
-      lines: buildFrustumLines(annex, viewRange),
-      updatable: true,
-    }, scene);
-    frustumLinesAnnex.color = new BABYLON.Color3(0.85, 0.15, 0.15);  // flagged tier: red
-    frustumLinesAnnex.alpha = 0.9;
-  }
+  frustumLines.color = new BABYLON.Color3(0.85, 0.15, 0.15);  // muted red, like matplotlib
+  frustumLines.alpha = 0.85;
 }
 
 // Update existing frustum mesh in place (no dispose/recreate). Babylon updates
