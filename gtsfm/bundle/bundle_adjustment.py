@@ -158,10 +158,6 @@ class BundleAdjustmentOptions:
     use_calibration_prior: bool = False
     use_pose_prior_all_cameras: bool = False
     use_pose_prior_first_camera: bool = False
-    # Sigma for the PriorFactorPose3 added by the use_pose_prior_* flags, anchored at the
-    # initialization poses. Near-zero (e.g. 1e-3, in scene units) freezes poses so the BA
-    # refines only structure + calibration ("self-calibration against the init poses").
-    cam_pose3_prior_noise_sigma: float = 0.1
     use_gnc: bool = False
     gnc_loss: Union[RobustBAMode, str] = RobustBAMode.GMC
     factor_weight_outlier_threshold: float = 0.0
@@ -192,7 +188,6 @@ class BundleAdjustmentOptions:
             use_calibration_prior=self.use_calibration_prior,
             use_pose_prior_all_cameras=self.use_pose_prior_all_cameras,
             use_pose_prior_first_camera=self.use_pose_prior_first_camera,
-            cam_pose3_prior_noise_sigma=self.cam_pose3_prior_noise_sigma,
             use_gnc=self.use_gnc,
             gnc_loss=self.gnc_loss,
             factor_weight_outlier_threshold=self.factor_weight_outlier_threshold,
