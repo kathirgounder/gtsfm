@@ -81,7 +81,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
       
       - name: Cache frontend
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         env:
           CACHE_NUMBER_FRONTEND: 3
         with:
