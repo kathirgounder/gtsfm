@@ -269,7 +269,8 @@ let prevStageData = null;      // previous stage points (for points LERP)
 let prevStageImages = null;    // previous stage cameras (for frustum LERP)
 let lerpAnimRAF = null;        // requestAnimationFrame handle for points lerp
 let frustumLerpRAF = null;     // requestAnimationFrame handle for frustum lerp
-const LERP_MS = 600;           // ms to interpolate between consecutive stages
+const LERP_MS = 1600;          // ms to interpolate between consecutive stages
+const DWELL_MS = 1200;         // extra hold per stage during autoplay (visual digestion)
 let pointSize = 2.0;           // current point cloud size, controlled by UI slider
 let frustumScale = 0.015;      // frustum size as a fraction of viewRange, controlled by UI slider
 
@@ -549,6 +550,43 @@ function paintballStagePoints(prevImages, next, durationMs) {
   lerpAnimRAF = requestAnimationFrame(tick);
 }
 
+// Refinement condensation: each point materializes from a small local mist around
+// its final position — reads as "BA polishing the model" rather than a spray, and
+// stays calm on sparse point sets. Used for the retri/final-BA stage, where the
+// point set changes so no index correspondence exists for a lerp.
+function condenseStagePoints(next, durationMs, viewRange) {
+  if (lerpAnimRAF) cancelAnimationFrame(lerpAnimRAF);
+  if (!next.count) { renderStagePoints(next); return; }
+  const spread = (viewRange ?? 1.0) * 0.06;
+  const endPos = new Float32Array(next.xyz);
+  const startPos = new Float32Array(next.count * 3);
+  for (let i = 0; i < next.count * 3; i++) {
+    const g = Math.random() + Math.random() - 1;  // cheap centered noise
+    startPos[i] = endPos[i] + g * spread;
+  }
+  const delays = new Float32Array(next.count);
+  for (let i = 0; i < next.count; i++) delays[i] = Math.random() * 0.45;
+  renderStagePoints({ xyz: Array.from(startPos), rgb: next.rgb, count: next.count });
+  const t0 = performance.now();
+  const tick = () => {
+    if (!pointsMesh) { lerpAnimRAF = null; return; }
+    const u = Math.min(1, (performance.now() - t0) / durationMs);
+    const pos = pointsMesh.getVerticesData(BABYLON.VertexBuffer.PositionKind);
+    for (let i = 0; i < next.count; i++) {
+      const localU = Math.max(0, Math.min(1, (u - delays[i]) / (1 - delays[i] + 1e-9)));
+      const e = 1 - Math.pow(1 - localU, 3);
+      const ix = i * 3;
+      pos[ix]     = startPos[ix]     * (1 - e) + endPos[ix]     * e;
+      pos[ix + 1] = startPos[ix + 1] * (1 - e) + endPos[ix + 1] * e;
+      pos[ix + 2] = startPos[ix + 2] * (1 - e) + endPos[ix + 2] * e;
+    }
+    pointsMesh.updateVerticesData(BABYLON.VertexBuffer.PositionKind, pos);
+    if (u < 1) lerpAnimRAF = requestAnimationFrame(tick);
+    else lerpAnimRAF = null;
+  };
+  lerpAnimRAF = requestAnimationFrame(tick);
+}
+
 // Smooth LERP between two point clouds. If counts differ, just discrete-swap
 // (can't morph different vertex counts cleanly without correspondence).
 function lerpStagePoints(prev, next, durationMs) {
@@ -625,10 +663,13 @@ async function loadStage(idx, { animate = true } = {}) {
   // correspondence graph). Densify is a quieter additive step where the existing
   // structure stays stable and we just lerp in 2-view supplements.
   const isPaintball = stage.stage_name === "retri";
+  const isCondense = !isPaintball && stage.stage_name.startsWith("retri");
   if (idx === 0 || !animate || !pointsMesh) {
     renderStagePoints(points);
   } else if (isPaintball && prevStageImages) {
-    paintballStagePoints(prevStageImages, points, 1800);
+    paintballStagePoints(prevStageImages, points, 3400);
+  } else if (isCondense && prevStageData) {
+    condenseStagePoints(points, 3000, sceneViewRange ?? 1.0);
   } else {
     lerpStagePoints(prevStageData, points, LERP_MS);
   }
@@ -793,15 +834,37 @@ async function init() {
 
   const playBtn = document.getElementById("playBtn");
   playBtn.addEventListener("click", () => {
+    const len = currentRun.manifest.stages.length;
+    const playTick = () => {
+      if (!isPlaying) return;
+      if (currentStageIdx >= len - 1) {
+        // finale reached: stop so the user can orbit/record; button becomes restart
+        isPlaying = false;
+        playBtn.textContent = "↺";
+        return;
+      }
+      loadStage(currentStageIdx + 1);  // transition runs while we wait
+      playTimer = setTimeout(playTick, LERP_MS + DWELL_MS);
+    };
+    if (!isPlaying && currentStageIdx >= len - 1) {
+      // restart from the top: clean slate, then play through once
+      disposePoints();
+      if (frustumLines) { frustumLines.dispose(); frustumLines = null; }
+      if (frustumLinesAnnex) { frustumLinesAnnex.dispose(); frustumLinesAnnex = null; }
+      prevStageData = null;
+      prevStageImages = null;
+      loadStage(0);
+      isPlaying = true;
+      playBtn.textContent = "❚❚";
+      playTimer = setTimeout(playTick, LERP_MS + DWELL_MS);
+      return;
+    }
     isPlaying = !isPlaying;
     playBtn.textContent = isPlaying ? "❚❚" : "▶";
     if (isPlaying) {
-      playTimer = setInterval(() => {
-        const next = (currentStageIdx + 1) % currentRun.manifest.stages.length;
-        loadStage(next);  // smooth LERP runs in the background while we wait
-      }, LERP_MS + 200);  // step a hair after the LERP finishes
+      playTimer = setTimeout(playTick, LERP_MS + DWELL_MS);
     } else {
-      clearInterval(playTimer);
+      clearTimeout(playTimer);
     }
   });
 }
